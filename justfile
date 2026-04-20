@@ -128,6 +128,7 @@ update_kernel_modules_and_source:
     {{_kernel_version}}
 
   @echo "Copying kernel headers"
+  mkdir -p unpack/kernel_headers
   tar \
     -xvzf {{_kernel_build_dir}}/kernel-headers.tar.gz \
     -C unpack/kernel_headers
