@@ -149,3 +149,6 @@ Cargo.lock
 
 kernel_version
 rootfs/module_order.txt
+
+# Downloaded at build time by `just sync_vendor_firmware`
+tools/payload-dumper-go/

@@ -7,8 +7,19 @@ _debootstrap := require("debootstrap")
 _rsync       := require("rsync")
 _fallocate   := require("fallocate")
 _mkfs_ext4   := require("mkfs.ext4")
+_curl        := require("curl")
+_unzip       := require("unzip")
+_extract_fs  := join(justfile_directory(), "tools", "extract-partition-fs.sh")
 _mkbootimg   := join(justfile_directory(), "tools", "mkbootimg", "mkbootimg.py")
 _bazel       := join(justfile_directory(), "kernel", "source", "tools", "bazel")
+
+# Factory image and extraction tooling
+_felix_ota_url           := "https://dl.google.com/dl/android/aosp/felix-ota-cp1a.260405.005-7a13341e.zip"
+_vendor_firmware_workdir := join(justfile_directory(), "rootfs", "vendor-firmware")
+_vendor_firmware_stage   := join(_vendor_firmware_workdir, "extracted")
+_payload_dumper_version  := "1.2.2"
+_payload_dumper_dir      := join(justfile_directory(), "tools", "payload-dumper-go")
+_payload_dumper_bin      := join(_payload_dumper_dir, "payload-dumper-go")
 
 default:
   just --list
@@ -52,10 +63,18 @@ build_kernel: clone_kernel_source
 _sysroot_dir := join(justfile_directory(), "rootfs", "sysroot")
 _user        := env("USER")
 
+# Debian snapshot timestamp that matches the known-good image built on
+# 2025-10-30. snapshot.debian.org serves historical apt archives so we pin
+# the package set bit-for-bit. Bump this when you intentionally want newer
+# packages and re-verify the UART still behaves afterwards.
+_deb_snapshot := "20251030T000000Z"
+_deb_mirror   := "http://snapshot.debian.org/archive/debian/" + _deb_snapshot + "/"
+_deb_sec_mirror := "http://snapshot.debian.org/archive/debian-security/" + _deb_snapshot + "/"
+
 [group('rootfs')]
 [working-directory: 'rootfs']
-build_rootfs debootstrap_release="stable" root_password="0000" hostname="fold":
-  # First stage 
+build_rootfs debootstrap_release="trixie" root_password="0000" hostname="fold":
+  # First stage
   sudo rm -rf {{_sysroot_dir}}
   mkdir {{_sysroot_dir}}
 
@@ -63,12 +82,22 @@ build_rootfs debootstrap_release="stable" root_password="0000" hostname="fold":
     --variant=minbase \
     --include=symlinks \
     --arch=arm64 --foreign {{debootstrap_release}} \
-    {{_sysroot_dir}}
+    {{_sysroot_dir}} \
+    {{_deb_mirror}}
 
   # Second stage
   sudo chroot {{_sysroot_dir}} debootstrap/debootstrap --second-stage
   sudo chroot {{_sysroot_dir}} symlinks -cr .
-  
+
+  # Pin apt to the same snapshot so install_apt_packages pulls matching versions.
+  # The check-valid-until=no is required because snapshot URLs serve metadata
+  # whose validity has expired relative to today's clock.
+  printf 'deb [check-valid-until=no] %s %s main contrib non-free non-free-firmware\ndeb [check-valid-until=no] %s %s-security main contrib non-free non-free-firmware\ndeb [check-valid-until=no] %s %s-updates main contrib non-free non-free-firmware\n' \
+    '{{_deb_mirror}}' '{{debootstrap_release}}' \
+    '{{_deb_sec_mirror}}' '{{debootstrap_release}}' \
+    '{{_deb_mirror}}' '{{debootstrap_release}}' \
+    | sudo tee {{_sysroot_dir}}/etc/apt/sources.list > /dev/null
+
   # Set password
   sudo chroot {{_sysroot_dir}} sh -c "echo "root:{{root_password}}" | chpasswd"
   # Set hostname
@@ -79,6 +108,9 @@ build_rootfs debootstrap_release="stable" root_password="0000" hostname="fold":
 [group('rootfs')]
 [working-directory: 'rootfs']
 install_apt_packages:
+  sudo chroot {{_sysroot_dir}} sh -c \
+    "apt-get -o Acquire::Check-Valid-Until=false update"
+
   # Setup locale
   sudo chroot {{_sysroot_dir}} sh -c \
     "DEBIAN_FRONTEND=noninteractive apt-get -y install locales apt-utils"
@@ -92,9 +124,64 @@ install_apt_packages:
   sudo chroot {{_sysroot_dir}} sh -c \
     "DEBIAN_FRONTEND=noninteractive apt-get -y install {{_apt_packages}}"
 
+_overlay_dir := join(justfile_directory(), "rootfs", "overlay")
+
+# Pull /vendor/firmware out of the Pixel Fold (felix) factory OTA and stage it
+# under rootfs/vendor-firmware/extracted/. customize_rootfs copies this tree
+# into /vendor/firmware/ on the target. Cached intermediates let re-runs skip
+# already-completed work.
+[group('rootfs')]
+sync_vendor_firmware:
+  mkdir -p {{_vendor_firmware_workdir}} {{_payload_dumper_dir}}
+
+  # One-time download of payload-dumper-go (pinned) so OTA payloads can be opened.
+  [ -x {{_payload_dumper_bin}} ] || ( \
+    {{_curl}} -L --fail -o {{_vendor_firmware_workdir}}/payload-dumper-go.tgz \
+      "https://github.com/ssut/payload-dumper-go/releases/download/{{_payload_dumper_version}}/payload-dumper-go_{{_payload_dumper_version}}_linux_amd64.tar.gz" \
+    && tar -xzf {{_vendor_firmware_workdir}}/payload-dumper-go.tgz -C {{_payload_dumper_dir}} \
+    && chmod +x {{_payload_dumper_bin}} \
+  )
+
+  # Download the OTA zip once. The file is ~2GB; subsequent runs are cheap.
+  [ -f {{_vendor_firmware_workdir}}/felix-ota.zip ] || \
+    {{_curl}} -L --fail -o {{_vendor_firmware_workdir}}/felix-ota.zip "{{_felix_ota_url}}"
+
+  # Pull payload.bin out of the zip.
+  [ -f {{_vendor_firmware_workdir}}/payload.bin ] || \
+    {{_unzip}} -o {{_vendor_firmware_workdir}}/felix-ota.zip payload.bin -d {{_vendor_firmware_workdir}}
+
+  # Extract only the vendor partition image from the A/B OTA payload.
+  [ -f {{_vendor_firmware_workdir}}/vendor.img ] || \
+    (cd {{_vendor_firmware_workdir}} && {{_payload_dumper_bin}} -partitions vendor -output . payload.bin)
+
+  # Extract the vendor partition into extracted/; filesystem type on felix
+  # has changed over the years (ext4 on Android 14 builds, EROFS on some
+  # others) and may also be wrapped in Android sparse framing, so the helper
+  # auto-detects and handles both.
+  {{_extract_fs}} {{_vendor_firmware_workdir}}/vendor.img {{_vendor_firmware_stage}}
+
+# Apply tracked sysroot customizations from rootfs/overlay/, and install
+# vendor firmware blobs extracted by sync_vendor_firmware. firmware_class.path
+# on the kernel cmdline points the kernel at /vendor/firmware; without blobs
+# there the AOC coprocessor retry-loops and starves UART RX enough to drop
+# login-prompt keystrokes.
+[group('rootfs')]
+[working-directory: 'rootfs']
+customize_rootfs:
+  @echo "Applying overlay"
+  sudo {{_rsync}} -a {{_overlay_dir}}/ {{_sysroot_dir}}/
+
+  @echo "Installing vendor firmware"
+  [ -d {{_vendor_firmware_stage}}/firmware ] || \
+    ( echo "Missing vendor firmware stage at {{_vendor_firmware_stage}}/firmware — run 'just sync_vendor_firmware' first" && exit 1 )
+  sudo mkdir -p {{_sysroot_dir}}/vendor/firmware
+  sudo {{_rsync}} -a {{_vendor_firmware_stage}}/firmware/ {{_sysroot_dir}}/vendor/firmware/
+
+  sudo chown -R {{_user}}:{{_user}} {{_sysroot_dir}}
+
 _module_order_path := join(justfile_directory(), "rootfs", "module_order.txt")
 
-# TODO: Download factory image and copy firmware
+
 [group('rootfs')]
 [working-directory: 'rootfs']
 update_kernel_modules_and_source:
@@ -151,7 +238,6 @@ update_kernel_modules_and_source:
     >> {{_module_order_path}}
   
 _initramfs_path := join(_sysroot_dir, "boot", "initrd.img-" + _kernel_version)
-_module_order   := replace(read(_module_order_path), "\n", " ")
 
 # TODO: Fix for proper root password (/etc/shadow) maybe with some post service
 # Add other user (kalm)
@@ -170,7 +256,7 @@ update_initramfs:
     --force \
     --add "rescue bash" \
     --kernel-cmdline "rd.shell" \
-    --force-drivers "{{_module_order}}"
+    --force-drivers "$(tr '\n' ' ' < {{_module_order_path}})"
   
   sudo chown -R {{_user}}:{{_user}} {{_sysroot_dir}}
 
@@ -179,7 +265,14 @@ update_initramfs:
 create_rootfs_image size="4GiB":
   rm -f rootfs.img
   {{_fallocate}} -l {{size}} rootfs.img
+  # Ownership on the sysroot tree gets flipped to the build user by earlier
+  # targets (so non-sudo edits work). Flip it back to root so the baked image
+  # has correct ownership for systemd-tmpfiles, NetworkManager plugin loader,
+  # etc. Then flip it back to the build user so downstream targets
+  # (build_boot_images reading the initrd) don't need sudo.
+  sudo chown -R root:root {{_sysroot_dir}}
   sudo {{_mkfs_ext4}} -d {{_sysroot_dir}} rootfs.img
+  sudo chown -R {{_user}}:{{_user}} {{_sysroot_dir}}
 
 [group('boot')]
 [working-directory: 'boot']

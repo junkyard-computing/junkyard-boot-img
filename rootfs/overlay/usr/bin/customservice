@@ -1,0 +1,24 @@
+#!/bin/sh
+# Triggers at multi-user.target. Matches the /usr/bin/customservice shipped
+# on the known-good Pixel Fold image. Currently the load_aoc_firmware step
+# is what matters for UART responsiveness: without it the AOC coprocessor
+# stays in a retry-loop that starves IRQ latency on ttySAC0 and drops
+# keystrokes at the login prompt.
+
+load_aoc_firmware() {
+  echo "aoc.bin" > /sys/devices/platform/19000000.aoc/firmware
+}
+
+format_userdata() {
+  DEVICE=/dev/disk/by-partlabel/userdata
+  EXISTING_FS=$(blkid -o value -s TYPE "$DEVICE" 2>/dev/null)
+  if [ -n "$EXISTING_FS" ]; then
+    echo "Filesystem already exists on $DEVICE ($EXISTING_FS). Skipping mkfs."
+  else
+    echo "No filesystem found on $DEVICE. Creating ext4 filesystem..."
+    mkfs.ext4 -F "$DEVICE"
+  fi
+}
+
+load_aoc_firmware
+format_userdata

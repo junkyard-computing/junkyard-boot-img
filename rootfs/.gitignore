@@ -4,4 +4,5 @@
 !.gitignore
 !_enter
 !packages.txt
-!module_order.txt
+!overlay
+!overlay/**
