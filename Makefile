@@ -6,7 +6,11 @@
 
 RELEASE ?= trixie
 ROOT_PW ?= 0000
+USER_LOGIN ?= kalm
+USER_PW ?= 0000
 HOSTNAME ?= fold
+# Pinned because trixie drops kmscon; snagged from the Debian pool arm64 builds.
+KMSCON_URL ?= http://ftp.us.debian.org/debian/pool/main/k/kmscon/kmscon_9.0.0-4_arm64.deb
 # felix's super partition is 2082816 × 4096B = 8136.9 MiB; 8100M leaves a small
 # margin so fastboot doesn't reject on a slightly-oversized image.
 SIZE ?= 8100M
@@ -22,6 +26,13 @@ OVERLAY_DIR ?= rootfs/overlay
 VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
+
+# --resolv-conf=bind-host overrides the container's /etc/resolv.conf for the
+# lifetime of the nspawn session. Packages.txt installs systemd-resolved,
+# whose postinst points /etc/resolv.conf at a stub that only resolves when
+# systemd-resolved is running (it isn't, under nspawn). Without this flag,
+# any nspawn call after that postinst loses DNS, including reruns.
+NSPAWN := sudo systemd-nspawn --resolv-conf=bind-host
 
 # Running `make` directly bypasses the env vars set by the justfile (notably
 # KERNEL_VERSION, which is read from kernel/kernel_version). Always go through
@@ -70,25 +81,42 @@ all:
 
 .install_packages: .debootstrap $(APT_PACKAGES_FILE) $(OVERLAY_FILES)
 	just mount_rootfs
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c "apt-get update"
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "apt-get update"
 	# Locale setup.
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c \
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"DEBIAN_FRONTEND=noninteractive apt-get -y install locales apt-utils"
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c \
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"export DEBIAN_FRONTEND=noninteractive; \
 		sed -i -e 's/# en_US.UTF-8 UTF-8/en_US.UTF-8 UTF-8/' /etc/locale.gen \
 		&& dpkg-reconfigure locales \
 		&& update-locale en_US.UTF-8"
-	# Packages from rootfs/packages.txt.
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c \
-		"DEBIAN_FRONTEND=noninteractive apt-get -y install $(APT_PACKAGES)"
+	# Pre-stage the pinned kmscon .deb (trixie dropped the package) so the
+	# single apt-get install below resolves its deps alongside packages.txt.
+	sudo curl -L --fail -o $(SYSROOT_DIR)/var/cache/apt/archives/kmscon.deb "$(KMSCON_URL)"
+	# Packages from rootfs/packages.txt plus the staged kmscon .deb.
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+		"DEBIAN_FRONTEND=noninteractive apt-get -y install $(APT_PACKAGES) /var/cache/apt/archives/kmscon.deb"
+	# Unprivileged user with passwordless sudo. Paired with the autologin
+	# override in rootfs/overlay/etc/systemd/system/kmsconvt@.service.d/.
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+		"id -u $(USER_LOGIN) >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo $(USER_LOGIN)"
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+		"echo $(USER_LOGIN):$(USER_PW) | chpasswd"
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+		"echo '%sudo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-sudo-nopasswd \
+		&& chmod 0440 /etc/sudoers.d/99-sudo-nopasswd"
+	# systemd-backlight@.service pulls felix into systemd "degraded" on every
+	# boot; mask it (symlink to /dev/null) to keep `systemctl is-system-running`
+	# green.
+	$(NSPAWN) -D $(SYSROOT_DIR) \
+		ln -sf /dev/null /etc/systemd/system/systemd-backlight@.service
 	# Prefer NetworkManager over dhcpcd and pre-seed a DHCP ethernet profile.
-	sudo systemd-nspawn -D $(SYSROOT_DIR) systemctl disable dhcpcd
-	sudo systemd-nspawn -D $(SYSROOT_DIR) systemctl enable NetworkManager
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c \
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl disable dhcpcd
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl enable NetworkManager
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"nmcli --offline connection add type ethernet con-name default_connection ipv4.method auto autoconnect true \
 		> /etc/NetworkManager/system-connections/default_connection.nmconnection"
-	sudo systemd-nspawn -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/default_connection.nmconnection
+	$(NSPAWN) -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/default_connection.nmconnection
 	# Apply tracked overlay (usb_gadget, blacklist.conf, custom service, ...).
 	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
 	just unmount_rootfs

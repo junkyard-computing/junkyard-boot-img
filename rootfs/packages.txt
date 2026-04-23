@@ -1,4 +1,5 @@
 busybox
+sudo
 iproute2
 iputils-ping
 dracut

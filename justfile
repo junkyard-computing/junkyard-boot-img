@@ -89,13 +89,15 @@ default:
 # KERNEL_VERSION written by .build_kernel. justfile exports are evaluated at
 # parse time, so on a fresh checkout KERNEL_VERSION would be empty without
 # this split.
-all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootstrap_release="trixie" root_password="0000" hostname="fold": (clone_kernel_source android_kernel_branch)
+all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000": (clone_kernel_source android_kernel_branch)
     {{ _make }} -C {{ justfile_directory() }} .build_kernel
     KVER=$(cat {{ justfile_directory() }}/kernel/kernel_version); \
     {{ _make }} -C {{ justfile_directory() }} .build_boot \
         SIZE={{ size }} \
         RELEASE={{ debootstrap_release }} \
         ROOT_PW={{ root_password }} \
+        USER_LOGIN={{ user_login }} \
+        USER_PW={{ user_password }} \
         HOSTNAME={{ hostname }} \
         KERNEL_VERSION=$KVER \
         INITRAMFS_PATH={{ _sysroot_dir }}/boot/initrd.img-$KVER
@@ -174,8 +176,10 @@ build_rootfs debootstrap_release="trixie" root_password="0000" hostname="fold" s
         SIZE={{ size }}
 
 [group('rootfs')]
-install_apt_packages:
-    {{ _make }} -C {{ justfile_directory() }} .install_packages
+install_apt_packages user_login="kalm" user_password="0000":
+    {{ _make }} -C {{ justfile_directory() }} .install_packages \
+        USER_LOGIN={{ user_login }} \
+        USER_PW={{ user_password }}
 
 # Pull /vendor/firmware out of the Pixel Fold (felix) factory OTA and stage it
 # under rootfs/vendor-firmware/extracted/. The Makefile's

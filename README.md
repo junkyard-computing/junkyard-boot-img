@@ -31,7 +31,7 @@ just sync_vendor_firmware         # once; ~2GB OTA download
 just all                          # full pipeline; produces boot/{boot,vendor_boot,rootfs}.img
 ```
 
-`just all` takes optional args: `android_kernel_branch`, `size`, `debootstrap_release`, `root_password`, `hostname`. Defaults: `android-gs-felix-6.1-android16`, `8100M`, `trixie`, `0000`, `fold`.
+`just all` takes optional args: `android_kernel_branch`, `size`, `debootstrap_release`, `root_password`, `hostname`, `user_login`, `user_password`. Defaults: `android-gs-felix-6.1-android16`, `8100M`, `trixie`, `0000`, `fold`, `kalm`, `0000`.
 
 ### What `just all` runs
 
@@ -43,7 +43,7 @@ It drives the Makefile's sentinel chain. Each stage writes a dotfile on success,
 | `.debootstrap` | Two-stage debootstrap of `trixie` into the mounted image; sets root password and hostname |
 | `.build_kernel` | Bazel-builds the felix kernel with the custom defconfig fragment; writes `kernel/kernel_version` |
 | `.install_vendor_firmware` | Rsyncs `rootfs/vendor-firmware/extracted/firmware/` (from `sync_vendor_firmware`) into `/vendor/firmware/` on the mounted image — required for UART input |
-| `.install_packages` | `apt-get install` everything in [rootfs/packages.txt](rootfs/packages.txt); disables `dhcpcd`, enables `NetworkManager`, seeds a DHCP ethernet profile; rsyncs [rootfs/overlay/](rootfs/overlay/) into the sysroot |
+| `.install_packages` | `apt-get install` everything in [rootfs/packages.txt](rootfs/packages.txt); installs kmscon from a pinned Debian-pool `.deb` (trixie dropped it); creates `$(USER_LOGIN)` with passwordless sudo; masks `systemd-backlight@.service`; disables `dhcpcd`, enables `NetworkManager`, seeds a DHCP ethernet profile; rsyncs [rootfs/overlay/](rootfs/overlay/) into the sysroot |
 | `.install_kernel` | Copies modules from the kernel build's staging archives, runs `depmod`, installs kernel headers, composes `rootfs/module_order.txt` for dracut's force-drivers list (with `bcmdhd4389`/`exynos_mfc` stripped) |
 | `.install_initramfs` | Runs `dracut` inside `systemd-nspawn` with `--force-drivers` from `module_order.txt` |
 | `.build_boot` | `mkbootimg` twice — `boot.img` (kernel + `root=` cmdline) and `vendor_boot.img` (dtb + vendor_ramdisk_fragment pointing at the dracut initramfs) |
@@ -67,4 +67,3 @@ fastboot oem disable-verification
 * Proper fstab
 * Dedicated build machine
 * Mount additional partitions by label
-* Suppress sleep when lid closed
