@@ -16,3 +16,4 @@ openssh-server
 ethtool
 usbutils
 systemd-resolved
+avahi-daemon

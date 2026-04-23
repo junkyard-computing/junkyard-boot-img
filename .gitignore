@@ -148,7 +148,24 @@ Cargo.lock
 # End of https://www.toptal.com/developers/gitignore/api/linux,c,c++,android,rust
 
 kernel_version
+kernel/kernel_version
 rootfs/module_order.txt
+rootfs/sysroot/
+rootfs/unpack/
+boot/rootfs.img
+boot/boot.img
+boot/vendor_boot.img
+
+# Build-pipeline sentinel files written by the Makefile.
+.create_image
+.debootstrap
+.build_kernel
+.sync_vendor_firmware
+.install_vendor_firmware
+.install_packages
+.install_kernel
+.install_initramfs
+.build_boot
 
 # Downloaded at build time by `just sync_vendor_firmware`
 tools/payload-dumper-go/
