@@ -67,6 +67,11 @@ Login lives on kmscon (pinned `kmscon_9.0.0-4_arm64.deb` from the Debian pool �
 ### mkbootimg is a submodule
 [tools/mkbootimg](tools/mkbootimg) is the upstream AOSP mkbootimg repo pulled in via `.gitmodules`. `.build_boot` invokes its `mkbootimg.py` twice — once for `boot.img` (kernel + generic root= cmdline) and once for `vendor_boot.img` (dtb + vendor_ramdisk_fragment pointing at the dracut initramfs inside the mounted rootfs image). Header version 4, pagesize 2048.
 
+### dtbo partition must be re-flashed — critical
+The base `dtb.img` we pass to `vendor_boot.img` is only the SoC-level tree ([gs201.dtsi](kernel/source/private/devices/google/gs201/dts/gs201.dtsi)), where `serial_0`, the foldable panels, and most other felix-specific nodes are `status = "disabled"`. The felix variant overlays (`gs201-felix-*.dtbo`, packaged into `kernel/source/out/felix/dist/dtbo.img`) flip those to `status = "okay"` at boot time when the bootloader selects the variant matching the board ID. We don't bake the overlay into `vendor_boot.img`; the dtbo lives on its own `dtbo` partition.
+
+Consequence: `fastboot flash dtbo kernel/source/out/felix/dist/dtbo.img` is mandatory, and [flash.sh](flash.sh) does it. Skipping it (or flashing a stock image afterward and only re-flashing our `boot`/`vendor_boot`/`super`) produces a half-configured DT where earlycon printk still reaches UART (MMIO poking, no driver needed) but `/dev/ttySAC0` never appears and the panel never lights up — the device boots to `graphical.target` but nothing interactive works.
+
 ## Conventions
 
 - Adding apt packages → one per line in [rootfs/packages.txt](rootfs/packages.txt) (read by the justfile at parse time and space-joined into the apt install invocation).

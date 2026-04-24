@@ -105,6 +105,10 @@ all:
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"echo '%sudo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-sudo-nopasswd \
 		&& chmod 0440 /etc/sudoers.d/99-sudo-nopasswd"
+	# Explicitly enable a getty on felix's UART console. The compiled-in
+	# `console=ttynull` in CONFIG_CMDLINE masks ttySAC0 from /sys/class/tty/
+	# console/active, so systemd-getty-generator won't spawn one on its own.
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl enable serial-getty@ttySAC0.service
 	# systemd-backlight@.service pulls felix into systemd "degraded" on every
 	# boot; mask it (symlink to /dev/null) to keep `systemctl is-system-running`
 	# green.

@@ -20,5 +20,15 @@ format_userdata() {
   fi
 }
 
+setup_usb_gadget() {
+  # Bring up a USB NCM gadget so the device is reachable over USB-Ethernet
+  # when plugged into a host — gives SSH access (port 22, kalm/kalm) without
+  # needing a serial cable or wired ethernet dongle.
+  if [ ! -e /sys/kernel/config/usb_gadget/g1 ]; then
+    /usr/local/sbin/usb_gadget || true
+  fi
+}
+
 load_aoc_firmware
+setup_usb_gadget
 format_userdata
