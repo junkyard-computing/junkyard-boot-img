@@ -178,14 +178,19 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.install_initramfs: .install_kernel .install_packages
+.install_initramfs: .install_kernel .install_packages .install_vendor_firmware
 	just mount_rootfs
+	# Bundle aoc.bin into the initramfs at the path firmware_class.path
+	# (/vendor/firmware, set by the dtb's /chosen/bootargs) points at.
+	# Without it, the AOC coprocessor retry-loops in dracut and starves
+	# UART RX, so emergency-shell keystrokes are dropped.
 	sudo systemd-nspawn -D $(SYSROOT_DIR) dracut \
 		--kver $(KERNEL_VERSION) \
 		--lz4 \
 		--show-modules \
 		--force \
 		--add "rescue bash" \
+		--install /vendor/firmware/aoc.bin \
 		--kernel-cmdline "rd.shell" \
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
 	just unmount_rootfs
