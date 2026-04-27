@@ -1,0 +1,360 @@
+diff --git a/arch/arm64/boot/dts/exynos/google/gs201.dtsi b/arch/arm64/boot/dts/exynos/google/gs201.dtsi
+index cf3b34066894..ffa971faa5e3 100644
+--- a/arch/arm64/boot/dts/exynos/google/gs201.dtsi
++++ b/arch/arm64/boot/dts/exynos/google/gs201.dtsi
+@@ -4,18 +4,25 @@
+  *
+  * Copyright 2026 Google LLC
+  *
+- * This DTSI covers the subset of GS201 hardware required for a
+- * headless mainline Linux system: interrupt controller, timers, PSCI,
+- * ACPM/clocks, pinctrl, serial console, UFS storage, USB, and the
+- * Mali-G710 GPU via the Panthor driver.
++ * Two non-obvious things about gs201:
+  *
+- * TODO: A GS201 CMU (Clock Management Unit) driver is not yet written.
+- * UFS and USB peripheral clocks are supplied as fixed-rate stubs
+- * (matching the frequencies the Android bootloader programmes) until
+- * proper CMU drivers are contributed.  GPU DVFS clocks are ACPM-based
+- * and work without the CMU driver.
++ * 1. BL31 firewalls EL1 CMU access UNLESS the kernel boots with
++ *    `kvm-arm.mode=protected` (Makefile sets this). With pKVM disabled,
++ *    direct readl of CMU_TOP @ 0x1e080000 aborts with synchronous external
++ *    abort code 0x96000010. See memory/project_pkvm_cmu_unlock.md.
++ *
++ * 2. Even with CMU access unlocked, mainline `clk-gs101.c` is not
++ *    register-layout compatible with gs201: many CMU_TOP and CMU_HSI2
++ *    register offsets differ from gs101 (AOSP cal-if `cmucal-sfr.c` has
++ *    the gs201-correct map; e.g. SHARED0_DIV4 is at 0x1930 on gs201 vs
++ *    0x1908 on gs101, HSI2_BUS/MMC_CARD are swapped, etc.). Until a
++ *    proper gs201 clock driver exists, UFS/peripheral clocks stay on
++ *    fixed-rate stubs that report the bootloader-programmed rates.
++ *    Hardware is already running at the right rate; the kernel just
++ *    can't reprogram it without the correct offsets.
+  */
+ 
++#include <dt-bindings/clock/google,gs101.h>
+ #include <dt-bindings/clock/google,gs201-acpm.h>
+ #include <dt-bindings/gpio/gpio.h>
+ #include <dt-bindings/interrupt-controller/arm-gic.h>
+@@ -265,12 +272,22 @@ oscclk: osc-clock {
+ 	};
+ 
+ 	/*
+-	 * Stub fixed-rate clocks for UFS until google,gs201-cmu-hsi2 driver
+-	 * is written.  Rates match what the Android bootloader configures:
+-	 *   aclk / core_clk  : 267 MHz
+-	 *   unipro mclk      : 333 MHz (HS-G4 mode)
+-	 * The UFS controller uses these values for timing calculations only;
+-	 * the actual hardware clocks are pre-configured by the bootloader.
++	 * Fixed-rate stubs for UFS — see top-of-file note about gs201
++	 * CMU register offsets being incompatible with mainline clk-gs101.
++	 * Rates back-computed from raw CMU_TOP register reads on a real
++	 * boot using gs201-correct offsets (see git history for the probe):
++	 *
++	 *   PLL_CON3_PLL_SHARED0 = 0xa15b0400
++	 *     → M=347, P=4, S=0 → 24.576MHz * 347/4/1 = 2,131,968,000 Hz
++	 *   shared0_div4 = 2131968000 / 4 = 532,992,000 Hz
++	 *   MUX_HSI2_UFS_EMBD = 1 (selects shared0_div4)
++	 *   DIV_HSI2_UFS_EMBD = 2 (divides by 3)
++	 *     → mclk_rate = 532992000 / 3 = 177,664,000 Hz
++	 *
++	 * ufs_aclk's actual rate would come from HSI2_NOC (gs201's "BUS"
++	 * divider, at offset 0x189c — different from gs101's 0x1898 which
++	 * holds MMC_CARD on gs201). Not yet measured; leaving at the
++	 * driver's PCLK_AVAIL_MAX as a known-in-range value.
+ 	 */
+ 	ufs_aclk: ufs-aclk {
+ 		compatible = "fixed-clock";
+@@ -281,14 +298,7 @@ ufs_aclk: ufs-aclk {
+ 	ufs_unipro: ufs-unipro-clk {
+ 		compatible = "fixed-clock";
+ 		#clock-cells = <0>;
+-		clock-frequency = <333000000>;
+-	};
+-
+-	/* stub for UFS PHY reference clock (26 MHz from TCXO) */
+-	ufs_refclk: ufs-refclk {
+-		compatible = "fixed-clock";
+-		#clock-cells = <0>;
+-		clock-frequency = <26000000>;
++		clock-frequency = <177664000>;
+ 	};
+ 
+ 	/* ------------------------------------------------------------------ */
+@@ -518,6 +528,36 @@ pinctrl_4: pinctrl@10840000 {
+ 		#gpio-cells = <2>;
+ 		interrupt-controller;
+ 		#interrupt-cells = <2>;
++
++		/*
++		 * gpp0 bank — used for the UFS device's VCC enable pin
++		 * (gpp0-1, see ufs_fixed_vcc below). The Samsung pinctrl
++		 * driver requires explicit bank subnodes; without this,
++		 * `<&gpp0 1 0>` won't resolve and ufs_fixed_vcc fails to
++		 * register, leaving the UFS chip unpowered.
++		 */
++		gpp0: gpp0-gpio-bank {
++			gpio-controller;
++			#gpio-cells = <2>;
++			interrupt-controller;
++			#interrupt-cells = <2>;
++		};
++
++		/*
++		 * Force gpp0-1 into GPIO output function so the
++		 * ufs_fixed_vcc regulator can actually drive the UFS
++		 * device's VCC enable line. Mainline Samsung pinctrl
++		 * doesn't automatically switch the pin's alt-function
++		 * when a consumer requests it as a GPIO; without an
++		 * explicit pin-function = 0 entry, the bootloader's
++		 * leftover function (or POR default) stays selected and
++		 * gpio_set_value writes never reach the pad.
++		 */
++		ufs_vcc_en: ufs-vcc-en {
++			samsung,pins = "gpp0-1";
++			samsung,pin-function = <0>;
++			samsung,pin-pud = <0>;
++		};
+ 	};
+ 
+ 	/* 5: GPIO_PERIC1 */
+@@ -562,6 +602,53 @@ pinctrl_8: pinctrl@14460000 {
+ 		#gpio-cells = <2>;
+ 		interrupt-controller;
+ 		#interrupt-cells = <2>;
++
++		/*
++		 * gph3 bank (2 pins at offset 0x000) — the only bank under
++		 * pinctrl_8. The gs201 pin-controller driver has the layout
++		 * hardcoded (gs201_pin_hsi2ufs[] in pinctrl-exynos-arm64.c),
++		 * but it still needs this subnode to exist so pin references
++		 * like "gph3-0" in the pin-state nodes below can be resolved.
++		 */
++		gph3: gph3-gpio-bank {
++			gpio-controller;
++			#gpio-cells = <2>;
++			interrupt-controller;
++			#interrupt-cells = <2>;
++		};
++
++		/*
++		 * UFS GPIO pin-mux states, consumed by ufs_0's pinctrl-0.
++		 * These belong nested in their owning pin-controller — placing
++		 * them at the root of the tree (as this file originally did)
++		 * makes fw_devlink treat the phandle targets as supplier
++		 * *devices* and defer ufs_0's probe forever waiting for a
++		 * driver that will never bind to a pinctrl-state subnode.
++		 */
++		/*
++		 * Both pins use pin-function = 2 (UFS host-controller alt
++		 * function), not GPIO. With GPIO, the host controller's
++		 * internal HCI_GPIO_OUT reset toggle (driven by
++		 * exynos_ufs_dev_hw_reset()) never reaches the UFS device's
++		 * RST_N pin, so the device can't respond to LINKSTARTUP and
++		 * link startup fails 4× then aborts. Values match AOSP
++		 * gs201-pinctrl.dtsi.
++		 */
++		ufs_rst_n: ufs-rst-n {
++			samsung,pins = "gph3-1";
++			samsung,pin-function = <2>;
++			samsung,pin-pud = <0>;
++			samsung,pin-con-pdn = <3>;
++			samsung,pin-pud-pdn = <0>;
++		};
++
++		ufs_refclk_out: ufs-refclk-out {
++			samsung,pins = "gph3-0";
++			samsung,pin-function = <2>;
++			samsung,pin-pud = <0>;
++			samsung,pin-con-pdn = <3>;
++			samsung,pin-pud-pdn = <0>;
++		};
+ 	};
+ 
+ 	/* ------------------------------------------------------------------ */
+@@ -573,11 +660,6 @@ serial_0: serial@10a00000 {
+ 		reg = <0x0 0x10a00000 0x100>;
+ 		samsung,fifo-size = <256>;
+ 		interrupts = <GIC_SPI 673 IRQ_TYPE_LEVEL_HIGH>;
+-		/*
+-		 * TODO: replace with proper gs201-cmu-peric0 clock references
+-		 * once the CMU driver is written.  The UART is configured by
+-		 * the bootloader at 115200-8n1; earlycon works without clocks.
+-		 */
+ 		clocks = <&oscclk>, <&oscclk>;
+ 		clock-names = "uart", "clk_uart_baud0";
+ 		status = "disabled";
+@@ -592,6 +674,41 @@ sysreg_hsi2: syscon@14420000 {
+ 		reg = <0x0 0x14420000 0x1000>;
+ 	};
+ 
++	/*
++	 * UFS device VCC enable. The KIOXIA THGJFGT1E45BAIPB's main power
++	 * rail is gated by gpp0-1 on felix; the bootloader drives it high to
++	 * talk to the device, then drops it during shutdown ("[I] [UFS]
++	 * shutdown complete"). Without this regulator, the kernel's UFS
++	 * driver sees a powered-down device — link startup completes (host
++	 * PHY has independent power) but every NOP OUT response slot stays
++	 * at 0 because the device chip isn't running. Matches AOSP's
++	 * gs201-ufs.dtsi ufs_fixed_vcc.
++	 */
++	ufs_fixed_vcc: regulator-ufs-vcc {
++		compatible = "regulator-fixed";
++		regulator-name = "ufs-vcc";
++		gpio = <&gpp0 1 GPIO_ACTIVE_HIGH>;
++		enable-active-high;
++		/*
++		 * Deliberately omit regulator-boot-on. The bootloader's
++		 * `[I] [UFS] shutdown complete` drops VCC before handing
++		 * off, so when the kernel boots the rail is OFF. With
++		 * regulator-boot-on, the framework would think it's
++		 * already on and skip the GPIO drive when UFS calls
++		 * regulator_enable. Without it, the framework runs the
++		 * fixed-voltage enable path and gpiod_set_value actually
++		 * drives gpp0-1 high.
++		 *
++		 * Power-on settling time. UFS device VCC needs to be
++		 * stable before the host issues commands; without this
++		 * the link comes up but NOP OUT can race the device's
++		 * internal init.
++		 */
++		startup-delay-us = <2000>;
++		pinctrl-names = "default";
++		pinctrl-0 = <&ufs_vcc_en>;
++	};
++
+ 	ufs_0: ufs@14700000 {
+ 		compatible = "google,gs201-ufs";
+ 		reg = <0x0 0x14700000 0x200>,   /* HCI standard  */
+@@ -602,10 +719,6 @@ ufs_0: ufs@14700000 {
+ 		interrupts = <GIC_SPI 453 IRQ_TYPE_LEVEL_HIGH>;
+ 		pinctrl-names = "default";
+ 		pinctrl-0 = <&ufs_rst_n &ufs_refclk_out>;
+-		/*
+-		 * Fixed-rate clock stubs — see top-of-file TODO.
+-		 * Replace with <&cmu_hsi2 …> entries when the CMU driver lands.
+-		 */
+ 		clocks = <&ufs_aclk>, <&ufs_unipro>, <&ufs_aclk>,
+ 			 <&ufs_aclk>, <&ufs_aclk>,   <&ufs_aclk>;
+ 		clock-names = "core_clk", "sclk_unipro_main", "fmp",
+@@ -613,43 +726,59 @@ ufs_0: ufs@14700000 {
+ 		freq-table-hz = <0 0>, <0 0>, <0 0>, <0 0>, <0 0>, <0 0>;
+ 		phys = <&ufs_0_phy>;
+ 		phy-names = "ufs-phy";
+-		samsung,sysreg = <&sysreg_hsi2>;
++		vcc-supply = <&ufs_fixed_vcc>;
+ 		ufs,pmd-attr-lane = /bits/ 8 <2>;
+ 		ufs,pmd-attr-gear = /bits/ 8 <4>;
++		/*
++		 * `dma-coherent` is required on gs201. exynos_ufs_parse_dt sets
++		 * `iocc_val = iocc_mask` only when of_dma_is_coherent() is true;
++		 * otherwise it sets iocc_val = 0, which causes
++		 * exynos_ufs_shareability's regmap_update_bits(sysreg+0x710,
++		 * mask=0x3, val=0) to actively CLEAR the bootloader's IOCC RD/WR
++		 * Sharable bits (observed: bootloader 0x13 → kernel 0x10). With
++		 * the bits cleared, the controller's AXI transactions are issued
++		 * with Device-memory semantics, so its UPIU writes never reach
++		 * CPU-visible DRAM (proven via magic-stamp test — controller fires
++		 * UTRCS but the response slot stays at 0xAB through the entire
++		 * transaction). Match AOSP's gs201-ufs.dtsi which has both
++		 * `dma-coherent` and `ufs-iocc { val = <0x3>; }`.
++		 */
+ 		dma-coherent;
++		samsung,sysreg = <&sysreg_hsi2 0x710>;
+ 	};
+ 
++	/* UFS PHY ref_clk is the 24.576 MHz SoC oscillator (gs101 uses the
++	 * same here). The PHY init sequence in phy-gs101-ufs.c writes ~70
++	 * magic register values calibrated for this reference frequency. */
+ 	ufs_0_phy: phy@14704000 {
+ 		compatible = "google,gs201-ufs-phy";
+ 		reg = <0x0 0x14704000 0x3000>;
+ 		reg-names = "phy-pma";
+-		clocks = <&ufs_refclk>;
++		clocks = <&oscclk>;
+ 		clock-names = "ref_clk";
+ 		samsung,pmu-syscon = <&pmu_alive>;
+ 		#phy-cells = <0>;
+ 	};
+ 
+-	/* UFS GPIO pin states (referenced from ufs_0) */
+-	ufs_rst_n: ufs-rst-n {
+-		samsung,pins = "gph3-1";
+-		samsung,pin-function = <1>;
+-		samsung,pin-pud = <0>;
+-		samsung,pin-drv = <0>;
+-	};
+-
+-	ufs_refclk_out: ufs-refclk-out {
+-		samsung,pins = "gph3-0";
+-		samsung,pin-function = <2>;
+-		samsung,pin-pud = <0>;
+-		samsung,pin-drv = <0>;
+-	};
++	/* UFS pin-mux states (ufs_rst_n, ufs_refclk_out) live inside pinctrl_8
++	 * above — see the comment there for why they must not be at root. */
+ 
+ 	/* ------------------------------------------------------------------ */
+ 	/* PMU syscon (needed by UFS PHY and power domain drivers)             */
+ 	/* ------------------------------------------------------------------ */
+ 
++	/*
++	 * Drop the "syscon" fallback compat: when both are present, the
++	 * generic of_syscon driver registers a direct-MMIO regmap for the
++	 * node and races/shadows the SMC-routed regmap that exynos-pmu.c
++	 * installs via of_syscon_register_regmap(). With only
++	 * "google,gs201-pmu" present (matching gs101.dtsi), exynos-pmu wins
++	 * and syscon_regmap_lookup_by_phandle() returns the SMC regmap, so
++	 * UFS PHY isolation writes to PMU_ALIVE+0x3ec8 go through BL31
++	 * instead of aborting.
++	 */
+ 	pmu_alive: pmu@18060000 {
+-		compatible = "google,gs201-pmu", "syscon";
++		compatible = "google,gs201-pmu";
+ 		reg = <0x0 0x18060000 0x10000>;
+ 	};
+ 
+@@ -712,21 +841,29 @@ gpu: gpu@28000000 {
+ 		#cooling-cells = <2>;
+ 	};
+ 
++	/*
++	 * When the gpu node gets a mali-supply regulator wired up, the OPP core
++	 * rejects any opp node that omits opp-microvolt (opp_parse_microvolt:
++	 * "missing although OPP managing regulators"). Every entry lists
++	 * <900000> — matches the fixed-regulator stub in gs201-felix.dts. Real
++	 * per-OPP voltages can replace these once an ACPM-backed regulator
++	 * driver exists and can actually program the G3D rail.
++	 */
+ 	gpu_opp: opp-table-gpu {
+ 		compatible = "operating-points-v2";
+ 		/* G3D (shader core) frequencies in Hz */
+-		opp-202000000 { opp-hz = /bits/ 64 <202000000>; };
+-		opp-251000000 { opp-hz = /bits/ 64 <251000000>; };
+-		opp-302000000 { opp-hz = /bits/ 64 <302000000>; };
+-		opp-351000000 { opp-hz = /bits/ 64 <351000000>; };
+-		opp-400000000 { opp-hz = /bits/ 64 <400000000>; };
+-		opp-434000000 { opp-hz = /bits/ 64 <434000000>; };
+-		opp-471000000 { opp-hz = /bits/ 64 <471000000>; };
+-		opp-510000000 { opp-hz = /bits/ 64 <510000000>; };
+-		opp-572000000 { opp-hz = /bits/ 64 <572000000>; };
+-		opp-633000000 { opp-hz = /bits/ 64 <633000000>; };
+-		opp-701000000 { opp-hz = /bits/ 64 <701000000>; };
+-		opp-762000000 { opp-hz = /bits/ 64 <762000000>; };
+-		opp-848000000 { opp-hz = /bits/ 64 <848000000>; };
++		opp-202000000 { opp-hz = /bits/ 64 <202000000>; opp-microvolt = <900000>; };
++		opp-251000000 { opp-hz = /bits/ 64 <251000000>; opp-microvolt = <900000>; };
++		opp-302000000 { opp-hz = /bits/ 64 <302000000>; opp-microvolt = <900000>; };
++		opp-351000000 { opp-hz = /bits/ 64 <351000000>; opp-microvolt = <900000>; };
++		opp-400000000 { opp-hz = /bits/ 64 <400000000>; opp-microvolt = <900000>; };
++		opp-434000000 { opp-hz = /bits/ 64 <434000000>; opp-microvolt = <900000>; };
++		opp-471000000 { opp-hz = /bits/ 64 <471000000>; opp-microvolt = <900000>; };
++		opp-510000000 { opp-hz = /bits/ 64 <510000000>; opp-microvolt = <900000>; };
++		opp-572000000 { opp-hz = /bits/ 64 <572000000>; opp-microvolt = <900000>; };
++		opp-633000000 { opp-hz = /bits/ 64 <633000000>; opp-microvolt = <900000>; };
++		opp-701000000 { opp-hz = /bits/ 64 <701000000>; opp-microvolt = <900000>; };
++		opp-762000000 { opp-hz = /bits/ 64 <762000000>; opp-microvolt = <900000>; };
++		opp-848000000 { opp-hz = /bits/ 64 <848000000>; opp-microvolt = <900000>; };
+ 	};
+ };

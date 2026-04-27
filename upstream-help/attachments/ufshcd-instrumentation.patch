@@ -1,0 +1,103 @@
+diff --git a/drivers/ufs/core/ufshcd.c b/drivers/ufs/core/ufshcd.c
+index 9ceb6d6d479d..13f03ceb4e88 100644
+--- a/drivers/ufs/core/ufshcd.c
++++ b/drivers/ufs/core/ufshcd.c
+@@ -2897,7 +2897,15 @@ static int ufshcd_compose_devman_upiu(struct ufs_hba *hba,
+ 	else
+ 		ret = -EINVAL;
+ 
+-	memset(lrbp->ucd_rsp_ptr, 0, sizeof(struct utp_upiu_rsp));
++	/*
++	 * Stamp the response slot with magic byte 0xAB BEFORE handing off to
++	 * the controller. If the controller writes a real response, we'll see
++	 * legitimate UPIU bytes; if it doesn't (silently dropped DMA), we'll
++	 * see 0xAB still in place. (Don't try to stamp UTRD->header.ocs — the
++	 * controller appears to treat non-OCS_INVALID initial values as
++	 * "slot already processed" and skips the transaction.)
++	 */
++	memset(lrbp->ucd_rsp_ptr, 0xAB, sizeof(struct utp_upiu_rsp));
+ 
+ 	return ret;
+ }
+@@ -3250,8 +3258,79 @@ ufshcd_dev_cmd_completion(struct ufs_hba *hba, struct ufshcd_lrb *lrbp)
+ 		break;
+ 	default:
+ 		err = -EINVAL;
+-		dev_err(hba->dev, "%s: Invalid device management cmd response: %x\n",
+-				__func__, resp);
++		dev_err(hba->dev, "%s: Invalid device management cmd response: %x (dev_cmd.type=%d)\n",
++				__func__, resp, hba->dev_cmd.type);
++		print_hex_dump(KERN_ERR, "UTRD: ", DUMP_PREFIX_OFFSET, 16, 4,
++			       lrbp->utr_descriptor_ptr,
++			       sizeof(*lrbp->utr_descriptor_ptr), false);
++		print_hex_dump(KERN_ERR, "REQ UPIU: ", DUMP_PREFIX_OFFSET, 16, 4,
++			       lrbp->ucd_req_ptr,
++			       sizeof(struct utp_upiu_header) + 16, false);
++		print_hex_dump(KERN_ERR, "RSP UPIU: ", DUMP_PREFIX_OFFSET, 16, 4,
++			       lrbp->ucd_rsp_ptr,
++			       sizeof(struct utp_upiu_header) + 16, false);
++		dev_err(hba->dev, "  rsp DMA=%pad  utrd DMA=%pad\n",
++			&lrbp->ucd_rsp_dma_addr, &lrbp->utrd_dma_addr);
++		dev_err(hba->dev, "  HCI: HCE=0x%08x HCS=0x%08x IS=0x%08x IE=0x%08x\n",
++			ufshcd_readl(hba, REG_CONTROLLER_ENABLE),
++			ufshcd_readl(hba, REG_CONTROLLER_STATUS),
++			ufshcd_readl(hba, REG_INTERRUPT_STATUS),
++			ufshcd_readl(hba, REG_INTERRUPT_ENABLE));
++		dev_err(hba->dev, "  HCI: UTRLDBR=0x%08x UTRLRSR=0x%08x UTRLCNR=0x%08x\n",
++			ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_DOOR_BELL),
++			ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_RUN_STOP),
++			ufshcd_readl(hba, REG_UTP_TRANSFER_REQ_LIST_CLEAR));
++		dev_err(hba->dev, "  UIC errs: PA=0x%08x DL=0x%08x N=0x%08x T=0x%08x DME=0x%08x\n",
++			ufshcd_readl(hba, REG_UIC_ERROR_CODE_PHY_ADAPTER_LAYER),
++			ufshcd_readl(hba, REG_UIC_ERROR_CODE_DATA_LINK_LAYER),
++			ufshcd_readl(hba, REG_UIC_ERROR_CODE_NETWORK_LAYER),
++			ufshcd_readl(hba, REG_UIC_ERROR_CODE_TRANSPORT_LAYER),
++			ufshcd_readl(hba, REG_UIC_ERROR_CODE_DME));
++		/*
++		 * Re-read response UPIU after invalidating the cache line.
++		 * If contents differ from the dump above, this is a DMA-coherency
++		 * issue (controller wrote into memory but driver read stale cache).
++		 */
++		dma_sync_single_for_cpu(hba->dev, lrbp->ucd_rsp_dma_addr,
++					sizeof(struct utp_upiu_rsp),
++					DMA_FROM_DEVICE);
++		print_hex_dump(KERN_ERR, "RSP UPIU (after sync): ",
++			       DUMP_PREFIX_OFFSET, 16, 4,
++			       lrbp->ucd_rsp_ptr,
++			       sizeof(struct utp_upiu_header) + 16, false);
++		/*
++		 * The UTRD's response_upiu_offset is encoded in BYTES if the
++		 * UFSHCD_QUIRK_PRDT_BYTE_GRAN quirk is set, otherwise in DWORDS
++		 * (per UFS spec). gs201 sets the quirk → mainline writes 0x200
++		 * (bytes). If gs201 hardware actually wants DWORDS (standard),
++		 * the controller would interpret 0x200 as DWORDS and write the
++		 * response at UCD+0x800 (= mainline's lrbp->ucd_rsp_ptr + 0x600).
++		 * Dump that region to check if there's a real NOP_IN response
++		 * sitting at the wrong offset.
++		 */
++		print_hex_dump(KERN_ERR, "UCD+0x800 (alt rsp loc): ",
++			       DUMP_PREFIX_OFFSET, 16, 4,
++			       (u8 *)lrbp->ucd_rsp_ptr + 0x600,
++			       sizeof(struct utp_upiu_header) + 16, false);
++		/*
++		 * gs201 S2MPU (Stage-2 Memory Protection Unit) at 0x145e0000.
++		 * Per-VID FAULT_PA_LOW (offset 0x2004+) reads SError from EL1
++		 * (those registers appear EL2-only on gs201), so only read the
++		 * non-fenced summary registers. CTRL0 carries the enable bit;
++		 * if 0, S2MPU is in pass-through and isn't blocking us.
++		 */
++		{
++			void __iomem *s = ioremap(0x145e0000, 0x4000);
++			if (s) {
++				dev_err(hba->dev, "  S2MPU-HSI2: VERSION=0x%08x STATUS=0x%08x CTRL0=0x%08x CTRL1=0x%08x FAULT_STATUS=0x%08x\n",
++					readl(s + 0x60), readl(s + 0x68),
++					readl(s + 0x00), readl(s + 0x04),
++					readl(s + 0x2000));
++				iounmap(s);
++			} else {
++				dev_err(hba->dev, "  S2MPU-HSI2: ioremap(0x145e0000) failed\n");
++			}
++		}
+ 		break;
+ 	}
+ 

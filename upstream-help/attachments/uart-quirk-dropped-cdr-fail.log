@@ -1,0 +1,81 @@
+
+[    1.707268] exynos-ufshc 14700000.ufs: UFSP after-cfg: SECURITY=0xfffa6492 SBEGIN0=0xfffa6492 SEND0=0xfffa6492 SLUN0=0xfffa6492 SCTRL0=0xfffa6492
+
+[    1.791719] samsung-ufs-phy 14704000.phy: failed to get cdr lock
+
+[    1.791830] exynos-ufshc 14700000.ufs: Power mode changed to : FAST series_B G_4 L_2
+
+[    1.792729] SMCCC: SOC_ID: ARCH_SOC_ID not implemented, skipping ....
+
+[    1.793276] usbcore: registered new interface driver usbhid
+
+[    1.795110] usbhid: USB HID core driver
+
+[    1.800787] NET: Registered PF_PACKET protocol family
+
+[    1.804006] 9pnet: Installing 9P2000 support
+
+[    1.808237] Key type dns_resolver registered
+
+[    1.816651] registered taskstats version 1
+
+[    1.816835] Loading compiled-in X.509 certificates
+
+[    1.824593] Demotion targets for Node 0: null
+
+[    1.826170] samsung-pinctrl 180d0000.pinctrl: Missing node for bank gpa0 - invalid DTB
+
+[    1.833563] samsung-pinctrl 180d0000.pinctrl: Missing node for bank gpa1 - invalid DTB
+
+[    1.841450] samsung-pinctrl 180d0000.pinctrl: Missing node for bank gpa2 - invalid DTB
+
+[    1.849346] samsung-pinctrl 180d0000.pinctrl: Missing node for bank gpa3 - invalid DTB
+
+[    1.857240] samsung-pinctrl 180d0000.pinctrl: Missing node for bank gpa4 - invalid DTB
+
+[    1.865135] samsung-pinctrl 180d0000.pinctrl: Missing node for bank gpa5 - invalid DTB
+
+[    1.873031] samsung-pinctrl 180d0000.pinctrl: Missing node for bank gpa9 - invalid DTB
+
+[    1.880955] samsung-pinctrl 180d0000.pinctrl: Missing node for bank gpa10 - invalid DTB
+
+[    1.889850] samsung-pinctrl 180e0000.pinctrl: Missing node for bank gpa6 - invalid DTB
+
+[    1.896812] samsung-pinctrl 180e0000.pinctrl: Missing node for bank gpa7 - invalid DTB
+
+[    1.904698] samsung-pinctrl 180e0000.pinctrl: Missing node for bank gpa8 - invalid DTB
+
+[    1.912592] samsung-pinctrl 180e0000.pinctrl: Missing node for bank gpa11 - invalid DTB
+
+[    1.921091] clk: Disabling unused clocks
+
+[    1.924488] PM: genpd: Disabling unused power domains
+
+[    1.929541] Warning: unable to open an initial console.
+
+[    7.817183] exynos-ufshc 14700000.ufs: ufshcd_abort: Device abort task at tag 0
+
+[    7.817340] host_regs: 00000000: 1303ff1f 00000000 00000300 00000000
+
+[    7.817460] host_regs: 00000010: 00000105 000001ce 00000000 00000000
+
+[    7.817576] host_regs: 00000020: 00000000 00071af5 00000000 00000000
+
+[    7.821203] host_regs: 00000030: 0000010f 00000001 00000000 00000000
+
+[    7.827529] host_regs: 00000040: 00000000 00000000 00000000 00000000
+
+[    7.833863] host_regs: 00000050: 817b9000 00000008 00000001 00000000
+
+[    7.840197] host_regs: 00000060: 00000001 00000001 00000000 00000000
+
+[    7.846530] host_regs: 00000070: 817b8000 00000008 00000000 00000000
+
+[    7.852864] host_regs: 00000080: 00000001 00000000 00000000 00000000
+
+[    7.859197] host_regs: 00000090: 00000002 15710000 00000000 00000000
+
+[    7.865533] exynos-ufshc 14700000.ufs: No record of pa_err
+
+[    7.871020] exynos-ufshc 14700000.ufs: dl_err[0] = 0x80000002 at 1821105 us
+

@@ -1,5 +1,0 @@
-"""
-Loads custom defconfig
-"""
-
-exports_files(["custom_defconfig"])
