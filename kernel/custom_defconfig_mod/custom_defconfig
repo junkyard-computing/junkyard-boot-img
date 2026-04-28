@@ -1,6 +1,6 @@
 CONFIG_SYSVIPC=y
 CONFIG_USER_NS=y
-CONFIG_CMDLINE="console=ttynull stack_depot_disable=on cgroup_disable=pressure kasan.page_alloc.sample=10 kasan.stacktrace=off kvm-arm.mode=nvhe bootconfig ioremap_guard cgroup_enable=cpuset cgroup_enable=cpu cgroup_enable=devices cgroup_enable=freezer cgroup_enable=blkio"
+CONFIG_CMDLINE="console=ttynull stack_depot_disable=on kasan.page_alloc.sample=10 kasan.stacktrace=off kvm-arm.mode=nvhe bootconfig ioremap_guard cgroup_enable=cpuset cgroup_enable=cpu cgroup_enable=devices cgroup_enable=freezer cgroup_enable=blkio"
 CONFIG_DEVTMPFS=y
 CONFIG_DEVTMPFS_MOUNT=y
 CONFIG_FW_LOADER_COMPRESS=y
@@ -19,3 +19,18 @@ CONFIG_VT=y
 CONFIG_HW_CONSOLE=y
 CONFIG_VT_HW_CONSOLE_BINDING=y
 CONFIG_DEVMEM=y
+
+# k8s/k3s — process & resource isolation
+CONFIG_PID_NS=y
+CONFIG_CGROUP_PIDS=y
+CONFIG_CGROUP_DEVICE=y
+CONFIG_CGROUP_PERF=y
+CONFIG_CGROUP_NET_CLASSID=y
+CONFIG_NET_CLS_CGROUP=y
+
+# k8s/k3s — networking (kube-proxy iptables mode + flannel VXLAN default)
+CONFIG_BRIDGE_NETFILTER=y
+CONFIG_VXLAN=y
+CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
+CONFIG_NETFILTER_XT_MATCH_RECENT=y
+CONFIG_IP6_NF_NAT=y

@@ -134,13 +134,19 @@ all:
 	sudo rm -f $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/modules.order
 	sudo touch $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/modules.order
 	@echo "Copying modules"
+	# Wipe stale .ko files from a previous kernel build before resyncing.
+	# rsync below must overwrite, not skip — a previous build's modules have
+	# __versions CRCs computed against the old vmlinux, so leaving them in
+	# place causes every module to fail MODVERSIONS check against a freshly
+	# rebuilt kernel and kicks the device into a watchdog reboot loop.
+	sudo find $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION) -name '*.ko' -delete 2>/dev/null || true
 	for staging in vendor_dlkm system_dlkm; \
 	do \
 		sudo mkdir -p rootfs/unpack/"$$staging" && \
 		sudo tar \
 			-xvzf $(KERNEL_BUILD_DIR)/"$$staging"_staging_archive.tar.gz \
 			-C rootfs/unpack/"$$staging"; \
-		sudo rsync -avK --ignore-existing --include='*/' --include='*.ko' --exclude='*' rootfs/unpack/"$$staging"/ $(SYSROOT_DIR)/; \
+		sudo rsync -avK --include='*/' --include='*.ko' --exclude='*' rootfs/unpack/"$$staging"/ $(SYSROOT_DIR)/; \
 		sudo sh -c "cat rootfs/unpack/\"$$staging\"/lib/modules/$(KERNEL_VERSION)/modules.order \
 			>> $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/modules.order"; \
 	done
