@@ -17,7 +17,7 @@ _rsync := require("rsync")
 [private]
 _fallocate := require("fallocate")
 [private]
-_mkfs_ext4 := require("mkfs.ext4")
+_mkfs_btrfs := require("mkfs.btrfs")
 [private]
 _curl := require("curl")
 [private]
@@ -135,12 +135,12 @@ config_kernel: clone_kernel_source
 build_kernel: clone_kernel_source
     {{ _make }} -C {{ justfile_directory() }} .build_kernel
 
-# Create the empty ext4 rootfs image.
+# Create the empty btrfs rootfs image.
 [group('rootfs')]
 create_rootfs_image size="8100M": unmount_rootfs
     {{ _make }} -C {{ justfile_directory() }} .create_image SIZE={{ size }}
 
-# Mount the ext4 rootfs image at rootfs/sysroot.
+# Mount the btrfs rootfs image at rootfs/sysroot.
 mount_rootfs size="8100M": (create_rootfs_image size)
     @mkdir -p {{ _sysroot_dir }}
     @if ! mountpoint -q {{ _sysroot_dir }}; then \
@@ -148,7 +148,7 @@ mount_rootfs size="8100M": (create_rootfs_image size)
       sudo mount {{ _sysroot_img }} {{ _sysroot_dir }}; \
     fi
 
-# Unmount the ext4 rootfs image.
+# Unmount the btrfs rootfs image.
 unmount_rootfs:
     @if mountpoint -q {{ _sysroot_dir }}; then \
       echo "Unmounting rootfs image from {{ _sysroot_dir }}"; \

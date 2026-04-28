@@ -44,7 +44,7 @@ all:
 .create_image:
 	mkdir -p $(SYSROOT_DIR)
 	sudo fallocate -l $(SIZE) $(ROOTFS_IMG)
-	sudo mkfs.ext4 -F -L rootfs $(ROOTFS_IMG)
+	sudo mkfs.btrfs -f -L rootfs $(ROOTFS_IMG)
 	touch $@
 
 .debootstrap: .create_image
