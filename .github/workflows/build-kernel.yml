@@ -36,7 +36,7 @@ jobs:
 
       # Checks out the repository under $GITHUB_WORKSPACE so subsequent steps
       # can access the kernel source, config files, and justfiles.
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       # Installs required build dependencies via apt.
       # - `repo`: Google's tool for managing multi-repo projects (used for kernel source)
@@ -65,7 +65,7 @@ jobs:
           eatmydata just update_kernel_modules_and_source
 
       # Uploads the compiled kernel tarball as a GitHub Actions artifact.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: kernel
           path: kernel/kernel.tar
@@ -73,7 +73,7 @@ jobs:
       # Uploads the full kernel build output directory as a separate artifact.
       # This includes intermediate build files, Module.symvers, and other outputs
       # that may be needed for debugging or building external kernel modules.
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v5
         with:
           name: kernel-build-out
           path: kernel/out/
