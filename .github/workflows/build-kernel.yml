@@ -53,7 +53,7 @@ jobs:
         run: |
           sudo rm -f /var/lib/man-db/auto-update
           sudo apt update
-          sudo eatmydata apt install -y repo kmod debootstrap systemd-container
+          sudo eatmydata apt install -y repo kmod debootstrap systemd-container qemu-user-static
           
 
       # Compiles the kernel and prepares the module tree and source artifacts using
