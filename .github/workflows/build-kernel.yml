@@ -38,12 +38,13 @@ jobs:
       # can access the kernel source, config files, and justfiles.
       - uses: actions/checkout@v5
 
+      # Downloads and installs the `just` command runner binary directly from upstream.
+      - name: Install just
+        run: curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | sudo bash -s -- --to /usr/bin
+
       # Installs required build dependencies via apt.
       # - `repo`: Google's tool for managing multi-repo projects (used for kernel source)
       # - `kmod`: utilities for loading/managing Linux kernel modules
-      # - `just`: a command runner (like make) used to invoke build recipes in this repo.
-      #   We copy a pre-built binary from the repo rather than installing via apt
-      #   because the apt version may be outdated or unavailable on this Ubuntu version.
       # `eatmydata` is used throughout to disable fsync/fdatasync calls, which speeds up
       # apt operations significantly in a throwaway CI environment where data durability
       # is not a concern.
@@ -52,7 +53,6 @@ jobs:
           sudo rm -f /var/lib/man-db/auto-update
           sudo apt update
           sudo eatmydata apt install -y repo kmod
-          sudo eatmydata cp just/just-x86_64 /usr/bin/just
 
       # Compiles the kernel and prepares the module tree and source artifacts using
       # the `just` command runner. Two targets are invoked:
