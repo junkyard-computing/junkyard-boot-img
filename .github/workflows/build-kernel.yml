@@ -53,7 +53,7 @@ jobs:
         run: |
           sudo rm -f /var/lib/man-db/auto-update
           sudo apt update
-          sudo eatmydata apt install -y repo kmod debootstrap
+          sudo eatmydata apt install -y repo kmod debootstrap systemd-container
           
 
       # Compiles the kernel and prepares the module tree and source artifacts using
