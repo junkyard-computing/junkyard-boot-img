@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Run a command inside an ephemeral build container with the repo bind-mounted.
+#
+# Usage:
+#   tools/dockershell                  # interactive shell
+#   tools/dockershell just all         # run the build
+#   tools/dockershell fastboot devices # talk to a connected device
+#   tools/dockershell tio /dev/ttyUSB0 # serial console
+#   tools/dockershell setup            # one-time host: register aarch64 binfmt
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+IMAGE="${JUNKYARD_IMAGE:-junkyard-build}"
+DOCKERFILE="$REPO_ROOT/tools/Dockerfile"
+
+if [ "${1:-}" = "setup" ]; then
+  echo "Registering aarch64 binfmt on the host kernel (one-time)..." >&2
+  exec docker run --privileged --rm tonistiigi/binfmt --install arm64
+fi
+
+# Rebuild image if missing or older than the Dockerfile.
+need_build=1
+if docker image inspect "$IMAGE" >/dev/null 2>&1; then
+  img_created=$(date -d "$(docker image inspect -f '{{.Created}}' "$IMAGE")" +%s)
+  df_mtime=$(stat -c %Y "$DOCKERFILE")
+  [ "$img_created" -gt "$df_mtime" ] && need_build=0
+fi
+if [ "$need_build" -eq 1 ]; then
+  docker build \
+    --build-arg USER_UID="$(id -u)" \
+    --build-arg USER_GID="$(id -g)" \
+    -t "$IMAGE" \
+    -f "$DOCKERFILE" \
+    "$REPO_ROOT/tools" >&2
+fi
+
+# Pass through serial adapters and the USB bus. Bind-mount /dev/bus/usb as a
+# directory (rather than --device) so devices that re-enumerate into bootloader
+# mode stay visible to the container without restart.
+device_args=()
+for tty in /dev/ttyUSB* /dev/ttyACM*; do
+  [ -e "$tty" ] && device_args+=(--device="$tty")
+done
+[ -d /dev/bus/usb ] && device_args+=(-v /dev/bus/usb:/dev/bus/usb)
+
+tty_args=(-i)
+[ -t 0 ] && tty_args+=(-t)
+
+[ $# -eq 0 ] && set -- bash
+
+exec docker run --rm \
+  "${tty_args[@]}" \
+  --privileged \
+  --cgroupns=host \
+  -v "$REPO_ROOT:/work" \
+  -w /work \
+  ${device_args[@]+"${device_args[@]}"} \
+  "$IMAGE" \
+  "$@"

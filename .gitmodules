@@ -5,3 +5,6 @@
 	path = kernel/source
 	url = https://github.com/junkyard-computing/linux.git
 	branch = felix
+[submodule "tools/pixel-devinfo"]
+	path = tools/pixel-devinfo
+	url = https://github.com/junkyard-computing/pixel-devinfo.git

@@ -87,3 +87,22 @@ Two submodules are configured in `.gitmodules`:
 ## Build-host prerequisites
 
 Beyond the obvious `just`, `git`, `qemu-user-static`: `make`, `e2fsprogs` (for `mkfs.ext4`), `rsync`, `debootstrap`, `systemd-container` (for `systemd-nspawn`), `curl`, `unzip`, `xxd`, `lz4`. Kernel build toolchain: an aarch64 cross-compiler (`gcc-aarch64-linux-gnu` on Debian/Ubuntu) plus the usual kbuild deps — `flex`, `bison`, `bc`, `libelf-dev`, `libssl-dev`, `dwarves` (pahole, for BTF), `cpio`, `kmod`. `erofs-utils` and `android-sdk-libsparse-utils` are optional and only kick in if a future felix OTA ships the vendor partition in those formats.
+
+## Docker build environment
+
+As an alternative to installing all of that on the host, [tools/Dockerfile](tools/Dockerfile) packages every prerequisite plus `fastboot` and `tio`, and [tools/dockershell](tools/dockershell) wraps `docker run --rm` so each invocation is an ephemeral container with the repo bind-mounted at `/work`. Persistent state (sentinels, `rootfs.img`, `kernel/source/out/`, vendor firmware extract) lives on the host bind mount; ephemeral state (loop mounts, the `systemd-nspawn` process tree) dies with the container — which matches the mount/work/unmount-per-stage shape the Makefile already assumes.
+
+The container runs as a `builder` user matched to the host uid/gid via `--build-arg USER_UID=…/USER_GID=…`, with passwordless sudo so the Makefile's `sudo`-laden recipes work unchanged. `builder` is added to `dialout`/`plugdev` so `/dev/ttyUSB*` and USB devices are accessible without `sudo`. `--privileged --cgroupns=host` is required: caps for `systemd-nspawn`, cgroup management, and loop-mounting `rootfs.img`.
+
+USB/UART passthrough: the wrapper auto-adds `--device=` for any `/dev/ttyUSB*`/`/dev/ttyACM*` it sees and bind-mounts `/dev/bus/usb` as a directory (rather than `--device`), so a device that re-enumerates between adb and fastboot modes stays visible to the next ephemeral `docker run` without restart.
+
+`qemu-user-static` binfmt is host-kernel global, not per-container. Run once with `./tools/dockershell setup` (wraps `tonistiigi/binfmt --install arm64`). Already in place on Debian-family hosts that have `qemu-user-static` + `binfmt-support` apt-installed.
+
+The image rebuilds automatically when the Dockerfile mtime is newer than the image's created time. Force a rebuild with `docker rmi junkyard-build`.
+
+UART capture modes:
+- Timed snapshot: `./tools/dockershell sh -c 'stty -F /dev/ttyUSB0 115200 raw -echo -icanon; timeout <SEC> cat /dev/ttyUSB0 > /work/uart.log'`
+- Background monitor: `docker run -d --rm --name uart --privileged -v "$PWD":/work --device=/dev/ttyUSB0 junkyard-build tio --log-file /work/uart.log /dev/ttyUSB0`; `tail -f uart.log` on the host. `docker stop uart` to end.
+- Interactive console: `./tools/dockershell tio /dev/ttyUSB0`.
+
+fastboot from inside: `./tools/dockershell fastboot devices`, `./tools/dockershell fastboot flash boot boot/boot.img`, etc. `flash.sh` still works directly on the host for users who already have host-side fastboot installed.
