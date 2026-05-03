@@ -1,0 +1,54 @@
+From 4b716ee1760358dca60d2b8012df1a67fc977f92 Mon Sep 17 00:00:00 2001
+From: "Christopher L. Crutchfield" <ccrutchf@ucsd.edu>
+Date: Sun, 3 May 2026 00:42:05 -0700
+Subject: [PATCH 2/7] phy: samsung-gs101-ufs: add missing END_UFS_PHY_CFG to
+ pre_pwr_hs table
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+tensor_gs101_pre_pwr_hs_config[] was missing the terminator entry. The
+samsung_ufs_phy_config -> for_each_phy_cfg walker iterates while
+cfg->id != 0, so without END_UFS_PHY_CFG it reads off the array end
+into the next-adjacent rodata, which is tensor_gs101_post_pwr_hs_config[].
+
+At HS pre-PMC, this means the entire post_pwr_hs table currently fires
+during pre_pwr_hs:
+
+  [intended] PHY_TRSV_REG_CFG_GS101(0x369, 0x11, PWR_MODE_ANY)
+  [intended] PHY_TRSV_REG_CFG_GS101(0x246, 0x03, PWR_MODE_ANY)
+  [unintended] PHY_COMN_REG_CFG(0x8, 0x60, PWR_MODE_PWM_ANY)
+  [unintended] PHY_TRSV_REG_CFG_GS101(0x222, 0x08, PWR_MODE_PWM_ANY)
+  [unintended] PHY_TRSV_REG_CFG_GS101(0x246, 0x01, PWR_MODE_ANY)
+  [legitimate sentinel from post_pwr_hs] END_UFS_PHY_CFG
+
+Note in particular that entry 5 writes 0x246=0x01, overwriting entry 2's
+0x246=0x03 written one entry earlier. samsung_ufs_phy_config does not
+filter on cfg->desc — the PWR_MODE_PWM_ANY tags are advisory only —
+so the PWM-only writes fire on every HS pre-PMC.
+
+Discovered by diffing AOSP gs201 cal-if pre_pmc against this driver +
+ufs-exynos.c gs101_ufs_pre_pwr_change. Top candidate for the
+gs201 HS dl_err 0x80000002 wedge that mainline hits on the first frame
+after PMC. Fix verification pending on Pixel Fold (gs201).
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/phy/samsung/phy-gs101-ufs.c | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/drivers/phy/samsung/phy-gs101-ufs.c b/drivers/phy/samsung/phy-gs101-ufs.c
+index af1938034c29..6f014279200c 100644
+--- a/drivers/phy/samsung/phy-gs101-ufs.c
++++ b/drivers/phy/samsung/phy-gs101-ufs.c
+@@ -111,6 +111,7 @@ static const struct samsung_ufs_phy_cfg tensor_gs101_pre_init_cfg[] = {
+ static const struct samsung_ufs_phy_cfg tensor_gs101_pre_pwr_hs_config[] = {
+ 	PHY_TRSV_REG_CFG_GS101(0x369, 0x11, PWR_MODE_ANY),
+ 	PHY_TRSV_REG_CFG_GS101(0x246, 0x03, PWR_MODE_ANY),
++	END_UFS_PHY_CFG,
+ };
+ 
+ /* Calibration for HS mode series A/B */
+-- 
+2.43.0
+

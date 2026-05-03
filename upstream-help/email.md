@@ -1,21 +1,73 @@
 To: peter.griffin@linaro.org
-Subject: gs201 (Tensor G2 / Pixel Fold) UFS bring-up — root cause + 4 patches (+ 2 drafts) + new questions
+Subject: gs201 (Tensor G2 / Pixel Fold) UFS bring-up — wedge solved end-to-end + final patch series (12 patches)
 
 Hi Peter,
 
-A FYI plus one new question. I emailed earlier about gs201 UFS NOP_OUT
-silently failing on a fork of v7.0-rc4. Since then I've found four
-upstream-eligible bugs in the gs201 path; the patches are drafted
-(0001-0004 in my repo at <MY GITHUB OR ATTACH>) and I'll Cc you when
-sending. One of them (0004) touches your `phy-gs101-ufs.c`, so heads-up
-below.
+Quick update on the gs201 UFS bring-up I'd been writing about. **The
+"controller signals UTRCS but writes nothing visible" wedge is fully
+resolved**, including the post-CDR-lock follow-on bug that hit on the
+first multi-PRD READ_10 right after PMC. Mainline now boots all the
+way to a mounted ext4 rootfs at HS-G4 Rate-B with both lanes locked,
+and Debian systemd reaches `multi-user.target` cleanly.
 
-Two more patches (0005 PRDT_PREFETCH_EN and 0006 phy_calibrate for
-non-HS pwr_change) are drafted but held — both match AOSP behaviour
-byte-for-byte, but neither on its own resolves the new HS-mode bug
-described in the "New blocker" section, and I'd rather not muddy the
-0001-0004 series with "matches AOSP, doesn't actually fix anything
-visible" patches before you've had a chance to see the new question.
+The final patch series is **12 patches**, full README at
+`upstream-patches/README.md` in <MY GITHUB OR ATTACH>. Two new big
+ones since the last note:
+
+* **0011 — `ufs: exynos: gs201 — drop DESCTYPE probe loop, set
+  FMPSECURITY0.DESCTYPE=0`.** This is the single most load-bearing
+  patch in the series for mainline gs201. Without FMP/inline-crypto
+  the kernel writes 16-byte `ufshcd_sg_entry` PRDTs, but a
+  long-standing probe-loop in our `gs201_ufs_smu_init` was leaving
+  FMPSECURITY0.DESCTYPE = 3 (128-byte FMP `fmp_sg_entry` mode).
+  Single-entry PRDTs (INQUIRY) survived; the first multi-entry
+  transfer (READ_10 32 KB / 8 PRDs) wedged with OCS=0xf at tag 6
+  on the response side. Fix: replace the four-call probe with a
+  single `SMC_CMD_FMP_SECURITY(0, SMU_EMBEDDED, 0)`. The patch text
+  walks the failure mode — the controller silently strides 128 bytes
+  past entry 0 and reads from beyond the software PRDT region.
+
+* **0010 — `ufs/phy: gs101/gs201 — three missing writes from
+  systematic cal-if walk`.** A byte-by-byte audit of AOSP's
+  `init_cfg_evt0` / `post_init_cfg_evt0` against our port turned up
+  three writes mainline was missing on the 38.4 MHz refclk path
+  (`USE_UFS_REFCLK == USE_38_4_MHZ`, gs201 ufs-cal.h:77). With all
+  three the M-PHY CDR locks first iteration on both lanes
+  (`R339 = 0x18`) and `dl_err 0x80000002 (TC0_REPLAY_TIMER_EXPIRED)`
+  is gone. Write-by-write:
+    1. `PHY_PMA_COMN_REG_CFG(0x29, 0x22)` at the start of
+       `tensor_gs101_pre_init_cfg`.
+    2. `ufshcd_dme_set(hba, UIC_ARG_MIB(0x202), 0x02)` in
+       `gs101_ufs_pre_link`.
+    3. `UNIPRO_ADAPT_LENGTH` RMW for 0x3348/0x334C in
+       `gs201_ufs_post_link` — cal-if conditional RMW, writes 0x3
+       not 0x0 for the typical reset-state value.
+
+Plus three smaller fixes that fell out of the same investigation:
+0007 (missing `END_UFS_PHY_CFG` terminator in
+`tensor_gs101_pre_pwr_hs_config`), 0009 (drop H8-entry writes from
+`tensor_gs101_post_pwr_hs_config` — they belong in the H8 sequence,
+not post-PMC), and 0008 (a complete from-scratch GSA mailbox shim
+for `KDN_SET_OP_MODE = 75` so we don't need Trusty for inline-crypto
+parity — useful even though mainline doesn't enable inline crypto
+yet).
+
+The original 0001-0006 are all still relevant; only 0001's framing
+changed (it's defensive — gs201 boots whether or not the IOCC
+bootloader-bits patch is applied, so I dropped the "doesn't unblock
+anything" caveat).
+
+**Send order I'm landing on:** 0002 (PRDT_BYTE_GRAN, biggest
+visible win), then 0011 (DESCTYPE=0, only-fix-that-makes-multi-PRD-
+work), then 0010 (cal-if-walk three-writes), then 0003, 0007, 0001,
+then the supporting cast (0004, 0005, 0006, 0008, 0009, 0012). I'll
+Cc you on each one. 0008 (GSA shim) and 0012 (verbose-print cleanup)
+need shaping before they go to LKML — happy to skip them in the
+first round.
+
+(Original message follows — patch 0001-0004 framing is unchanged.)
+
+---
 
 ## 0002 — root cause: UFSHCD_QUIRK_PRDT_BYTE_GRAN is wrong for gs201
 

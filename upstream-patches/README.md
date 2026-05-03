@@ -4,12 +4,56 @@ Patches against the mainline Linux kernel discovered during the gs201
 (Tensor G2 / Pixel Fold) bring-up. Each patch is a real upstream-eligible
 fix, independent of the gs201-specific DT/driver changes in our fork.
 
-## Send 0002 first — it's the bigger win.
+## 2026-05-03 update — dl_err 0x80000002 wedge solved end-to-end
+
+The gs201 UFS path now boots all the way to a mounted ext4 rootfs
+(`KIOXIA THGJFGT1E45BAIPB`, 256 GB) at HS-G4 Rate-B with both lanes
+locked, and Debian systemd reaches `multi-user.target` at kernel-time
+~35 s. Two new root causes pinned this session:
+
+1. **Three writes missing from the AOSP cal-if walk** (patch 0010).
+   `tensor_gs101_pre_init_cfg`, `gs101_ufs_pre_link`, and
+   `gs201_ufs_post_link` were each missing a single write that AOSP's
+   `init_cfg_evt0` / `post_init_cfg_evt0` issue when `USE_UFS_REFCLK ==
+   USE_38_4_MHZ` (the gs201 refclk). Without all three, the M-PHY CDR
+   never locks at HS-Rate-B and link startup wedges the first SCSI
+   command with `dl_err 0x80000002` (TC0_REPLAY_TIMER_EXPIRED).
+2. **DESCTYPE-3 left in FMPSECURITY0 by an old probe loop** (patch
+   0011). With FMP/inline-crypto disabled, mainline writes 16-byte
+   `ufshcd_sg_entry` PRDTs but a probe-loop in `gs201_ufs_smu_init`
+   left FMPSECURITY0.DESCTYPE=3 (128-byte FMP `fmp_sg_entry` mode),
+   so single-entry PRDTs (INQUIRY) survived but the first multi-entry
+   transfer (READ_10 32 KB / 8 PRDs) wedged with OCS=0xf at tag 6.
+
+Plus three smaller felix-history fixes (0007 missing
+`END_UFS_PHY_CFG` terminator, 0009 dropping misplaced post-PMC writes,
+0008 a complete from-scratch GSA mailbox shim that replaces the
+out-of-tree dependency on Trusty for `KDN_SET_OP_MODE`).
+
+The **0001 IOCC patch** is still defensive but is no longer co-blocking
+the boot path. The original phrasing in the patch ("matches AOSP, can
+not claim this fix unblocks gs201") is now safe to keep verbatim — gs201
+boots whether or not this patch is applied. It is still upstreamable
+on its own merit.
+
+## Send order (revised)
+
+1. **0002 PRDT_BYTE_GRAN** — biggest single fix (controller writes
+   response 1.5 KB further than mainline reads). Send first.
+2. **0011 DESCTYPE=0** — second-biggest. Without it, multi-PRD reads
+   don't land. Send right after.
+3. **0010 three cal-if writes** — fixes HS-Rate-B CDR-lock at the
+   38.4 MHz refclk path. Best understood after 0002/0011 are in.
+4. **0003 32-bit DMA mask** — silently corrupts on >4 GB DMA;
+   AOSP-confirmed and independent.
+5. **0007 END_UFS_PHY_CFG** — single-line walker-overrun fix.
+6. **0001 IOCC** — defensive cleanup; describe carefully because it
+   reverses a recent intentional change.
+7. **0004, 0005, 0006, 0008, 0009, 0012** — supporting cast.
 
 `0001` is a defensive correctness fix that doesn't change observable
-behavior on its own. `0002` is the actual root-cause fix that gets gs201
-past NOP_OUT and is verifiable end-to-end. Send `0002` first; `0001` can
-follow as a related cleanup.
+behavior on its own. `0011` is the only patch where landing it
+dramatically changes whether this controller works on mainline.
 
 ## 0001-ufs-exynos-don-t-clobber-bootloader-IOCC-bits-when-d.patch
 
@@ -261,3 +305,132 @@ HCI-config layer. Both patches are still worth sending eventually
 outreach so the cover letter can frame them honestly: "match AOSP;
 do not on their own fix the PWM data-path issue we asked you about
 in the linked thread."
+
+---
+
+## 0007-phy-samsung-gs101-ufs-add-missing-END_UFS_PHY_CFG-to.patch
+
+`tensor_gs101_pre_pwr_hs_config` is missing the
+`END_UFS_PHY_CFG` terminator the upstream
+`samsung_ufs_phy_config()` walker uses to stop iterating. Without
+it the walker reads past the array into whatever the linker placed
+next — observable as occasional spurious writes at PHY config time.
+Single-line correctness fix. Apply alongside 0010 since both touch
+the felix PHY tables.
+
+**Maintainer routing:** drivers/phy/samsung/phy-gs101-ufs.c —
+linux-arm-kernel and the Samsung PHY maintainer chain. Cc Peter
+Griffin (the original gs101 author).
+
+## 0008-ufs-exynos-gs201-KDN_CTRL_MON-dump-GSA-mailbox-shim-.patch
+
+A full from-scratch port of the gs201 GSA (Google Security Anchor)
+mailbox protocol so we can issue `GSA_MB_CMD_KDN_SET_OP_MODE = 75`
+without the AOSP Trusty dependency. ~80 LoC inline shim plus a
+small dump helper. After this runs, `HSI2_KDN_CONTROL_MONITOR`
+(sysreg-HSI2 +0x400) flips from 0x4 → 0x5 (MKE+RDY), matching the
+AOSP-side state. Direct EL1 writes to the same register silently
+NOP — only the GSA-mediated path actually programs it.
+
+This patch isn't strictly needed for the boot path to work — it's a
+parity fix with AOSP for the inline-crypto handoff, which mainline
+gs201 currently doesn't use. But it's a real, isolated piece of work
+that's reusable by anyone doing future gs201 inline-crypto support.
+
+**Maintainer routing:** drivers/ufs/host/ufs-exynos.c —
+linux-samsung-soc, linux-scsi, plus the Linaro folks doing Tensor
+work (Peter Griffin, William McVicker).
+
+**Caveat:** mailbox protocol details inferred from the AOSP
+`google-modules/soc/gs/drivers/soc/google/gsa/gsa.c`; check the
+struct layout against current AOSP HEAD before sending.
+
+## 0009-phy-samsung-gs101-ufs-drop-H8-entry-writes-from-post.patch
+
+`tensor_gs101_post_pwr_hs_config` previously contained two writes
+that belong to the H8 (hibern8) entry sequence, not the post-PMC
+table. Dropping them gives a cleaner R222/R246 state at the
+`gs101_phy_wait_for_cdr_lock` entry probe. Independently a small
+correctness improvement; only meaningful in combination with the
+0010 cal-if-walk fixes (alone it doesn't unblock dl_err).
+
+## 0010-ufs-phy-gs101-gs201-three-missing-writes-from-system.patch
+
+**The big HS-Rate-B fix.** Three single-line writes from a
+byte-by-byte AOSP-cal-if walk that mainline's port had quietly
+missed:
+
+1. **`PHY_PMA_COMN_REG_CFG(0x29, 0x22, PWR_MODE_ANY)`** added at the
+   start of `tensor_gs101_pre_init_cfg`. AOSP's `init_cfg_evt0`
+   issues this when `USE_UFS_REFCLK == USE_38_4_MHZ` (gs201
+   ufs-cal.h:77). Without it, the PMA reset state for the 38.4 MHz
+   refclk is wrong and HS-Rate-B negotiation fails downstream.
+2. **`ufshcd_dme_set(hba, UIC_ARG_MIB(0x202), 0x02)`** added in
+   `gs101_ufs_pre_link` between MIB(0x200)=0x40 and the per-lane
+   writes. Same 38.4 MHz refclk path, on the UniPro side.
+3. **`UNIPRO_ADAPT_LENGTH` RMW** in `gs201_ufs_post_link` for
+   addresses 0x3348 / 0x334C. AOSP's cal-if treats these as
+   `UNIPRO_ADAPT_LENGTH` access, which is a conditional RMW that
+   writes 0x3 (not 0x0) for typical reset values. Mainline used to
+   write a literal 0x0 here.
+
+Empirical result: with all three, the M-PHY CDR locks first
+iteration on both lanes (`R339 = 0x18`), `dl_err 0x80000002` is
+gone, and the controller cleanly finishes link-startup at
+`FAST series_B G_4 L_2`.
+
+**Send 0010 with 0011** — they're complementary. 0010 makes the
+link come up at HS-Rate-B; 0011 makes the first multi-PRD transfer
+on that link land in the right buffers.
+
+**Maintainer routing:** drivers/phy/samsung/phy-gs101-ufs.c +
+drivers/ufs/host/ufs-exynos.c. Same chain as 0007.
+
+## 0011-ufs-exynos-gs201-drop-DESCTYPE-probe-loop-set-FMPSEC.patch
+
+**The big PRDT-format fix.** A previous round of debugging in
+`gs201_ufs_smu_init` looped through `SMC_CMD_FMP_SECURITY` with
+DESCTYPE = 0, 1, 2, 3 to "see if a non-3 value unlocks writes for
+our mainline 16-byte PRDT setup." Each SMC succeeded, so the
+*last* call latched FMPSECURITY0.DESCTYPE = 3 — the 128-byte
+`fmp_sg_entry` mode AOSP uses with inline crypto.
+
+Mainline gs201 disables FMP (no `EXYNOS_UFS_OPT_UFSPR_SECURE`), so
+`exynos_ufs_fmp_init` early-returns and `ufshcd_set_sg_entry_size`
+is never called. The kernel writes 16-byte `struct ufshcd_sg_entry`
+while the controller reads 128-byte stride — single-entry PRDTs
+(INQUIRY) survived (only entry 0 is read), but the first
+multi-entry transfer wedged. Visible as:
+
+```
+[62.6s] ufshcd_abort: Device abort task at tag 6
+sd 0:0:0:0: [sda] tag#6 CDB: opcode=0x28 28 00 00 00 00 08 00 00 08 00
+                            -> READ_10 lba=0x8 length=8 sectors = 32 KB / 8 PRDs
+UTRD: ocs=0x0f (controller never wrote)
+UPIU RSP: all zero (controller never wrote)
+PA/DL/NL err: 0x0
+```
+
+Fix: replace the four-call probe with a single
+`SMC_CMD_FMP_SECURITY(0, SMU_EMBEDDED, 0)` so DESCTYPE=0
+(16-byte standard PRDT) which is what our `sg_entry_size`
+matches. `SMC_CMD_SMU(SMU_INIT)` and `SMC_CMD_FMP_SMU_RESUME`
+are unchanged — those open the SMU/UFSP fence.
+
+**This is the most-load-bearing single patch in the new series.**
+Without it, every multi-PRD read or write hangs on gs201 mainline.
+
+## 0012-ufs-phy-gs201-silence-debug-instrumentation-dev_info.patch
+
+Bulk `dev_info → dev_dbg` for the bring-up instrumentation in
+`ufs-exynos.c`, `phy-gs101-ufs.c`, and `ufshcd.c`'s
+ufs-cmd-issue trace. AOSP runs with `loglevel=4` and doesn't
+have these prints in the first place; with the wedge fixed,
+the verbose output was throttling 115200-baud UART by ~70 s
+per boot.
+
+This is **not** an upstream-quality patch (it's a quick
+"shut it up" sweep); a proper cleanup pass is owed before
+sending — keep `dev_warn`/`dev_err`, drop the dump helpers
+entirely or gate them behind a Kconfig debug option. Tracked
+in the auto-memory `feedback_uart_verbosity.md`.

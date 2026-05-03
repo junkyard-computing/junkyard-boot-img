@@ -1,0 +1,85 @@
+From 40f9bccb582f398013966128ab2fd7e81ef3733b Mon Sep 17 00:00:00 2001
+From: "Christopher L. Crutchfield" <ccrutchf@ucsd.edu>
+Date: Sun, 3 May 2026 10:10:28 -0700
+Subject: [PATCH 6/7] =?UTF-8?q?ufs:=20exynos:=20gs201=20=E2=80=94=20drop?=
+ =?UTF-8?q?=20DESCTYPE=20probe=20loop,=20set=20FMPSECURITY0.DESCTYPE=3D0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The previous gs201_ufs_smu_init() called SMC_CMD_FMP_SECURITY four times
+in succession with DESCTYPE = 0, 1, 2, 3 to "see if a non-3 value unlocks
+writes for our mainline 16-byte PRDT setup." Each SMC succeeded (a0=0),
+so the *last* call latched FMPSECURITY0.DESCTYPE = 3 — the 128-byte
+fmp_sg_entry mode AOSP uses with inline crypto.
+
+But mainline gs201 disables FMP (EXYNOS_UFS_OPT_UFSPR_SECURE is dropped),
+so exynos_ufs_fmp_init early-returns without calling
+ufshcd_set_sg_entry_size(). The kernel writes 16-byte struct
+ufshcd_sg_entry while the controller reads 128-byte stride —
+single-entry PRDTs (INQUIRY) survive (only entry 0 is read), but the
+first multi-entry transfer wedges. Observed symptom on a fresh boot:
+
+  [62.6s] ufshcd_abort: Device abort task at tag 6
+  sd 0:0:0:0: [sda] tag#6 CDB: opcode=0x28 28 00 00 00 00 08 00 00 08 00
+  -> READ_10 lba=0x8 length=8 sectors = 32 KB / 8 PRD entries
+  UTRD: ocs=0x0f (controller never wrote)
+  UPIU RSP: all zero (controller never wrote)
+  PA/DL/NL err: 0x0 (no UIC errors)
+
+All 10s of discovery INQUIRYs at len=4..64 succeeded; the first READ_10
+hung. UCD+0x600 dump (= PRDT base + 0x200, where DESCTYPE=3 entry 4
+would land) was zero, fitting "controller reads beyond the 128-byte
+software PRDT region, gets DBA=0, AXI bus error / silent stall."
+
+Fix: replace the probe with a single SMC_CMD_FMP_SECURITY(...,DESCTYPE=0)
+call to explicitly select the 16-byte standard PRDT mode that matches
+our sg_entry_size. SMC_CMD_SMU(SMU_INIT) and SMC_CMD_FMP_SMU_RESUME
+are unchanged — those open the SMU/UFSP fence and remain necessary.
+
+Verified empirically: with the fix, sd 0:0:0:0 enumerates a 256 GB
+KIOXIA at HS-G4 Rate-B 2-lane, EXT4 sda30 mounts RO at [46s], systemd
+runs READ_10 transfers up to len=32768 sectors (128 MB) without abort.
+---
+ drivers/ufs/host/ufs-exynos.c | 23 ++++++++++++++---------
+ 1 file changed, 14 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+index baa3589d2b1a..95de2843aa05 100644
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -766,17 +766,22 @@ static inline void gs201_dump_pa_state(struct ufs_hba *hba, const char *tag) {}
+ static int gs201_ufs_smu_init(struct device *dev)
+ {
+ 	struct arm_smccc_res res;
+-	unsigned long desctype;
+ 
+-	/* Try each DESCTYPE — see if a non-3 value unlocks writes for our
+-	 * mainline 16-byte PRDT setup (we don't enable inline crypto).
++	/*
++	 * Set FMPSECURITY0.DESCTYPE=0 (16-byte standard PRDT entries) to match
++	 * the mainline ufshcd default sg_entry_size. AOSP uses DESCTYPE=3 with
++	 * 128-byte fmp_sg_entry for inline crypto; we don't enable FMP, so
++	 * DESCTYPE must be 0. An earlier probe loop here ended at DESCTYPE=3,
++	 * leaving the controller expecting 128-byte stride while we wrote
++	 * 16-byte entries — single-entry PRDTs (INQUIRY) succeeded but the
++	 * first multi-entry transfer (READ_10 32 KB = 8 PRDs) hung at
++	 * tag 6 with OCS=0xf because entries 1..7 were read from beyond the
++	 * 128-byte software PRDT region (zero/garbage DBA).
+ 	 */
+-	for (desctype = 0; desctype <= 3; desctype++) {
+-		arm_smccc_smc(SMC_CMD_FMP_SECURITY, 0, SMU_EMBEDDED, desctype,
+-			      0, 0, 0, 0, &res);
+-		dev_info(dev, "SMC_CMD_FMP_SECURITY(0, SMU_EMBEDDED, %lu) -> a0=0x%lx a1=0x%lx\n",
+-			 desctype, res.a0, res.a1);
+-	}
++	arm_smccc_smc(SMC_CMD_FMP_SECURITY, 0, SMU_EMBEDDED, 0,
++		      0, 0, 0, 0, &res);
++	dev_info(dev, "SMC_CMD_FMP_SECURITY(0, SMU_EMBEDDED, DESCTYPE=0) -> a0=0x%lx a1=0x%lx\n",
++		 res.a0, res.a1);
+ 
+ 	arm_smccc_smc(SMC_CMD_SMU, SMU_INIT, SMU_EMBEDDED, 0, 0, 0, 0, 0, &res);
+ 	dev_info(dev, "SMC_CMD_SMU(SMU_INIT, SMU_EMBEDDED) -> a0=0x%lx a1=0x%lx\n",
+-- 
+2.43.0
+

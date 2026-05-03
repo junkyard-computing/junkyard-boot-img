@@ -1,0 +1,130 @@
+From a671169ce62234466b0db6860e8fe29eb8d65c2c Mon Sep 17 00:00:00 2001
+From: "Christopher L. Crutchfield" <ccrutchf@ucsd.edu>
+Date: Sun, 3 May 2026 09:42:22 -0700
+Subject: [PATCH 5/7] =?UTF-8?q?ufs/phy:=20gs101/gs201=20=E2=80=94=20three?=
+ =?UTF-8?q?=20missing=20writes=20from=20systematic=20cal-if=20walk?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Diff'd every (target-byte-address, value) pair AOSP cal-if init_cfg_evt0
++ post_init_cfg_evt0 emits against everything mainline tensor_gs101_pre_init_cfg
++ gs101_ufs_pre_link + gs201_ufs_post_link emits. Found three real misses,
+all empirically necessary for HS-G4 dual-lane CDR lock on gs201 felix:
+
+1. phy-gs101-ufs.c tensor_gs101_pre_init_cfg: add PHY_COMN_REG_CFG(0x29,
+   0x22, PWR_MODE_ANY) at the start of the table. This corresponds to
+   AOSP cal-if init_cfg_evt0 line 84
+   ({0x0000, 0x0A4, 0x22, PMD_ALL, PHY_PMA_COMN, BRD_ALL}), which is gated
+   by `USE_UFS_REFCLK == USE_38_4_MHZ` — the gs201 setting per
+   `ufs-cal.h:77`. Mainline was missing this entirely.
+
+2. ufs-exynos.c gs101_ufs_pre_link: add ufshcd_dme_set(MIB(0x202), 0x02)
+   between the MIB(0x200)=0x40 PCS-debug-mode open and the per-lane PCS
+   writes. Same 38.4 MHz refclk branch in cal-if (init_cfg_evt0 line 83).
+   Mainline was missing this entirely.
+
+3. ufs-exynos.c gs201_ufs_post_link: replace the raw `unipro_writel(0,
+   0x3348)` and `unipro_writel(0, 0x334C)` with the conditional RMW that
+   AOSP cal-if's UNIPRO_ADAPT_LENGTH access type encodes (cal-if.c:800).
+   For the typical reset value 0x0, the cal-if RMW writes 0x3 (not 0x0
+   like mainline did). MIB 0x15D2 / 0x15D3.
+
+Empirical result on Pixel Fold (gs201) at HS-G4 L2:
+
+  before: R339 (LN0_MON_RX_CDR_FLD_CK_MODE_DONE) stays 0x00 across the
+          8ms poll window; R337=0xa1 R33B=0x00; dl_err 0x80000002 fires
+          ~1.9s after PMC; UPIU RSP slot reads 0xababab pre-fill stamp;
+          dracut times out.
+
+  after:  R339=0x18 first iteration (lock OK on both lanes); R337=0xa0
+          R33B=0x04 — byte-for-byte matching AOSP's working state;
+          UPIU RSP slot now actually written by controller (all-0x00 on
+          one observed abort, not the 0xab stamp). dl_err 0x80000002 is
+          gone.
+
+A separate downstream timeout still fires later in the boot (different
+tag, different timing window, different RSP pattern) — not the
+HS dl_err wedge this commit addresses.
+
+Co-Authored-By: Claude Opus 4.7 (1M context) <noreply@anthropic.com>
+---
+ drivers/phy/samsung/phy-gs101-ufs.c | 10 +++++++++
+ drivers/ufs/host/ufs-exynos.c       | 33 +++++++++++++++++++++++++++--
+ 2 files changed, 41 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/phy/samsung/phy-gs101-ufs.c b/drivers/phy/samsung/phy-gs101-ufs.c
+index 23198245aad4..41e95425a3c5 100644
+--- a/drivers/phy/samsung/phy-gs101-ufs.c
++++ b/drivers/phy/samsung/phy-gs101-ufs.c
+@@ -28,6 +28,16 @@
+ 
+ /* Calibration for phy initialization */
+ static const struct samsung_ufs_phy_cfg tensor_gs101_pre_init_cfg[] = {
++	/*
++	 * COMN reg 0x29 = 0x22 — gs201's 38.4 MHz refclk-conditional
++	 * write (AOSP cal-if line 84, gated by USE_UFS_REFCLK == USE_38_4_MHZ
++	 * which is gs201's setting per ufs-cal.h:77). Cal-if places it in
++	 * the PCS section between MIB 0x200 = 0x40 (open) and the per-lane
++	 * PCS writes; mainline's split phy/controller architecture means
++	 * the closest semantic match is to land it in the PMA pre_init
++	 * pass (here), before the rest of the COMN setup.
++	 */
++	PHY_COMN_REG_CFG(0x29, 0x22,  PWR_MODE_ANY),
+ 	PHY_COMN_REG_CFG(0x43, 0x10,  PWR_MODE_ANY),
+ 	PHY_COMN_REG_CFG(0x3C, 0x14,  PWR_MODE_ANY),
+ 	PHY_COMN_REG_CFG(0x46, 0x48,  PWR_MODE_ANY),
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+index 777f8f4e669b..baa3589d2b1a 100644
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -2668,6 +2668,14 @@ static int gs101_ufs_pre_link(struct exynos_ufs *ufs)
+ 
+ 	ufshcd_dme_set(hba, UIC_ARG_MIB(0x200), 0x40);
+ 
++	/*
++	 * MIB 0x202 = 0x02 — AOSP cal-if init_cfg_evt0 line 83 (38.4 MHz
++	 * branch). gs201 ships USE_UFS_REFCLK == USE_38_4_MHZ. Mainline
++	 * was missing this entirely. Cal-if writes 0x12 for 26 MHz and
++	 * 0x02 for 19.2/38.4 MHz; gs201 = 0x02.
++	 */
++	ufshcd_dme_set(hba, UIC_ARG_MIB(0x202), 0x02);
++
+ #if GS201_AOSP_PCS_WRITES
+ 	/*
+ 	 * (h13) AOSP `__set_pcs` mechanism: bracket each per-lane raw
+@@ -2790,8 +2798,29 @@ static int gs201_ufs_post_link(struct exynos_ufs *ufs)
+ 	if (ret)
+ 		return ret;
+ 
+-	unipro_writel(ufs, 0x0, 0x3348);
+-	unipro_writel(ufs, 0x0, 0x334C);
++	/*
++	 * AOSP cal-if post_init_cfg_evt0 lines 326-327 mark these
++	 * (MIB 0x15D2/0x15D3 = bytes 0x3348/0x334C) as
++	 * UNIPRO_ADAPT_LENGTH, which is a conditional RMW (cal-if.c:800):
++	 *   if (val & 0x80) and (val & 0x7F) < 2: write 0x82
++	 *   else if ((val + 1) & 0x3): write val | 0x3
++	 * For the typical reset value of 0x0, branch 2 fires and
++	 * writes 0x3 (not 0x0). Mainline previously wrote raw 0x0 here
++	 * which is a different value. Encode the RMW directly.
++	 */
++	{
++		u32 v;
++		v = unipro_readl(ufs, 0x3348);
++		if ((v & 0x80) && (v & 0x7F) < 2)
++			unipro_writel(ufs, 0x82, 0x3348);
++		else if ((v + 1) & 0x3)
++			unipro_writel(ufs, v | 0x3, 0x3348);
++		v = unipro_readl(ufs, 0x334C);
++		if ((v & 0x80) && (v & 0x7F) < 2)
++			unipro_writel(ufs, 0x82, 0x334C);
++		else if ((v + 1) & 0x3)
++			unipro_writel(ufs, v | 0x3, 0x334C);
++	}
+ 
+ #if GS201_PRDT_PREFETCH
+ 	{
+-- 
+2.43.0
+

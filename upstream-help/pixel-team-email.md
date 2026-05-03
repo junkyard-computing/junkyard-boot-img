@@ -91,7 +91,87 @@ own `gs201-ufs.dtsi` uses `vcc-supply = <&ufs_fixed_vcc>` — a fixed
 GPIO regulator — and doesn't tie UFS to `pd_hsi0`; that driver only
 manages USB PHY rails on felix. Ruled out as a UFS lead.)
 
-## Open questions
+## 2026-05-03 update — wedge solved end-to-end
+
+Before reading the original "Open questions" section below, an
+important update: **the dl_err 0x80000002 wedge is fully resolved**.
+gs201 mainline now boots all the way to a mounted ext4 rootfs at
+HS-G4 Rate-B with both lanes locked. Two root causes pinned this
+session:
+
+1. **Three writes were missing from the AOSP cal-if walk** — a single
+   write each in `tensor_gs101_pre_init_cfg`, `gs101_ufs_pre_link`,
+   and `gs201_ufs_post_link`, all on the 38.4 MHz refclk path
+   (`USE_UFS_REFCLK == USE_38_4_MHZ`). With all three, M-PHY CDR
+   locks first iteration (`R339 = 0x18`) and link startup completes.
+2. **A four-call `SMC_CMD_FMP_SECURITY` probe loop in our
+   `gs201_ufs_smu_init`** had been latching FMPSECURITY0.DESCTYPE = 3
+   (128-byte FMP `fmp_sg_entry` mode) as its last call. Mainline
+   writes 16-byte standard PRDTs (FMP/inline-crypto disabled), so
+   single-entry transfers (INQUIRY) survived but the first multi-PRD
+   transfer (READ_10 32 KB / 8 PRDs) wedged with OCS=0xf at tag 6.
+   Replacing the loop with a single-shot DESCTYPE=0 call unwedges it.
+
+Most of the questions below remain interesting (especially the
+`MASK_64_ADDRESSING_SUPPORT` and `UFSHCD_QUIRK_PRDT_BYTE_GRAN` ones —
+those are still upstream patches), but **the "HS at any rate × gear
+fails with dl_err 0x80000002" question (Q2) is closed** by the
+cal-if-walk fix. I've left the original text below unedited for
+context, but you can skip Q2 if you only have time to skim.
+
+The full new patch series (12 patches now) is at
+`upstream-patches/README.md` in <MY GITHUB OR ATTACH>.
+
+---
+
+## New questions raised by this session
+
+A. **Why does the AOSP cal-if treat addresses 0x3348 / 0x334C
+   (`PA_*_TActivate`-adjacent) as `UNIPRO_ADAPT_LENGTH`-class
+   conditional RMW?** The cal-if branch writes 0x82 if (val & 0x80
+   && (val & 0x7F) < 2), else writes (val | 0x3) if ((val + 1) &
+   0x3). For a typical reset value of 0x0, that path writes 0x3.
+   Mainline previously wrote a literal 0x0. Is this a known
+   silicon quirk that should be documented somewhere LKML can see,
+   or am I cargo-culting? Either is fine — the patch is verifiable
+   either way — but a one-line confirmation helps the cover letter.
+
+B. **Why does the gs201 secure firmware (BL31?) leave
+   FMPSECURITY0.DESCTYPE in whatever state the last
+   `SMC_CMD_FMP_SECURITY` call set it to?** Specifically, is there
+   an expectation that the OS calls `SMC_CMD_FMP_SECURITY(...,
+   DESCTYPE)` with the value matching its `sg_entry_size`? Or is
+   the bootloader supposed to leave DESCTYPE in a sensible default
+   (presumably 0 = standard 16-byte PRDT) for non-FMP boots?
+   Asking because the original probe-loop in our
+   `gs201_ufs_smu_init` was a hack born of "we don't know what
+   DESCTYPE is supposed to be on non-FMP boot" — it'd be nice to
+   replace the cargo-cult comment with a real answer.
+
+C. **Why does mainline gs201 not probe DWC3 at all?** Mainline
+   defconfig has `CONFIG_USB_DWC3=y` and `CONFIG_USB_DWC3_EXYNOS=y`,
+   the gs201.dtsi has `compatible = "samsung,exynos850-dwusb3"` and
+   `compatible = "snps,dwc3"` (gs201.dtsi:790, 799), and yet our
+   boot log shows zero `dwc3` lines in dmesg — only the usbcore
+   class registrations. Is there a Tensor-specific role-switch /
+   PD-controller driver missing (Maxim PMIC?), or is the DTS just
+   incomplete and we need to graft from gs101.dtsi (which has the
+   USBDRD31 PHY + controller scaffolding fully wired)? This is the
+   only thing standing between us and an SSH-reachable mainline
+   Debian on felix.
+
+D. **Why does the gs201 secure firmware open CMU access only when
+   EL2 is in pKVM?** We boot mainline with `kvm-arm.mode=protected`
+   and CMU readl/writel work fine. Without that flag, every CMU
+   access aborts with synchronous external abort code 0x96000010.
+   Empirically discovered, but a one-line "yes, BL31 routes CMU
+   through pKVM" or "no, that's a different reason" comment from
+   someone in the know would let us upstream a proper note in the
+   gs201 binding doc.
+
+---
+
+## Open questions (original — Q2 closed by 2026-05-03 update above)
 
 1. **Is MASK_64_ADDRESSING_SUPPORT in the gs201 caps register actually
    wrong?** The AOSP driver pins dma_mask to 32-bit for the entire
