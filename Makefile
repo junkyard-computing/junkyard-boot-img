@@ -16,14 +16,21 @@ KMSCON_URL ?= http://ftp.us.debian.org/debian/pool/main/k/kmscon/kmscon_9.0.0-4_
 SIZE ?= 8100M
 SYSROOT_DIR ?= rootfs/sysroot
 KERNEL_SOURCE_DIR ?= kernel/source
-KERNEL_BUILD_DIR ?= $(KERNEL_SOURCE_DIR)/out/felix/dist
+KERNEL_BUILD_DIR ?= $(KERNEL_SOURCE_DIR)/out
+KERNEL_DEFCONFIG ?= defconfig
+KERNEL_CROSS_COMPILE ?= aarch64-linux-gnu-
+# Relative path inside $(KERNEL_BUILD_DIR) to the compiled felix device tree.
+KERNEL_DTB ?= arch/arm64/boot/dts/exynos/google/gs201-felix.dtb
 APT_PACKAGES_FILE ?= rootfs/packages.txt
 MODULE_ORDER_PATH ?= rootfs/module_order.txt
 ROOTFS_IMG ?= boot/rootfs.img
 MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
-BAZEL ?= kernel/source/tools/bazel
 OVERLAY_DIR ?= rootfs/overlay
 VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
+
+# Standard out-of-tree kbuild invocation. O=out keeps build artifacts under
+# kernel/source/out/ so the submodule's worktree stays clean.
+KMAKE := $(MAKE) -C $(KERNEL_SOURCE_DIR) ARCH=arm64 CROSS_COMPILE=$(KERNEL_CROSS_COMPILE) O=out
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 
@@ -57,15 +64,24 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.build_kernel: kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_defconfig_mod/custom_defconfig
-	cd $(KERNEL_SOURCE_DIR); $(BAZEL) run \
-		--config=use_source_tree_aosp \
-		--config=stamp \
-		--config=felix \
-		--defconfig_fragment=//custom_defconfig_mod:custom_defconfig \
-		//private/devices/google/felix:gs201_felix_dist
+.build_kernel: kernel/custom_defconfig_mod/felix.config
+	$(KMAKE) $(KERNEL_DEFCONFIG)
+	# Merge the felix fragment on top of the mainline defconfig: forces
+	# VA_BITS=48 / no-LPA2 and turns off ARMv8.5+ extensions the GS201 cores
+	# don't implement. Without this the kernel hangs silently in head.S MMU
+	# setup (before earlycon is up) and the platform watchdog reboots.
+	KCONFIG_CONFIG=$(KERNEL_BUILD_DIR)/.config \
+		$(KERNEL_SOURCE_DIR)/scripts/kconfig/merge_config.sh -m -O $(KERNEL_BUILD_DIR) \
+		$(KERNEL_BUILD_DIR)/.config $(CURDIR)/kernel/custom_defconfig_mod/felix.config
+	$(KMAKE) olddefconfig
+	# DTC_FLAGS=-@ makes dtc emit the __symbols__ node into the compiled dtbs.
+	# Without it, the felix bootloader refuses to boot because its factory
+	# dtbo partition's phandle fixups can't resolve against a symbol-less dtb
+	# (ufdt_overlay_do_fixups: "No node __symbols__ in main dtb").
+	$(KMAKE) -j$(shell nproc) DTC_FLAGS=-@ Image modules dtbs
+	lz4 -f -9 $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4
 	@echo "Updating kernel version string"
-	strings $(KERNEL_BUILD_DIR)/Image | grep "Linux version" | head -n 1 | awk '{print $$3}' > kernel/kernel_version
+	cat $(KERNEL_BUILD_DIR)/include/config/kernel.release > kernel/kernel_version
 	touch $@
 
 .sync_vendor_firmware:
@@ -76,6 +92,13 @@ all:
 	just mount_rootfs
 	sudo mkdir -p $(SYSROOT_DIR)/vendor/firmware
 	sudo rsync -a $(VENDOR_FIRMWARE_STAGE)/firmware/ $(SYSROOT_DIR)/vendor/firmware/
+	# Panthor (Mali-G710 CSF) requests 'arm/mali/arch10.8/mali_csffw.bin'
+	# relative to firmware_class.path=/vendor/firmware. The felix OTA ships
+	# the file as /vendor/firmware/mali_csffw-r54p2.bin (and a few older
+	# versions). Symlink the newest into the path panthor expects.
+	sudo mkdir -p $(SYSROOT_DIR)/vendor/firmware/arm/mali/arch10.8
+	sudo ln -sf ../../../mali_csffw-r54p2.bin \
+		$(SYSROOT_DIR)/vendor/firmware/arm/mali/arch10.8/mali_csffw.bin
 	just unmount_rootfs
 	touch $@
 
@@ -105,10 +128,6 @@ all:
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"echo '%sudo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-sudo-nopasswd \
 		&& chmod 0440 /etc/sudoers.d/99-sudo-nopasswd"
-	# Explicitly enable a getty on felix's UART console. The compiled-in
-	# `console=ttynull` in CONFIG_CMDLINE masks ttySAC0 from /sys/class/tty/
-	# console/active, so systemd-getty-generator won't spawn one on its own.
-	$(NSPAWN) -D $(SYSROOT_DIR) systemctl enable serial-getty@ttySAC0.service
 	# systemd-backlight@.service pulls felix into systemd "degraded" on every
 	# boot; mask it (symlink to /dev/null) to keep `systemctl is-system-running`
 	# green.
@@ -128,29 +147,16 @@ all:
 
 .install_kernel: .build_kernel .install_packages
 	just mount_rootfs
-	sudo mkdir -p $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)
-	sudo cp $(KERNEL_BUILD_DIR)/modules.builtin $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/
-	sudo cp $(KERNEL_BUILD_DIR)/modules.builtin.modinfo $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/
-	sudo rm -f $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/modules.order
-	sudo touch $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/modules.order
-	@echo "Copying modules"
-	# Wipe stale .ko files from a previous kernel build before resyncing.
-	# rsync below must overwrite, not skip — a previous build's modules have
-	# __versions CRCs computed against the old vmlinux, so leaving them in
-	# place causes every module to fail MODVERSIONS check against a freshly
-	# rebuilt kernel and kicks the device into a watchdog reboot loop.
-	sudo find $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION) -name '*.ko' -delete 2>/dev/null || true
-	for staging in vendor_dlkm system_dlkm; \
-	do \
-		sudo mkdir -p rootfs/unpack/"$$staging" && \
-		sudo tar \
-			-xvzf $(KERNEL_BUILD_DIR)/"$$staging"_staging_archive.tar.gz \
-			-C rootfs/unpack/"$$staging"; \
-		sudo rsync -avK --include='*/' --include='*.ko' --exclude='*' rootfs/unpack/"$$staging"/ $(SYSROOT_DIR)/; \
-		sudo sh -c "cat rootfs/unpack/\"$$staging\"/lib/modules/$(KERNEL_VERSION)/modules.order \
-			>> $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/modules.order"; \
-	done
-	@echo "Updating System.map"
+	# Stage modules_install output into rootfs/unpack/ so kbuild runs unprivileged,
+	# then sudo-rsync into the mounted sysroot to match the ownership pattern used
+	# elsewhere in this pipeline. rootfs/unpack/ is typically root-owned from
+	# earlier stages, so we prep the staging subdir with sudo+chown before
+	# invoking kbuild unprivileged.
+	sudo rm -rf rootfs/unpack/modules_install
+	sudo mkdir -p rootfs/unpack/modules_install
+	sudo chown $$(id -u):$$(id -g) rootfs/unpack/modules_install
+	$(KMAKE) INSTALL_MOD_PATH=$(CURDIR)/rootfs/unpack/modules_install modules_install
+	sudo rsync -a rootfs/unpack/modules_install/lib/modules/ $(SYSROOT_DIR)/lib/modules/
 	sudo cp $(KERNEL_BUILD_DIR)/System.map $(SYSROOT_DIR)/boot/System.map-$(KERNEL_VERSION)
 	@echo "Updating module dependencies"
 	sudo systemd-nspawn -D $(SYSROOT_DIR) depmod \
@@ -158,28 +164,12 @@ all:
 		--all \
 		--filesyms /boot/System.map-$(KERNEL_VERSION) \
 		$(KERNEL_VERSION)
-	@echo "Copying kernel headers"
-	sudo mkdir -p rootfs/unpack/kernel_headers
-	sudo tar \
-		-xvzf $(KERNEL_BUILD_DIR)/kernel-headers.tar.gz \
-		-C rootfs/unpack/kernel_headers
-	sudo cp -r rootfs/unpack/kernel_headers $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION)
-	sudo ln -rsf $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION) $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/build
-	sudo cp $(KERNEL_BUILD_DIR)/kernel_aarch64_Module.symvers $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION)/
-	sudo cp $(KERNEL_BUILD_DIR)/vmlinux.symvers $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION)/
 	@echo "Writing dracut force-drivers list"
-	sudo rm -f $(MODULE_ORDER_PATH)
-	sudo sh -c "cat $(KERNEL_BUILD_DIR)/vendor_kernel_boot.modules.load | xargs -I {} \
-		modinfo -b $(SYSROOT_DIR) -k $(KERNEL_VERSION) -F name \"$(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/{}\" \
-		> $(MODULE_ORDER_PATH)"
-	sudo sh -c "cat $(KERNEL_BUILD_DIR)/vendor_dlkm.modules.load | xargs -I {} \
-		modinfo -b $(SYSROOT_DIR) -k $(KERNEL_VERSION) -F name \"$(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/{}\" \
-		>> $(MODULE_ORDER_PATH)"
-	sudo sh -c "cat $(KERNEL_BUILD_DIR)/system_dlkm.modules.load | xargs -I {} \
-		modinfo -b $(SYSROOT_DIR) -k $(KERNEL_VERSION) -F name \"$(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/{}\" \
-		>> $(MODULE_ORDER_PATH)"
-	# Strip blacklisted modules so dracut --force-drivers doesn't pull them
-	# into the initramfs despite /etc/modprobe.d/blacklist.conf.
+	# Walk every installed *.ko(.xz|.zst) and ask modinfo for its canonical module
+	# name; that avoids having to strip compression suffixes ourselves. Blacklist
+	# filter mirrors /etc/modprobe.d/blacklist.conf so dracut doesn't pull those
+	# modules into the initramfs (where the modprobe.d blacklist doesn't yet apply).
+	sudo sh -c 'find $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/kernel -type f -name "*.ko*" -exec modinfo -F name {} + > $(MODULE_ORDER_PATH)'
 	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d' $(MODULE_ORDER_PATH)
 	just unmount_rootfs
 	touch $@
@@ -203,9 +193,33 @@ all:
 	touch $@
 
 .build_boot: .install_initramfs .install_vendor_firmware
+	# Kernel cmdline.
+	#   earlycon=exynos4210,mmio32,0x10A00000  UART0 output using the bootloader's
+	#                                          divider setup (polled, no reprogramming)
+	#   keep_bootcon                           keep earlycon attached even after the
+	#                                          full console registers
+	#   root=...                               rootfs location (super partition)
+	#   firmware_class.path=/vendor/firmware   replaces the stock felix dtb's
+	#                                          /chosen/bootargs entry; without it
+	#                                          AOC retry-loops and starves UART RX.
+	#   rd.udev.children-max=1                 (h14) Serialize udev workers in
+	#                                          dracut/initrd. Workaround for the
+	#                                          (h6) PWM SBFES wedge: when udev's
+	#                                          coldplug burst fires 4 parallel
+	#                                          scsi_id INQUIRYs + 2x 64KB READ_10
+	#                                          back-to-back, the controller's bus
+	#                                          state breaks. Serializing should
+	#                                          let each command drain before the
+	#                                          next is queued. Remove once HS-Rate-B
+	#                                          works (controller can handle the
+	#                                          parallel storm at HS speed).
+	#
+	# No console=ttySAC0 — samsung_tty stays disabled in gs201.dtsi because the
+	# gs201 CMU is non-secure-EL1-protected; with &oscclk stub clocks the baud
+	# divider would be mis-calculated and serial output would garble.
 	$(MKBOOTIMG) \
-		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
-		--cmdline "root=/dev/disk/by-partlabel/super" \
+		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
@@ -215,7 +229,7 @@ all:
 	sudo $(MKBOOTIMG) \
 		--ramdisk_name "" \
 		--vendor_ramdisk_fragment $(INITRAMFS_PATH) \
-		--dtb $(KERNEL_BUILD_DIR)/dtb.img \
+		--dtb $(KERNEL_BUILD_DIR)/$(KERNEL_DTB) \
 		--header_version 4 \
 		--vendor_boot boot/vendor_boot.img \
 		--pagesize 2048 \

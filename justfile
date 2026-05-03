@@ -9,7 +9,7 @@ _apt_packages := replace(read(_apt_packages_file), "\n", " ")
 
 # Tools
 [private]
-_repo := require("repo")
+_git := require("git")
 [private]
 _debootstrap := require("debootstrap")
 [private]
@@ -25,17 +25,21 @@ _unzip := require("unzip")
 [private]
 _make := require("make")
 [private]
+_lz4 := require("lz4")
+[private]
 _extract_fs := join(justfile_directory(), "tools", "extract-partition-fs.sh")
 [private]
 _mkbootimg := join(justfile_directory(), "tools", "mkbootimg", "mkbootimg.py")
-[private]
-_bazel := join(justfile_directory(), "kernel", "source", "tools", "bazel")
 
 # Paths / variables
 [private]
-_kernel_build_dir := join(justfile_directory(), "kernel", "source", "out", "felix", "dist")
+_kernel_build_dir := join(justfile_directory(), "kernel", "source", "out")
+# shell() instead of read() so a missing kernel_version (fresh checkout, or
+# post-`just clean_kernel`) doesn't abort justfile parsing. `.build_kernel`
+# will write the real value; the two-invocation split in `all` re-reads it
+# at recipe time.
 [private]
-_kernel_version := trim(read(join("kernel", "kernel_version")))
+_kernel_version := trim(shell("cat kernel/kernel_version 2>/dev/null || true"))
 [private]
 _sysroot_img := join(justfile_directory(), "boot", "rootfs.img")
 [private]
@@ -75,21 +79,19 @@ export MKBOOTIMG := _mkbootimg
 [private]
 export SYSROOT_DIR := _sysroot_dir
 [private]
-export BAZEL := _bazel
-[private]
 export MODULE_ORDER_PATH := _module_order_path
 
 default:
     just --list
 
-# Run the full pipeline. Takes ~1hr on first run (kernel build dominates).
+# Run the full pipeline. Takes a while on first run (kernel build dominates).
 # Reruns skip already-finished stages thanks to the Makefile's sentinel files.
 #
 # Split into two make invocations so the second picks up the fresh
 # KERNEL_VERSION written by .build_kernel. justfile exports are evaluated at
 # parse time, so on a fresh checkout KERNEL_VERSION would be empty without
 # this split.
-all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000": (clone_kernel_source android_kernel_branch)
+all size="8100M" debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000": clone_kernel_source
     {{ _make }} -C {{ justfile_directory() }} .build_kernel
     KVER=$(cat {{ justfile_directory() }}/kernel/kernel_version); \
     {{ _make }} -C {{ justfile_directory() }} .build_boot \
@@ -102,34 +104,24 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootst
         KERNEL_VERSION=$KVER \
         INITRAMFS_PATH={{ _sysroot_dir }}/boot/initrd.img-$KVER
 
+# Sync the kernel source submodule (github.com/junkyard-computing/linux, felix
+# branch). The branch name is pinned in .gitmodules; update it there if you
+# need to change branches.
 [group('kernel')]
-[working-directory: 'kernel/source']
-clone_kernel_source android_kernel_branch="android-gs-felix-6.1-android16":
-    @echo "Cloning Android kernel from branch: {{ android_kernel_branch }}"
-    {{ _repo }} init \
-      --depth=1 \
-      -u https://android.googlesource.com/kernel/manifest \
-      -b {{ android_kernel_branch }}
-    {{ _repo }} sync -j {{ num_cpus() }}
-    if [ ! -e custom_defconfig_mod ]; then \
-        ln -s ../custom_defconfig_mod ./; \
-    fi
+clone_kernel_source:
+    {{ _git }} submodule update --init --recursive kernel/source
 
 [group('kernel')]
-[working-directory: 'kernel/source']
-clean_kernel: clone_kernel_source
-    {{ _bazel }} clean --expunge
+clean_kernel:
+    {{ _make }} -C {{ justfile_directory() }}/kernel/source mrproper O=out || true
+    rm -rf {{ justfile_directory() }}/kernel/source/out
     rm -f {{ justfile_directory() }}/.build_kernel
 
-# Print a diff showing what the custom fragment would change vs. gki_defconfig.
+# Drop into nconfig against the current kernel build tree so transitive deps
+# resolve correctly.
 [group('kernel')]
-[working-directory: 'kernel/source']
 config_kernel: clone_kernel_source
-    cp ./aosp/arch/arm64/configs/gki_defconfig ./gki_defconfig_original
-    {{ _bazel }} run //private/devices/google/felix:kernel_config -- nconfig
-    diff -up ./gki_defconfig_original aosp/arch/arm64/configs/gki_defconfig; [ $? -eq 0 ] || [ $? -eq 1 ]
-    rm ./gki_defconfig_original
-    cd aosp; git checkout arch/arm64/configs/gki_defconfig
+    {{ _make }} -C {{ justfile_directory() }}/kernel/source ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out nconfig
 
 [group('kernel')]
 build_kernel: clone_kernel_source

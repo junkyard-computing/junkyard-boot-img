@@ -1,12 +1,5 @@
 #!/bin/bash
 #
-# The felix dtbo carries the board-variant overrides that flip serial_0,
-# the panels, and other felix-specific nodes from status="disabled" (as
-# defined in gs201.dtsi) to status="okay". Without it UART login and the
-# display silently go dead. Any prior "reflash to stock" wipes whatever
-# stock dtbo was there, so always re-flash ours.
-DTBO=../kernel/source/out/felix/dist/dtbo.img
-
 pushd boot
 
 fastboot oem disable-verification
@@ -16,12 +9,16 @@ fastboot erase boot
 fastboot flash boot boot.img
 fastboot erase vendor_boot
 fastboot flash vendor_boot vendor_boot.img
-fastboot erase dtbo
-fastboot flash dtbo "$DTBO"
 fastboot erase super
 fastboot flash super rootfs.img
 fastboot erase vendor_kernel_boot
+# Erase dtbo so the bootloader skips the factory device-tree overlay. Our dtb
+# (built from the junkyard-computing felix branch) carries the full board
+# description; the factory dtbo's phandle fixups target a __symbols__ node
+# that a standard kbuild dtb doesn't emit, and the bootloader refuses to boot
+# when the merge fails.
+fastboot erase dtbo
 # fastboot oem uart disable
-fastboot reboot
+# fastboot reboot
 
 popd

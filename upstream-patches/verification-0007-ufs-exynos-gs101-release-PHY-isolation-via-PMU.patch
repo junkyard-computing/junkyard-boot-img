@@ -1,0 +1,156 @@
+From: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+Date: Sat, 02 May 2026 23:00:00 -0700
+Subject: [PATCH] ufs: exynos: gs101: release UFS PHY isolation via PMU before
+ link startup [VERIFICATION]
+
+This is a verification patch — applied on its own, with no other graft
+or AOSP-shape changes, it tests the hypothesis that mainline's
+gs101/gs201 HS-Rate `dl_err 0x80000002` wedge is caused by mainline
+never lifting a PMU PHY-isolation gate that AOSP's vendor driver lifts
+at probe.
+
+AOSP's `private/google-modules/soc/gs/drivers/ufs/ufs-exynos.c` calls
+`exynos_ufs_ctrl_phy_pwr(ufs, true)` at the top of
+`exynos_ufs_config_externals()`, which walks an `ufs-phy-iso` DT
+sub-node and writes its `{offset, mask, val}` triple into the PMU via
+`exynos_pmu_update`. For both gs101 and gs201 (and zuma), the AOSP DT
+value is:
+
+  ufs-phy-iso {
+      offset = <0x3ec8>;
+      mask = <0x1>;
+      val = <0x1>;
+  };
+
+i.e. write 1 to bit 0 at `pmu_alive + 0x3ec8`. Mainline's
+`drivers/phy/samsung/phy-gs101-ufs.c` and
+`drivers/ufs/host/ufs-exynos.c gs101_ufs_*` paths never touch the PMU.
+The `samsung,pmu-syscon = <&pmu_alive>` phandle that already exists in
+mainline's `phy@14704000` DT node is unused at runtime — it looks
+prophylactic.
+
+The hypothesised mechanism: bit 0 at `pmu_alive + 0x3ec8` gates the
+M-PHY's analog/transmission path on the HSI2 power island. With it
+cleared (presumed default at bootloader handoff), the controller can
+negotiate PMC at the UIC attribute layer (which is just attribute
+exchange, not data) but the PHY won't actually drive the differential
+pairs in HS-Rate mode. PWM tolerates this; HS does not. That matches
+the observed mainline failure exactly: PMC succeeds, host reports
+FAST_MODE on both lanes, and then `dl_err 0x80000002` fires on the
+first frame.
+
+This patch adds the missing PMU write to `gs101_ufs_drv_init` (which
+runs once at probe, mirroring AOSP's `exynos_ufs_config_externals`
+call site). The offset 0x3ec8 is hard-coded for verification
+simplicity; the eventual upstream-quality version should put the
+offset/mask/val in DT to match the AOSP `ufs-phy-iso` shape.
+
+DT-side: add `samsung,pmu-syscon = <&pmu_alive>` to the UFS node so the
+driver can `syscon_regmap_lookup_by_phandle` it. The PMU node itself
+already exists in mainline DT and is referenced by the PHY node.
+
+Verification expected: HS-Rate-A or HS-Rate-B link startup completes
+where it previously wedged with `dl_err 0x80000002` on the first frame
+after PMC. Specifically, the kernel log should advance past
+`Power mode changed to : FAST series_? G_4 L_2` *and* dispatch the
+first SCSI command without a host_reset.
+
+Test environment: Pixel Fold (felix, gs201) booted with
+`kvm-arm.mode=protected` so BL31's CMU/PMU register firewalling
+(see `project_pkvm_cmu_unlock.md` in the parent project) is in the
+unlocked state. If the gate is BL31-firewalled at EL1 without pKVM,
+the regmap_update_bits will silently no-op and HS will still wedge —
+that's an additional thing this verification patch surfaces.
+
+If verification succeeds, the upstream patch will:
+  - Replace the hard-coded 0x3ec8 with a binding on the UFS node
+    (likely `ufs-phy-iso { offset; mask; val; }` to match AOSP shape)
+  - Add the binding to existing gs101 / gs201 / zuma DT
+  - Document the binding under
+    Documentation/devicetree/bindings/ufs/exynos-ufs.yaml
+  - Note the BL31-firewalling-with-pKVM dependency in the patch
+    cover letter so distros not running pKVM understand the
+    requirement
+
+Not for upstream as-is — this patch is a single-axis bisect tool to
+validate the hypothesis. Do not apply on top of the
+`feature/linux-kernel` branch's other graft work; apply on a clean
+copy of `feature/linux-kernel` (or any branch that has the mainline
+`drivers/ufs/host/ufs-exynos.c gs101_ufs_*` path compiled in).
+
+Signed-off-by: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+---
+ arch/arm64/boot/dts/exynos/google/gs201.dtsi |  1 +
+ drivers/ufs/host/ufs-exynos.c                | 35 +++++++++++++++++++-
+ 2 files changed, 35 insertions(+), 1 deletion(-)
+
+diff --git a/arch/arm64/boot/dts/exynos/google/gs201.dtsi b/arch/arm64/boot/dts/exynos/google/gs201.dtsi
+--- a/arch/arm64/boot/dts/exynos/google/gs201.dtsi
++++ b/arch/arm64/boot/dts/exynos/google/gs201.dtsi
+@@ -753,6 +753,7 @@
+ 		 */
+ 		dma-coherent;
+ 		samsung,sysreg = <&sysreg_hsi2 0x710>;
++		samsung,pmu-syscon = <&pmu_alive>;
+ 	};
+
+ 	/* UFS PHY ref_clk is the 24.576 MHz SoC oscillator (gs101 uses the
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -19,6 +19,7 @@
+ #include <linux/of_address.h>
+ #include <linux/platform_device.h>
+ #include <linux/regulator/consumer.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/regmap.h>
+ #include <linux/phy/phy.h>
+
+@@ -218,11 +219,43 @@ static void exynos_ufs_get_uic_info(struct exynos_ufs *ufs)
+ 	ufs->drv_data->uic_attr = attr;
+ }
+
++/*
++ * VERIFICATION: lift the PMU PHY-isolation gate that AOSP's
++ * exynos_ufs_ctrl_phy_pwr() lifts at probe and that mainline currently
++ * leaves cleared. Bit 0 at pmu_alive + 0x3ec8. See cover letter for the
++ * mechanism + evidence; this is a single-axis bisect tool, not
++ * upstream-quality.
++ */
++static void gs101_ufs_release_phy_isolation(struct exynos_ufs *ufs)
++{
++	struct device *dev = ufs->dev;
++	struct regmap *pmu;
++	int ret;
++
++	pmu = syscon_regmap_lookup_by_phandle(dev->of_node,
++					      "samsung,pmu-syscon");
++	if (IS_ERR(pmu)) {
++		dev_warn(dev, "no samsung,pmu-syscon — PHY isolation not released\n");
++		return;
++	}
++
++	ret = regmap_update_bits(pmu, 0x3ec8, 0x1, 0x1);
++	if (ret)
++		dev_warn(dev, "PMU PHY-isolation write failed: %d\n", ret);
++	else
++		dev_info(dev, "PMU PHY-isolation released (offset 0x3ec8 bit 0)\n");
++}
++
+ static int gs101_ufs_drv_init(struct exynos_ufs *ufs)
+ {
+ 	struct ufs_hba *hba = ufs->hba;
+ 	u32 reg;
+
++	/*
++	 * Release PHY isolation via PMU before any link-startup activity.
++	 * Mirrors AOSP's exynos_ufs_ctrl_phy_pwr(true) at the start of
++	 * exynos_ufs_config_externals(). See gs101_ufs_release_phy_isolation
++	 * comment for the verification rationale.
++	 */
++	gs101_ufs_release_phy_isolation(ufs);
++
+ 	/* Enable WriteBooster */
+ 	hba->caps |= UFSHCD_CAP_WB_EN;
+

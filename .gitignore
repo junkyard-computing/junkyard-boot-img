@@ -149,6 +149,12 @@ Cargo.lock
 
 kernel_version
 kernel/kernel_version
+# kernel/source.aosp-backup is a symlink to a host-specific local AOSP
+# source checkout; the trailing "/" form would match a real directory but
+# not the symlink itself, so list both shapes.
+kernel/source.aosp-backup
+kernel/source.aosp-backup/
+kernel/source/out/
 rootfs/module_order.txt
 rootfs/sysroot/
 rootfs/unpack/
@@ -169,3 +175,16 @@ boot/vendor_boot.img
 
 # Downloaded at build time by `just sync_vendor_firmware`
 tools/payload-dumper-go/
+
+# Uart logs
+uart-logs/
+
+# Stock OTA boot images extracted for the AOSP-kernel sanity test
+# (see flash-aosp-sanity.sh) — large binary blobs, regenerable from the OTA.
+aosp-sanity/
+
+# Earlier ABL dump
+abl-dump/
+
+# Misc unpacked-image scratch directory used during boot-image debugging
+out/

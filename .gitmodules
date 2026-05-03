@@ -1,3 +1,7 @@
 [submodule "tools/mkbootimg"]
 	path = tools/mkbootimg
 	url = https://android.googlesource.com/platform/system/tools/mkbootimg
+[submodule "kernel/source"]
+	path = kernel/source
+	url = https://github.com/junkyard-computing/linux.git
+	branch = felix-vendor-graft
