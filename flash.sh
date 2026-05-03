@@ -19,6 +19,6 @@ fastboot erase vendor_kernel_boot
 # when the merge fails.
 fastboot erase dtbo
 # fastboot oem uart disable
-fastboot reboot
+# fastboot reboot
 
 popd

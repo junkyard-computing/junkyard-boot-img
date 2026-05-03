@@ -202,13 +202,24 @@ all:
 	#   firmware_class.path=/vendor/firmware   replaces the stock felix dtb's
 	#                                          /chosen/bootargs entry; without it
 	#                                          AOC retry-loops and starves UART RX.
+	#   rd.udev.children-max=1                 (h14) Serialize udev workers in
+	#                                          dracut/initrd. Workaround for the
+	#                                          (h6) PWM SBFES wedge: when udev's
+	#                                          coldplug burst fires 4 parallel
+	#                                          scsi_id INQUIRYs + 2x 64KB READ_10
+	#                                          back-to-back, the controller's bus
+	#                                          state breaks. Serializing should
+	#                                          let each command drain before the
+	#                                          next is queued. Remove once HS-Rate-B
+	#                                          works (controller can handle the
+	#                                          parallel storm at HS speed).
 	#
 	# No console=ttySAC0 — samsung_tty stays disabled in gs201.dtsi because the
 	# gs201 CMU is non-secure-EL1-protected; with &oscclk stub clocks the baud
 	# divider would be mis-calculated and serial output would garble.
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super firmware_class.path=/vendor/firmware kvm-arm.mode=protected" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
