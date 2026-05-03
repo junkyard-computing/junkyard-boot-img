@@ -34,6 +34,17 @@ KMAKE := $(MAKE) -C $(KERNEL_SOURCE_DIR) ARCH=arm64 CROSS_COMPILE=$(KERNEL_CROSS
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 
+# Pre-built aarch64 binary copied into the overlay tree by .build_pixel_devinfo.
+# Source-of-truth lives in the tools/pixel-devinfo submodule
+# (github.com/junkyard-computing/pixel-devinfo). Used by the
+# mark-slot-successful systemd unit to clear the bootloader's slot retry
+# counter so the device doesn't fall into fastboot after a few boots.
+PIXEL_DEVINFO_DIR ?= tools/pixel-devinfo
+PIXEL_DEVINFO_TARGET ?= aarch64-unknown-linux-gnu
+PIXEL_DEVINFO_BIN ?= $(PIXEL_DEVINFO_DIR)/target/$(PIXEL_DEVINFO_TARGET)/release/pixel-devinfo
+PIXEL_DEVINFO_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-devinfo
+PIXEL_DEVINFO_SOURCES := $(wildcard $(PIXEL_DEVINFO_DIR)/Cargo.toml $(PIXEL_DEVINFO_DIR)/Cargo.lock $(PIXEL_DEVINFO_DIR)/src/*.rs)
+
 # --resolv-conf=bind-host overrides the container's /etc/resolv.conf for the
 # lifetime of the nspawn session. Packages.txt installs systemd-resolved,
 # whose postinst points /etc/resolv.conf at a stub that only resolves when
@@ -102,7 +113,16 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.install_packages: .debootstrap $(APT_PACKAGES_FILE) $(OVERLAY_FILES)
+.build_pixel_devinfo: $(PIXEL_DEVINFO_SOURCES)
+	cd $(PIXEL_DEVINFO_DIR) && \
+		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(KERNEL_CROSS_COMPILE)gcc \
+		cargo build --release --target $(PIXEL_DEVINFO_TARGET)
+	$(KERNEL_CROSS_COMPILE)strip $(PIXEL_DEVINFO_BIN)
+	mkdir -p $(dir $(PIXEL_DEVINFO_OVERLAY))
+	install -m 0755 $(PIXEL_DEVINFO_BIN) $(PIXEL_DEVINFO_OVERLAY)
+	touch $@
+
+.install_packages: .debootstrap .build_pixel_devinfo $(APT_PACKAGES_FILE) $(OVERLAY_FILES)
 	just mount_rootfs
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "apt-get update"
 	# Locale setup.
@@ -219,7 +239,7 @@ all:
 	# divider would be mis-calculated and serial output would garble.
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=8 ignore_loglevel" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \

@@ -1,0 +1,18 @@
+[Unit]
+Description=Mark current Pixel A/B slot successful (devinfo)
+After=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# Read-modify-write the active slot in the devinfo partition: mark it
+# successful, max retries, clear unbootable. Stops the bootloader's retry
+# counter from exhausting after a few boots and forcing fastboot mode.
+# Source: github.com/junkyard-computing/pixel-devinfo (vendored at
+# tools/pixel-devinfo and cross-compiled to aarch64 by the build).
+ExecStart=/usr/local/bin/pixel-devinfo /dev/disk/by-partlabel/devinfo /dev/disk/by-partlabel/devinfo --successful true --unbootable false --retries 7 --quiet
+StandardOutput=journal+kmsg
+StandardError=journal+kmsg
+
+[Install]
+WantedBy=multi-user.target

@@ -20,5 +20,10 @@ format_userdata() {
   fi
 }
 
+echo "[BEACON] customservice: multi-user.target reached, starting" > /dev/kmsg
 load_aoc_firmware
 format_userdata
+echo "[BEACON] customservice: finished" > /dev/kmsg
+
+# Best-effort: log every assigned IPv4 address so we know if DHCP succeeded.
+ip -4 addr show 2>/dev/null | awk '/inet /{ print "[BEACON] " $NF " " $2 > "/dev/kmsg" }'

@@ -1,0 +1,76 @@
+#!/bin/sh
+# Dump the previous boot's saved diagnostic state via /dev/kmsg, then save
+# this boot's state for the next boot to read.
+#
+# Why: gs201 felix has a single USB-C port; UART adapter and USB-C ethernet
+# adapter are mutually exclusive. To debug "ethernet not coming up" without
+# being able to watch UART live during an ethernet boot, we save state to
+# disk on every boot and dump the *previous* boot's saved state on the next
+# (UART-attached) boot.
+
+PREV=/var/log/network-beacon-prev.log
+
+if [ -f "$PREV" ]; then
+    while IFS= read -r line; do
+        echo "[PREV-BOOT] $line" > /dev/kmsg
+    done < "$PREV"
+fi
+
+echo "[BEACON] network-beacon: collecting current state" > /dev/kmsg
+
+{
+    echo "=== network-beacon snapshot at $(date -u 2>/dev/null) ==="
+    echo
+    echo "--- lsusb ---"
+    lsusb 2>&1
+    echo
+    echo "--- ip -o link ---"
+    ip -o link show 2>&1
+    echo
+    echo "--- ip -4 addr ---"
+    ip -4 addr show 2>&1
+    echo
+    echo "--- ip -4 route ---"
+    ip -4 route show 2>&1
+    echo
+    echo "--- nmcli device status ---"
+    nmcli device status 2>&1
+    echo
+    echo "--- nmcli con show --active ---"
+    nmcli con show --active 2>&1
+    echo
+    echo "--- nmcli general status ---"
+    nmcli general status 2>&1
+    echo
+    echo "--- dmesg | grep -iE usb|eth|r8152|ax8817|cdc|usbnet|dwc3|xhci|networkmanager ---"
+    dmesg 2>/dev/null | grep -iE 'usb|eth|r8152|ax8817|cdc|usbnet|dwc3|xhci|networkmanager' | tail -120
+    echo
+    echo "=== end snapshot ==="
+} > "$PREV" 2>&1
+
+echo "[BEACON] network-beacon: saved to $PREV ($(wc -l < $PREV 2>/dev/null) lines)" > /dev/kmsg
+
+# Also dump a short summary now (this boot's IPs/routes via kmsg)
+ip -4 addr show 2>/dev/null | awk '/inet /{ print "[BEACON] " $NF " " $2 > "/dev/kmsg" }'
+ip -4 route show 2>/dev/null | while read -r line; do
+    echo "[BEACON] route: $line" > /dev/kmsg
+done
+nmcli -t -f STATE general 2>/dev/null | while read -r s; do
+    echo "[BEACON] nmcli STATE=$s" > /dev/kmsg
+done
+
+# Login-surface diagnostics: which targets reached, which units are active or
+# failed. Tells us whether any login path (ssh, getty@, kmsconvt@) is actually
+# usable on this boot.
+echo "[BEACON] system: $(systemctl is-system-running 2>/dev/null)" > /dev/kmsg
+for tgt in basic.target multi-user.target getty.target network.target network-online.target graphical.target; do
+    state=$(systemctl is-active "$tgt" 2>/dev/null)
+    echo "[BEACON] target: $tgt = $state" > /dev/kmsg
+done
+for svc in ssh.service NetworkManager.service systemd-logind.service kmsconvt@tty1.service getty@tty1.service serial-getty@ttySAC0.service mark-slot-successful.service; do
+    state=$(systemctl is-active "$svc" 2>/dev/null)
+    echo "[BEACON] svc: $svc = $state" > /dev/kmsg
+done
+systemctl --no-pager --no-legend list-units --state=failed --type=service 2>/dev/null | while read -r line; do
+    echo "[BEACON] failed: $line" > /dev/kmsg
+done

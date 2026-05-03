@@ -184,3 +184,9 @@ abl-dump/
 
 # Misc unpacked-image scratch directory used during boot-image debugging
 out/
+# Pre-built aarch64 binary copied from tools/pixel-devinfo by the Makefile
+# (see .build_pixel_devinfo target). The source-of-truth lives in the
+# tools/pixel-devinfo submodule; this is just a staged artifact for overlay
+# rsync.
+rootfs/overlay/usr/local/bin/pixel-devinfo
+.build_pixel_devinfo
