@@ -1,0 +1,146 @@
+From: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+Date: Mon, 27 Apr 2026 10:45:00 -0700
+Subject: [PATCH] ufs: exynos: force 32-bit DMA mask on gs201 (Tensor G2)
+
+The gs201 UFS controller advertises MASK_64_ADDRESSING_SUPPORT
+(bit 24) in its capabilities register:
+
+  exynos-ufshc 14700000.ufs: cap=0x1303ff1f (bit24 set)
+
+Mainline's ufshcd_set_dma_mask therefore configures the device for
+DMA_BIT_MASK(64). On a 12 GB Pixel Fold (felix), the kernel's general
+allocator regularly hands out scatter-gather buffers above the 4 GB
+boundary. The moment the controller's AXI master is asked to access
+one of those high-memory addresses for a SCSI data DMA, it raises
+SYSTEM_BUS_FATAL_ERROR (IS register bit 17, saved_err = 0x20000) and
+silently abandons the in-flight commands. The driver then sees
+OCS_INVALID_COMMAND_STATUS for those tags 30 seconds later when the
+SCSI command timeout fires.
+
+Concrete reproducer on Pixel Fold:
+
+  exynos-ufshc 14700000.ufs: OCS invalid from controller for tag 14
+    ocs-instr tag=14 lun=2 op=0x12 lba=0x0
+    ocs-instr UTRD ocs=0xf rsp_off=0x80 rsp_len=0x80 prd_off=0x100 prd_len=0x1
+    ocs-instr UCD virt=ffff00007e40a800 req_dma=0xfe40a800
+    ocs-instr UCD+0x400: 00 d0 fb 99 08 00 00 00 00 00 00 00 ff 00 00 00
+                         ^^^^^^^^^^^^^^^^^^^^^^^^
+                         PRD addr = 0x0000000899fbd000  (>4 GB)
+  exynos-ufshc 14700000.ufs: fatal_err[0] = 0x20000 at 36254540 us
+
+The capabilities-register claim of 64-bit support is therefore wrong
+in practice on this part. The downstream Android driver
+(google-modules/soc/gs/drivers/ufs/ufs-exynos.c) sidesteps this by
+unconditionally pinning the dma_mask:
+
+  static u64 exynos_ufs_dma_mask = DMA_BIT_MASK(32);
+  ...
+  dev->dma_mask = &exynos_ufs_dma_mask;
+
+That suggests the controller bug is recognised at Google but never
+documented; the override is buried at probe-init for the whole
+exynos UFS family.
+
+This patch adds a per-variant dma_mask_bits field to
+exynos_ufs_drv_data and a matching .set_dma_mask vop. When non-zero,
+the override forces dma_set_mask_and_coherent to the requested width
+regardless of the controller's MASK_64_ADDRESSING_SUPPORT bit. Only
+the gs201_ufs_drvs entry sets it (= 32); gs101 and the other Exynos
+variants keep the existing capability-driven path.
+
+I'm being conservative and only setting dma_mask_bits for gs201 since
+that's the part I have hardware to test. The downstream override
+covers all exynos variants, which is suggestive — gs101 (Tensor G1)
+in particular is likely affected by the same controller behavior. But
+since I can't verify that, leaving it for someone with gs101 hardware
+to test and follow up on.
+
+Tested on Pixel Fold (felix, gs201): with the override in place, the
+UTRL base address moves from 0x883c9a000 (>4 GB) to 0x89000000
+(<4 GB), and PRD entries for SCSI data buffers no longer land above
+the 4 GB boundary.
+
+Cc: Peter Griffin <peter.griffin@linaro.org>
+Cc: Alim Akhtar <alim.akhtar@samsung.com>
+Signed-off-by: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+---
+ drivers/ufs/host/ufs-exynos.c | 25 +++++++++++++++++++++++++
+ drivers/ufs/host/ufs-exynos.h |  8 ++++++++
+ 2 files changed, 33 insertions(+)
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -12,6 +12,7 @@
+ #include <linux/arm-smccc.h>
+ #include <linux/clk.h>
+ #include <linux/delay.h>
++#include <linux/dma-mapping.h>
+ #include <linux/module.h>
+ #include <linux/of.h>
+ #include <linux/of_address.h>
+@@ -2261,6 +2262,23 @@ static int gs101_ufs_suspend(struct exynos_ufs *ufs)
+ 	return 0;
+ }
+
++static int exynos_ufs_set_dma_mask(struct ufs_hba *hba)
++{
++	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
++	u8 bits;
++
++	if (ufs->drv_data && ufs->drv_data->dma_mask_bits) {
++		bits = ufs->drv_data->dma_mask_bits;
++		return dma_set_mask_and_coherent(hba->dev, DMA_BIT_MASK(bits));
++	}
++
++	if (hba->capabilities & MASK_64_ADDRESSING_SUPPORT) {
++		if (!dma_set_mask_and_coherent(hba->dev, DMA_BIT_MASK(64)))
++			return 0;
++	}
++	return dma_set_mask_and_coherent(hba->dev, DMA_BIT_MASK(32));
++}
++
+ static const struct ufs_hba_variant_ops ufs_hba_exynos_ops = {
+ 	.name				= "exynos_ufs",
+ 	.init				= exynos_ufs_init,
+@@ -2275,6 +2293,7 @@ static const struct ufs_hba_variant_ops ufs_hba_exynos_ops = {
+ 	.suspend			= exynos_ufs_suspend,
+ 	.resume				= exynos_ufs_resume,
+ 	.fill_crypto_prdt		= exynos_ufs_fmp_fill_prdt,
++	.set_dma_mask			= exynos_ufs_set_dma_mask,
+ };
+
+ static struct ufs_hba_variant_ops ufs_hba_exynosauto_vh_ops = {
+@@ -2447,6 +2466,12 @@ static const struct exynos_ufs_drv_data gs201_ufs_drvs = {
+ 	.opts			= EXYNOS_UFS_OPT_SKIP_CONFIG_PHY_ATTR |
+ 				  EXYNOS_UFS_OPT_TIMER_TICK_SELECT,
+ 	.iocc_mask		= UFS_GS101_SHARABLE,
++	/*
++	 * The controller advertises MASK_64_ADDRESSING_SUPPORT but in
++	 * practice raises SYSTEM_BUS_FATAL_ERROR on >4 GB DMA. Force
++	 * 32-bit so the kernel allocator never hands us a high address.
++	 */
++	.dma_mask_bits		= 32,
+ 	.drv_init		= gs201_ufs_drv_init,
+ 	.pre_link		= gs101_ufs_pre_link,
+ 	.post_link		= gs201_ufs_post_link,
+diff --git a/drivers/ufs/host/ufs-exynos.h b/drivers/ufs/host/ufs-exynos.h
+--- a/drivers/ufs/host/ufs-exynos.h
++++ b/drivers/ufs/host/ufs-exynos.h
+@@ -181,6 +181,14 @@ struct exynos_ufs_drv_data {
+ 	unsigned int quirks;
+ 	unsigned int opts;
+ 	u32 iocc_mask;
++	/*
++	 * If non-zero, force dev->dma_mask to this width even when
++	 * MASK_64_ADDRESSING_SUPPORT is set in the controller capabilities
++	 * register. Workaround for SoCs whose UFS controller advertises
++	 * 64-bit DMA but actually faults the AXI master on addresses
++	 * above the 4 GB boundary (gs201 / Tensor G2 confirmed).
++	 */
++	u8 dma_mask_bits;
+ 	/* SoC's specific operations */
+ 	int (*drv_init)(struct exynos_ufs *ufs);
+ 	int (*pre_link)(struct exynos_ufs *ufs);
+--
+2.50.0

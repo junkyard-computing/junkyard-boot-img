@@ -1,0 +1,77 @@
+From: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+Date: Sat, 02 May 2026 12:50:00 -0700
+Subject: [PATCH] ufs: exynos: gs201: enable PRDT prefetch on TX without
+ requiring crypto
+
+`exynos_ufs_post_link` only ORs `PRDT_PREFETCH_EN` (BIT(31)) into
+`HCI_TXPRDT_ENTRY_SIZE` when `hba->caps & UFSHCD_CAP_CRYPTO` is set.
+On gs201 we don't currently get `UFSHCD_CAP_CRYPTO` because the
+gs201 path can't go through `EXYNOS_UFS_OPT_UFSPR_SECURE` (BL31's
+`SMC_CMD_FMP_SECURITY` / `SMC_CMD_SMU(SMU_INIT)` don't actually
+program the FMP security registers, so fmp_init early-returns and
+crypto registration never happens). The result is that mainline gs201
+runs with TX-PRDT prefetch DISABLED — the controller fetches PRDT
+entries on demand, one at a time, instead of batch-prefetching them
+into its internal cache.
+
+AOSP's downstream driver (`google-modules/soc/gs/drivers/ufs/ufs-exynos.c`,
+`exynos_ufs_config_host`) writes
+`PRDT_PREFECT_EN | PRDT_SET_SIZE(12)` to `HCI_TXPRDT_ENTRY_SIZE`
+unconditionally for every Tensor SoC, with no dependency on
+crypto/inline-encryption being available. The bit gates an AXI master
+optimisation that's orthogonal to crypto.
+
+Add an explicit write in `gs201_ufs_post_link` that overwrites the
+generic exynos_ufs_post_link value with the AOSP-equivalent
+`PRDT_PREFETCH_EN | size = 12`. gs201 only — gs101 uses the existing
+`gs101_ufs_post_link` which doesn't apply this fix because gs101
+mainline gets `UFSHCD_CAP_CRYPTO` through the working
+`EXYNOS_UFS_OPT_UFSPR_SECURE` path. (Verifying gs101 separately would
+be a good cleanup — AOSP shares the config_host code across
+gs101/gs201/zuma.)
+
+**Important caveat:** this matches AOSP byte-for-byte but does NOT
+on its own resolve the gs201 SCSI hang at ~38 s into boot at PWM gear
+that we're still seeing on a forked (HS-Rate-B-disabled) tree.
+PRDT prefetch is an AXI-master efficiency feature; the wedge has the
+shape of a controller-level race in PWM gear that survives every
+SCSI-side and HCI-side workaround we've tried, including this one.
+The patch stands on its own as "match AOSP behaviour"; PWM survival
+is a separate problem.
+
+Signed-off-by: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+Cc: Peter Griffin <peter.griffin@linaro.org>
+Cc: Alim Akhtar <alim.akhtar@samsung.com>
+Cc: linux-samsung-soc@vger.kernel.org
+Cc: linux-scsi@vger.kernel.org
+Cc: linux-arm-kernel@lists.infradead.org
+---
+ drivers/ufs/host/ufs-exynos.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -2400,6 +2400,20 @@ static int gs201_ufs_post_link(struct exynos_ufs *ufs)
+ 	unipro_writel(ufs, 0x0, 0x3348);
+ 	unipro_writel(ufs, 0x0, 0x334C);
+
++	/*
++	 * Enable TX PRDT prefetch (BIT(31) of HCI_TXPRDT_ENTRY_SIZE).
++	 * exynos_ufs_post_link only ORs this bit in when CRYPTO is enabled
++	 * (val |= PRDT_PREFETCH_EN under hba->caps & UFSHCD_CAP_CRYPTO),
++	 * but on gs201 we cannot enable EXYNOS_UFS_OPT_UFSPR_SECURE (BL31
++	 * doesn't honour the FMP SMC pair) so CRYPTO is never set and TX
++	 * PRDT prefetch ships disabled. AOSP's exynos_ufs_config_host
++	 * writes PRDT_PREFECT_EN unconditionally for every Tensor SoC;
++	 * match that behaviour explicitly.
++	 */
++	hci_writel(ufs,
++		   PRDT_PREFETCH_EN | (ilog2(DATA_UNIT_SIZE) & 0x1F),
++		   HCI_TXPRDT_ENTRY_SIZE);
++
+ 	return 0;
+ }
+
+--
+2.50.0

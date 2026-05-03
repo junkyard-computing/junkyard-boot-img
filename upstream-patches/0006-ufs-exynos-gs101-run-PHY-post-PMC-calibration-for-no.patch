@@ -1,0 +1,141 @@
+From: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+Date: Sat, 02 May 2026 13:00:00 -0700
+Subject: [PATCH] ufs: exynos: gs101: run PHY post-PMC calibration for non-HS
+ gear changes
+
+`exynos_ufs_pre_pwr_mode` and `exynos_ufs_post_pwr_mode` only call
+`phy_calibrate(generic_phy)` if the negotiated mode is HS:
+
+  if (ufshcd_is_hs_mode(dev_req_params)) {
+      switch (dev_req_params->hs_rate) {
+      case PA_HS_MODE_A:
+      case PA_HS_MODE_B:
+          phy_calibrate(generic_phy);
+          break;
+      }
+  }
+
+The Samsung PHY framework's per-state register tables (CFG_PRE_PWR_HS
+and CFG_POST_PWR_HS) include entries tagged for PWM mode
+(`PWR_MODE_PWM_ANY`) and for any mode (`PWR_MODE_ANY`). Because of
+the HS-only gating in ufs-exynos, those entries never run when a
+gs101/gs201 system enters PWM gear.
+
+For tensor_gs101 specifically the impact is concrete:
+  tensor_gs101_pre_pwr_hs_config:
+    PHY_TRSV_REG_CFG_GS101(0x369, 0x11, PWR_MODE_ANY)
+    PHY_TRSV_REG_CFG_GS101(0x246, 0x03, PWR_MODE_ANY)
+  tensor_gs101_post_pwr_hs_config:
+    PHY_COMN_REG_CFG    (0x8,   0x60, PWR_MODE_PWM_ANY)
+    PHY_TRSV_REG_CFG_GS101(0x222, 0x08, PWR_MODE_PWM_ANY)
+    PHY_TRSV_REG_CFG_GS101(0x246, 0x01, PWR_MODE_ANY)
+
+These match AOSP's `post_calib_of_pwm` cal-if table byte-for-byte
+(byte 0x20=0x60 / 0x888=0x08 / 0x918=0x01 in the PMA TRSV region),
+which AOSP applies via `ufs_call_cal(ufs_cal_post_pmc)` from
+`exynos_ufs_pwr_change_notify`'s POST_CHANGE branch — not gated by
+HS mode.
+
+Add a `gs101_ufs_post_pwr_change` vops hook (wired into both
+`gs101_ufs_drvs` and `gs201_ufs_drvs`) that, for non-HS pwr_change
+notifications, drives `phy_calibrate` twice to advance the Samsung
+PHY framework's state machine (samsung_ufs_phy_calibrate in
+drivers/phy/samsung/phy-samsung-ufs.c) through CFG_PRE_PWR_HS →
+CFG_POST_PWR_HS → CFG_PRE_INIT, applying both tables. For HS
+pwr_change the existing `exynos_ufs_pre_pwr_mode` and
+`exynos_ufs_post_pwr_mode` already call phy_calibrate, so the new
+hook returns 0 immediately.
+
+The 2nd phy_calibrate runs `wait_for_cdr` on lane 0/1; for non-HS
+this returns -ETIMEDOUT (no CDR lock at PWM). samsung_ufs_phy_calibrate
+propagates the error to the caller, but `exynos_ufs_post_pwr_mode`
+discards the rc of the surrounding `phy_calibrate()` call, so this is
+benign — it just costs ~30 ms of poll-and-timeout per non-HS
+pwr_change. A follow-up patch could short-circuit wait_for_cdr at
+non-HS gears in `gs101_phy_wait_for_cdr_lock` (and equivalents) to
+remove the wasted poll.
+
+**Important caveat:** this matches AOSP behaviour but is not on its
+own a fix for gs201 PWM-gear stability. We're still seeing a SCSI
+hang at ~38 s into boot under sustained PWM workload, with or
+without this patch. The point of the change is "match AOSP /
+populate state the PHY framework was already designed to populate";
+PWM-gear data-path bugs are a separate problem. If a maintainer
+wants to scope this down to gs201 only or block it pending a more
+upstream-friendly approach (e.g. removing the HS-only gating in
+exynos_ufs_*_pwr_mode and adding a PWR_MODE filter to
+samsung_ufs_phy_config), I'll happily respin.
+
+Signed-off-by: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+Cc: Peter Griffin <peter.griffin@linaro.org>
+Cc: Alim Akhtar <alim.akhtar@samsung.com>
+Cc: Vinod Koul <vkoul@kernel.org>
+Cc: Kishon Vijay Abraham I <kishon@kernel.org>
+Cc: linux-phy@lists.infradead.org
+Cc: linux-samsung-soc@vger.kernel.org
+Cc: linux-scsi@vger.kernel.org
+Cc: linux-arm-kernel@lists.infradead.org
+---
+ drivers/ufs/host/ufs-exynos.c | 33 +++++++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -2592,6 +2592,37 @@ static int gs101_ufs_pre_pwr_change(struct exynos_ufs *ufs,
+ 	return 0;
+ }
+
++/*
++ * Drive the Samsung PHY framework's state machine
++ * (samsung_ufs_phy_calibrate in drivers/phy/samsung/phy-samsung-ufs.c)
++ * through CFG_PRE_PWR_HS -> CFG_POST_PWR_HS for non-HS gear changes.
++ * mainline `exynos_ufs_pre_pwr_mode` and `exynos_ufs_post_pwr_mode`
++ * gate `phy_calibrate(generic_phy)` behind `ufshcd_is_hs_mode()`, so
++ * for PWM the PRE_PWR_HS / POST_PWR_HS register tables never run --
++ * even though those tables contain entries tagged PWR_MODE_PWM_ANY
++ * and PWR_MODE_ANY that AOSP unconditionally applies via
++ * ufs_cal_post_pmc.
++ *
++ * For HS modes, the surrounding exynos_ufs_post_pwr_mode already calls
++ * phy_calibrate, so do nothing here.
++ */
++static int gs101_ufs_post_pwr_change(struct exynos_ufs *ufs,
++				     const struct ufs_pa_layer_attr *pwr_req)
++{
++	struct phy *generic_phy = ufs->phy;
++
++	if (ufshcd_is_hs_mode(pwr_req))
++		return 0;
++
++	phy_calibrate(generic_phy);	/* runs CFG_PRE_PWR_HS table */
++	/*
++	 * Runs CFG_POST_PWR_HS table; also calls drvdata->wait_for_cdr
++	 * which times out for non-HS (samsung_ufs_phy_calibrate returns
++	 * -ETIMEDOUT, discarded by exynos_ufs_post_pwr_mode).
++	 */
++	phy_calibrate(generic_phy);
++	return 0;
++}
++
+ static int exynos_ufs_set_dma_mask(struct ufs_hba *hba)
+ {
+ 	struct exynos_ufs *ufs = ufshcd_get_variant(hba);
+@@ -2884,6 +2915,7 @@ static const struct exynos_ufs_drv_data gs101_ufs_drvs = {
+ 	.pre_link		= gs101_ufs_pre_link,
+ 	.post_link		= gs101_ufs_post_link,
+ 	.pre_pwr_change		= gs101_ufs_pre_pwr_change,
++	.post_pwr_change	= gs101_ufs_post_pwr_change,
+ 	.suspend		= gs101_ufs_suspend,
+ };
+
+@@ -2946,6 +2978,7 @@ static const struct exynos_ufs_drv_data gs201_ufs_drvs = {
+ 	.pre_link		= gs101_ufs_pre_link,
+ 	.post_link		= gs201_ufs_post_link,
+ 	.pre_pwr_change		= gs101_ufs_pre_pwr_change,
++	.post_pwr_change	= gs101_ufs_post_pwr_change,
+ 	.suspend		= gs101_ufs_suspend,
+ };
+
+--
+2.50.0

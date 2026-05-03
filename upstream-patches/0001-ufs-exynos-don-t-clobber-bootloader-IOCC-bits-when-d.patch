@@ -45,12 +45,14 @@ fights with that intent.
 On gs201 the AOSP driver pairs `dma-coherent` with
 `ufs-iocc { val = <0x3>; }` in DT; preserving rather than clearing
 brings the !dma-coherent path in line with the same defensive
-behavior. Note: this change does not on its own resolve the wider
-mainline gs201 NOP_OUT failure (additional firewalls between the
-controller and DRAM remain unresolved). It is sent as a targeted
-correctness fix for the destructive-clear behavior, which likely
-affects other Samsung platforms whose bootloaders configure IOCC
-bits expected to persist into the kernel.
+behavior. Note: this change is sent as a defensive correctness fix
+and does not on its own unblock gs201 NOP_OUT — the gating fix for
+that is the companion patch "ufs: exynos: drop UFSHCD_QUIRK_PRDT_BYTE_GRAN
+from gs201", which corrects an inherited gs101 quirk that caused
+mainline to misinterpret the controller's UTRD offset units.
+However the destructive "actively clear iocc_val" behavior is wrong
+on its own merits and likely affects other Samsung platforms whose
+bootloaders configure IOCC bits expected to persist into the kernel.
 
 Cc: Peter Griffin <peter.griffin@linaro.org>
 References: f92bb74 ("scsi: ufs: exynos: Disable iocc if dma-coherent property isn't set")
