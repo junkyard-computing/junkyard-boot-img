@@ -1,0 +1,76 @@
+From: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+Date: Sat, 26 Apr 2026 19:55:00 -0700
+Subject: [PATCH] ufs: exynos: drop UFSHCD_QUIRK_PRDT_BYTE_GRAN from gs201
+
+The gs201 (Tensor G2 / Pixel Fold) entry in exynos_ufs_of_match was
+added carrying the UFSHCD_QUIRK_PRDT_BYTE_GRAN quirk inherited from
+gs101. On gs201 hardware this is wrong: the controller follows the
+UFS spec strictly and interprets the UTRD's response_upiu_offset and
+prd_table_offset fields in DWORDS, not bytes.
+
+With the quirk set, ufshcd_host_memory_configure writes
+response_upiu_offset = ALIGNED_UPIU_SIZE (i.e. 0x200, in bytes).
+The controller reads 0x200 and interprets it as 0x200 dwords =
+0x800 bytes, then writes its UPIU response at UCD+0x800. Mainline
+reads the response slot at UCD+0x200 (per the C struct layout in
+struct utp_transfer_cmd_desc) and sees nothing — exactly the
+"controller signals UTRCS, doorbell clears, response slot stays
+empty, no UIC errors" pattern that's been confounding gs201 UFS
+bring-up.
+
+Confirmed by stamping the response slot with 0xAB before submitting
+NOP_OUT and dumping memory at the alternate location after the
+controller "completes":
+
+  RSP UPIU: 00000000: abababab abababab abababab abababab
+  UCD+0x800 (alt rsp loc): 00000000: 00000020 00000000 00000000 00000000
+                                     ^^^^^^^^
+                                     NOP_IN (0x20) — the response
+
+Dropping the quirk causes mainline to emit the offsets in DWORDS
+(0x80 = 128 dwords = 0x200 bytes), which the controller now
+correctly interprets, and NOP_OUT completes successfully. PWR_MODE
+change to HS-G4 L2 succeeds afterwards (link comes up to FAST mode).
+
+(Subsequent UFS init still hits a separate PHY CDR-lock issue, but
+that's a distinct problem; this patch is the gating fix for getting
+past NOP_OUT on gs201.)
+
+The gs101 entry keeps the quirk untouched. gs101 hardware may have
+the same DWORDS-per-spec behavior, in which case the quirk could be
+dropped there too — but I don't have hardware to verify.
+
+Tested on Pixel Fold (felix, gs201).
+
+Cc: Peter Griffin <peter.griffin@linaro.org>
+Cc: Alim Akhtar <alim.akhtar@samsung.com>
+Signed-off-by: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+---
+ drivers/ufs/host/ufs-exynos.c | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -2370,8 +2370,17 @@ static const struct exynos_ufs_drv_data gs101_ufs_drvs = {
+
+ static const struct exynos_ufs_drv_data gs201_ufs_drvs = {
+ 	.uic_attr		= &gs101_uic_attr,
+-	.quirks			= UFSHCD_QUIRK_PRDT_BYTE_GRAN |
+-				  UFSHCI_QUIRK_SKIP_RESET_INTR_AGGR |
++	/*
++	 * gs101 sets UFSHCD_QUIRK_PRDT_BYTE_GRAN — gs201 must NOT.
++	 * gs201 controller follows UFS spec: the UTRD response_upiu_offset
++	 * and prd_table_offset fields are in DWORDS. With the quirk set,
++	 * mainline writes those fields in BYTES; the controller interprets
++	 * as DWORDS and writes the response 4× further into the UCD than
++	 * mainline reads back from. Result: link startup OK, NOP_OUT
++	 * "completes" with no UIC errors, but RSP UPIU appears empty
++	 * (controller actually wrote it at UCD+0x800 instead of UCD+0x200).
++	 */
++	.quirks			= UFSHCI_QUIRK_SKIP_RESET_INTR_AGGR |
+ 				  UFSHCI_QUIRK_BROKEN_REQ_LIST_CLR |
+ 				  UFSHCD_QUIRK_BROKEN_OCS_FATAL_ERROR |
+ 				  UFSHCI_QUIRK_SKIP_MANUAL_WB_FLUSH_CTRL |
+--
+2.50.0

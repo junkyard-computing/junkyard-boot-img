@@ -1,0 +1,91 @@
+From: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+Date: Sat, 26 Apr 2026 17:30:00 -0700
+Subject: [PATCH] ufs: exynos: preserve bootloader IOCC bits when
+ !dma-coherent
+
+Commit f92bb74 ("scsi: ufs: exynos: Disable iocc if dma-coherent
+property isn't set") deliberately switched the !dma-coherent path
+from no-op to "actively clear iocc bits". The intent — keep
+hardware-coherency state consistent with what the kernel claims —
+makes sense in isolation, but the chosen mechanism is destructive
+to bootloader configuration on platforms where the IOCC bits
+control more than just snoop participation.
+
+When 'dma-coherent' is not set in DT, exynos_ufs_parse_dt sets
+iocc_val=0 and exynos_ufs_shareability then issues
+regmap_update_bits(sysreg, iocc_offset, iocc_mask, val=0), which
+*actively clears* the IOCC sharability bits the bootloader set.
+
+On gs201 (Tensor G2 / Pixel Fold) this is fatal: the IOCC bits at
+sysreg_hsi2+0x710 don't just control hardware coherency, they also
+control whether the UFS controller's AXI master uses Inner-Shareable
+Normal-Memory transactions. With those bits cleared the controller
+issues Device-Memory accesses that get absorbed by intermediate
+buffers and never reach CPU-visible DRAM. Symptom: link startup
+succeeds, every NOP_OUT "completes" (UTRCS fires, doorbell clears)
+but the response slot in memory stays untouched (no UIC errors,
+OCS=SUCCESS), proven by stamping the response slot with a magic
+byte before submission and observing that the magic survives the
+entire transaction.
+
+Observed on a Pixel Fold (felix) running mainline:
+
+  exynos-ufshc 14700000.ufs: sysreg-HSI2 IOCC before-iocc-write: @0x710 = 0x00000013
+  exynos-ufshc 14700000.ufs: sysreg-HSI2 IOCC after-iocc-write : @0x710 = 0x00000010
+
+Bootloader had bits 0 and 1 (RD/WR Sharable) set; mainline cleared them.
+
+The fix preserves the bootloader's IOCC bits when 'dma-coherent' is
+absent by zeroing iocc_mask instead of iocc_val. With mask=0 the
+regmap_update_bits call becomes a no-op so any firmware-programmed
+bits stay intact. Platforms that intentionally want IOCC bits cleared
+should clear them in the bootloader; the kernel actively zeroing them
+fights with that intent.
+
+On gs201 the AOSP driver pairs `dma-coherent` with
+`ufs-iocc { val = <0x3>; }` in DT; preserving rather than clearing
+brings the !dma-coherent path in line with the same defensive
+behavior. Note: this change is sent as a defensive correctness fix
+and does not on its own unblock gs201 NOP_OUT — the gating fix for
+that is the companion patch "ufs: exynos: drop UFSHCD_QUIRK_PRDT_BYTE_GRAN
+from gs201", which corrects an inherited gs101 quirk that caused
+mainline to misinterpret the controller's UTRD offset units.
+However the destructive "actively clear iocc_val" behavior is wrong
+on its own merits and likely affects other Samsung platforms whose
+bootloaders configure IOCC bits expected to persist into the kernel.
+
+Cc: Peter Griffin <peter.griffin@linaro.org>
+References: f92bb74 ("scsi: ufs: exynos: Disable iocc if dma-coherent property isn't set")
+Signed-off-by: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+---
+ drivers/ufs/host/ufs-exynos.c | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/ufs/host/ufs-exynos.c b/drivers/ufs/host/ufs-exynos.c
+--- a/drivers/ufs/host/ufs-exynos.c
++++ b/drivers/ufs/host/ufs-exynos.c
+@@ -1352,10 +1352,19 @@ static int exynos_ufs_parse_dt(struct device *dev, struct exynos_ufs *ufs)
+ 	ufs->iocc_mask = ufs->drv_data->iocc_mask;
+ 	/*
+ 	 * no 'dma-coherent' property means the descriptors are
+-	 * non-cacheable so iocc shareability should be disabled.
++	 * non-cacheable so kernel-side cache maintenance handles
++	 * coherency. Don't actively *clear* the IOCC bits in that
++	 * case: zero the mask so the subsequent regmap_update_bits
++	 * call is a no-op, preserving whatever the firmware/bootloader
++	 * configured. On some platforms (e.g. gs201/Tensor G2) the
++	 * IOCC bits also control whether the controller's AXI master
++	 * uses Inner-Shareable Normal-Memory transactions; clearing
++	 * them turns master writes into Device-Memory accesses that
++	 * never reach CPU-visible DRAM, producing silent UPIU
++	 * completion failures (NOP OUT response slot stays untouched).
+ 	 */
+ 	if (of_dma_is_coherent(dev->of_node))
+ 		ufs->iocc_val = ufs->iocc_mask;
+ 	else
+-		ufs->iocc_val = 0;
++		ufs->iocc_mask = 0;
+
+ 	ufs->pclk_avail_min = PCLK_AVAIL_MIN;
+--
+2.50.0
