@@ -1,176 +1,137 @@
 To: peter.griffin@linaro.org
 Cc: <PIXEL TEAM CONTACT>
-Subject: gs201 UFS HS dl_err 0x80000002 — likely cause is missing PMU PHY-isolation
-         release (follow-up to bring-up thread)
+Subject: gs201 UFS bring-up — AOSP-vs-mainline diff (PMU PHY-isolation parity gap;
+         dl_err 0x80000002 still open)
 
 Hi Peter (cc'ing the Pixel team thread),
 
-Follow-up to the gs201 bring-up thread with a new finding I think is
-upstream-eligible on its own. TL;DR: the `dl_err 0x80000002` wedge that
-hit on every HS-Rate attempt in mainline appears to be caused by
-mainline never lifting a PMU PHY-isolation bit that the AOSP vendor
-driver lifts before link startup. The evidence is empirical (running
-AOSP's UFS driver unmodified on an otherwise mainline-shape v7.0-rc4
-kernel makes HS-G4 dual-lane link startup pass on the same hardware),
-but the bit's exact semantics are insider knowledge, hence the cc to
-the Pixel team.
+Follow-up to the gs201 bring-up thread. I had a hypothesis I wanted to
+test before sending — that the `dl_err 0x80000002` wedge mainline hits
+at HS-Rate was caused by missing a PMU PHY-isolation release that
+AOSP's vendor driver does at probe. **Result is negative.** Documenting
+it here because the parity gap is still real and the test settled one
+of the BL31-firewalling questions on the Pixel-team side.
 
-## What I did
+## TL;DR
 
-I grafted AOSP's vendor UFS driver
-(`private/google-modules/soc/gs/drivers/ufs/`) wholesale into a
-v7.0-rc4-based mainline kernel — separate driver at
-`drivers/ufs/host/exynos-gs/`, gated by a new `SCSI_UFS_EXYNOS_GS`
-Kconfig, mainline's `SCSI_UFS_EXYNOS` disabled. The intent wasn't
-upstreaming the graft itself — it was a controlled experiment to find
-out what AOSP does in the link-startup path that mainline doesn't.
+A vendor-driver graft on a v7.0-rc4 + felix-platform-port mainline
+kernel reaches `UFS link start-up passes` at HS-G4 dual-lane on Pixel
+Fold (gs201) where mainline's `drivers/ufs/host/ufs-exynos.c gs101_ufs_*`
+path wedges with `dl_err 0x80000002` on the first frame after PMC. So
+the gap is real — there's something AOSP does that mainline doesn't.
 
-The graft's only source-level edits to AOSP code are upstream-API drift
-fixes (const on `pwr_change_notify`'s `desired_pmd`, `hrtimer_init` →
-`hrtimer_setup`, `ufshcd_hold` 1-arg form, `ufshcd_shutdown` removal,
-`platform_driver.remove` returning void, `<asm/unaligned.h>` →
-`<linux/unaligned.h>`, vendor-hook stubs because mainline doesn't carry
-ANDROID_VENDOR_HOOKS). None of those touch the link-startup path.
+I traced one concrete piece: AOSP's `exynos_ufs_ctrl_phy_pwr()` writes
+PMU offset 0x3ec8 bit 0 (the `ufs-phy-iso` DT subnode triple) at the
+top of `exynos_ufs_config_externals()`. Mainline's gs101 path never
+touches the PMU. I built a single-write verification patch (helper at
+the top of `gs101_ufs_drv_init` + `samsung,pmu-syscon = <&pmu_alive>`
+on the UFS DT node) and tested it on Pixel Fold:
 
-DT-side changes are equally minimal: add the AOSP-shape sub-nodes
-(`ufs-phy-iso`, `ufs-iocc`) and the missing reg entries (PHY MMIO at
-0x14704000+0x3000 and CPORT at 0x14708000+0x804) to felix's UFS node so
-the AOSP driver's expected ioremap loop completes, and disable the
-mainline-shape standalone `phy@14704000` node so it doesn't claim
-the PHY MMIO range with -EBUSY.
+  [    1.677] PMU PHY-isolation released (offset 0x3ec8 bit 0)
+  [    1.891] Power mode changed to : FAST series_B G_4 L_2
+  [    8.073] ufshcd_abort: Device abort task at tag 0
+  [    8.127] dl_err[0] = 0x80000002 at 1928150 us
 
-## What happened
+So the write reaches the register (good news for one of the questions
+below), but `dl_err 0x80000002` still fires 37 ms after PMC just like
+without the patch. The bit is doing *something* on AOSP — it's not a
+no-op or a binding wart — but it's not what gates the HS data path.
 
-Same hardware (Pixel Fold, gs201), same bootloader handoff, same kernel
-base v7.0-rc4 + post-rc4 merges, same `kvm-arm.mode=protected`,
-same `dma-coherent` + `samsung,sysreg` references — only the UFS host
-driver swapped in.
+## What this confirms / rules out
 
-UART:
+* **The PMU register at offset 0x3ec8 is reachable from EL1** with
+  `kvm-arm.mode=protected` set (which we have for the unrelated CMU
+  unlock per `project_pkvm_cmu_unlock.md`). So the `samsung,pmu-syscon`
+  + regmap_update_bits path works end-to-end. That answers question
+  (C) from my draft pre-test cover letter — 0x3ec8 isn't BL31-firewalled
+  the way CMU is.
 
-  [    1.613655] exynos-ufs 14700000.ufs: PA_ActiveTxDataLanes(2), PA_ActiveRxDataLanes(2)
-  [    1.613797] exynos-ufs 14700000.ufs: max_gear(4), PA_MaxRxHSGear(4)
-  [    1.613916] exynos-ufs 14700000.ufs: UFS link start-up passes
+* **The bit is not on the HS data-path critical chain.** Whatever
+  gates the M-PHY's analog TX in mainline-shape gs101, it's not this.
+  Hypothesis "PMU isolation is the gate" is dead.
 
-i.e. UIC link startup completes at HS-G4 dual-lane *and* commands then
-dispatch (UTRD ring fires, controller posts UTRCS). The follow-on
-"Invalid device management cmd response: ab" is unrelated — it's the
-IOCC sharability bug we already knew about (same `0xAB` magic stamp
-issue) and isn't caused by the new graft path.
+* **The gap between mainline and AOSP's vendor driver is real and
+  empirically reproducible** — same hardware, same v7.0-rc4 base, same
+  bootloader handoff, same `kvm-arm.mode=protected`. Only the host
+  driver differs. AOSP's gets past dl_err; mainline's doesn't.
 
-The upshot is: with AOSP's driver, the HS data path actually transmits
-frames. That's the wedge mainline couldn't get past after weeks of
-investigation (D1, D2, S1, C1, C2, h14, h15* in our prior notes — every
-mainline-side hypothesis was ruled out). So *something* in AOSP's
-configure path is releasing whatever was gating the M-PHY TX in
-mainline.
+## What I'm now investigating
 
-## Where I think it is
+Top remaining candidates, in rough order of plausibility:
 
-AOSP's `exynos_ufs_config_externals()` (called once at probe before link
-startup):
+1. **Cal-if `pre_pmc` / `post_pmc` PMA register sequences.** AOSP's
+   `gs201/ufs-cal-if.c` writes a set of PMA bytes (notably a 0x888
+   kick-start write flagged in our parent project's
+   `project_ufs_bringup_state.md` memory) that mainline's
+   `tensor_gs101_pre_init_cfg` table doesn't. Some of those writes
+   apply at the post-PMC window. Mainline's structural choice to put
+   the post-PMC PMA logic in `drivers/phy/samsung/phy-gs101-ufs.c`
+   (called via `phy_calibrate()`) instead of inline in the controller
+   driver may also affect the timing window.
 
-  static int exynos_ufs_config_externals(struct exynos_ufs *ufs)
-  {
-      /* PHY isolation bypass */
-      exynos_ufs_ctrl_phy_pwr(ufs, true);
+2. **AOSP's `__set_pcs` mechanism.** The vendor driver writes a per-
+   lane PCS calibration via a dedicated mechanism mainline doesn't
+   replicate; reaches different MIB attributes on the path.
 
-      /* Set for UFS iocc */
-      for (...) {
-          regmap_update_bits(*p, q->offset, q->mask, q->val);
-      }
-  }
+3. **`gs101_ufs_post_link` differences.** AOSP's per-SoC post_link
+   writes a few HCI knobs (PRDT_PREFETCH_EN at TXPRDT_ENTRY_SIZE
+   regardless of crypto, etc.) that mainline only does conditionally.
+   Some of these are already covered by my prior 0005 / 0006 drafts;
+   the question is whether a *combination* of those fixes plus
+   something else clears dl_err.
 
-`exynos_ufs_ctrl_phy_pwr(ufs, true)` reads the `ufs-phy-iso` DT
-sub-node and writes its `{offset, mask, val}` triple into the PMU via
-`exynos_pmu_update`. For gs201 this is:
+The empirical evidence (AOSP graft works on the same hardware) means
+something in this list (or a combination) is the actual fix. I want to
+land them one-at-a-time as bisect-style verifications rather than
+shotgun a multi-patch series.
 
-  ufs-phy-iso {
-      offset = <0x3ec8>;
-      mask = <0x1>;
-      val = <0x1>;
-  };
-
-Plain English: write 1 to bit 0 at `pmu_alive + 0x3ec8` before link
-startup.
-
-Mainline's `phy-gs101-ufs.c` does not touch the PMU at all — only the
-PMA at 0x14704000. Mainline's `drivers/ufs/host/ufs-exynos.c gs101_ufs_*`
-(tensor_gs101_pre_init_cfg, gs101_ufs_pre_link, gs101_ufs_post_link)
-also doesn't touch the PMU. The `samsung,pmu-syscon = <&pmu_alive>`
-phandle in mainline's `phy@14704000` DT node is present but unused by
-any code path I can find — it looks prophylactic.
-
-## Hypothesized mechanism
-
-Bit 0 at `pmu_alive + 0x3ec8` gates the M-PHY's analog/transmission path
-on the HSI2 power island. With it cleared (presumed default at
-bootloader handoff), the controller can negotiate PMC (which is just
-attribute exchange at the UIC layer) but the PHY won't actually drive
-the differential pairs in HS-Rate mode. PWM tolerates this (lower-rate,
-analog more forgiving, partial bootloader state may be enough); HS does
-not.
-
-That matches the asymmetry we see in mainline: `host PA reports: device
-supports HS-G4, both lanes negotiated, both lanes active, both
-directions in FAST_MODE. Exactly what mainline requested. Device fully
-acknowledged the mode change.` — and then the *first frame* dies with
-`dl_err 0x80000002`. PMC wins, frames don't.
-
-If this hypothesis is right, mainline gs101 UFS has *never* actually
-brought the PHY out of isolation for HS link-up. PWM has been working
-in spite of, not because of, the PHY power state.
-
-## What I'm asking
+## What I'm still asking
 
 For Peter:
 
-1. Does the framing make sense? If yes, the upstream patch is pretty
-   surgical: an optional pre-link callback in `gs101_ufs_drvs` that
-   walks an optional `samsung,phy-isolation-pmu-syscon` + offset/mask/val
-   triple (or the AOSP-shape `ufs-phy-iso` subnode) and lifts the bit.
-   I can write it and post it; would prefer to follow your review style
-   for the binding choice rather than guess.
+1. Have you seen `dl_err 0x80000002` before in your gs101 work? If so,
+   was the diagnosis different? Anything in the back of your head from
+   the original gs101 port that screams "I had to do something specific
+   at the controller / PHY boundary that didn't make it into the public
+   patch"?
 
-2. Have you seen `dl_err 0x80000002` before in your gs101 work? If so,
-   was the diagnosis different?
-
-3. Verification step before sending: I plan to apply *only* this PMU
-   write to mainline's `gs101_ufs_pre_link` (no other graft changes,
-   reverting our DT and driver to fully mainline shape) and check that
-   `dl_err 0x80000002` clears at HS-G4. That's the unambiguous test —
-   if it works, it's a clean one-line "mainline doesn't lift this PMU
-   bit; it should" patch. Sound right?
+2. The PMU PHY-isolation write (now confirmed reachable, not the wedge
+   fix, but parity with AOSP) — would you take a patch landing it as a
+   parity-with-AOSP completeness fix even though it doesn't change
+   observable behavior under the current dl_err wedge? My instinct is
+   yes (AOSP wouldn't ship the write for nothing), but I'd rather not
+   send single-axis non-fixing-anything patches without a thumbs up on
+   framing.
 
 For the Pixel team:
 
-A. Is `pmu_alive + 0x3ec8 bit 0` a UFS PHY isolation / power-domain
-   release control on gs201 (and gs101)? AOSP's helper is named
-   `exynos_ufs_ctrl_phy_pwr` and the DT node is `ufs-phy-iso`, so the
-   external evidence points that way, but the actual bit semantics are
-   yours.
+A. **What does `pmu_alive + 0x3ec8 bit 0` actually control on
+   gs101/gs201?** Empirically it's reachable from EL1 and AOSP writes
+   it once at probe, but our experiment shows it's not the gate on the
+   M-PHY analog TX. Is it a different power-domain release (e.g., for
+   the UFS protector / FMP / UNIPRO clock domain) that we wouldn't see
+   the effect of in our boot path because we don't exercise those
+   paths? Or is the bit actually a dead one that AOSP keeps writing for
+   historical reasons?
 
-B. Is the bootloader supposed to lift this, or is the kernel supposed
-   to? AOSP's behaviour is "kernel lifts it at probe." If the
-   bootloader is supposed to lift it on production AOSP boots and the
-   kernel write is just defensive, then there might be something
-   different about our boot chain that leaves the bit cleared at
-   handoff. (We're running ABL → BL31 → our kernel directly, not the
-   AOSP boot.img stack — could be relevant.)
+B. **Where in the AOSP chain is the M-PHY analog TX gated such that
+   `dl_err 0x80000002` wouldn't fire?** Mainline gets to FAST_MODE PMC
+   negotiation, device acks the power-mode change, host PA reports
+   FAST/FAST and 2 lanes active on both directions — and then the
+   first data frame doesn't come out. That's M-PHY signal-integrity-
+   level. Anything in `cal-if/gs201/` or the AOSP-side post-PMC
+   sequence that you'd flag as "this is what makes HS work"?
 
-C. Is `0x3ec8` reachable from EL1, or does BL31 firewall it the way it
-   firewalls CMU? Per a parallel thread, gs201 BL31 only opens CMU
-   register access when EL2 is in pKVM mode (workaround: boot with
-   `kvm-arm.mode=protected`, which we have). If 0x3ec8 has the same
-   protection, AOSP's write would silently be no-op'd unless the same
-   pKVM unlock is in place — and our test had pKVM enabled, so we
-   wouldn't see the firewall. Confirming it's reachable from
-   non-pKVM EL1 would matter for upstream because not every gs101/201
-   distro will boot pKVM.
+C. The 0x888 PMA byte writes (from cal-if's `post_calib_of_hs_rate_b`
+   for gs201) — is there an entry there that the mainline `gs101_ufs_*`
+   path is missing because of the binding split between
+   `phy-gs101-ufs.c` (PHY framework calibrate path) and `ufs-exynos.c`
+   (controller path)?
 
-The doc with the full discovery writeup, evidence, and proposed patch
-shape is in our repo at `upstream-patches/discovery-phy-isolation-bypass.md`
-(I can attach if you'd rather have it as a file).
+The discovery doc (with the negative-result update) is in our repo at
+`upstream-patches/discovery-phy-isolation-bypass.md`. The verification
+patch I tested is at
+`upstream-patches/verification-0007-ufs-exynos-gs101-release-PHY-isolation-via-PMU.patch`.
 
 Thanks,
 Chris

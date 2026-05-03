@@ -1,9 +1,45 @@
-# Discovery: gs101/gs201 UFS HS data path requires PMU PHY-isolation bypass
+# Discovery: AOSP's PMU PHY-isolation bypass — parity gap, NOT the HS dl_err 0x80000002 fix
 
-**Status:** Empirically observed via vendor-driver graft on Pixel Fold (gs201,
-Tensor G2). Upstream patch not yet written — this document describes the
-finding, evidence, and shape of the fix so it can be turned into a real
-patch + cover letter.
+> **2026-05-03 update — verification result is negative.** The single-write
+> verification patch (PMU offset 0x3ec8 bit 0 → 1 from
+> `gs101_ufs_drv_init`, with `GS201_MAINLINE_FORCE_PWM_GEAR=0` so the driver
+> actually attempts HS) was applied on `feature/linux-kernel` and booted on
+> Pixel Fold. UART log `uart-logs/2026-05-03_000810.log`:
+>
+> ```
+> [    1.677133] PMU PHY-isolation released (offset 0x3ec8 bit 0)
+> [    1.891311] Power mode changed to : FAST series_B G_4 L_2
+> [    8.073205] ufshcd_abort: Device abort task at tag 0
+> [    8.127012] dl_err[0] = 0x80000002 at 1928150 us
+> ```
+>
+> The PMU write reaches the register (no `-EACCES` / no BL31 firewall —
+> answers one of the open questions for the Pixel team), but the wedge
+> still fires on the first frame after PMC. The hypothesis "this PMU bit
+> gates the M-PHY analog TX path" is **wrong** — bit 0x3ec8 / 0x1 is doing
+> something else, and whatever AOSP does that mainline doesn't to actually
+> get past `dl_err 0x80000002` is somewhere else.
+>
+> The patch is still upstream-eligible as **parity work** (AOSP carries
+> the write; mainline doesn't; it's reachable from EL1; including it
+> matches AOSP's probe-time setup), but the framing in the rest of this
+> doc is *historical* — the "fixes dl_err 0x80000002" claim does not hold.
+> Read with that caveat. Cover letter (`upstream-help/phy-isolation-followup.md`)
+> has been similarly retracted.
+>
+> Next investigation: cal-if `pre_pmc` / `post_pmc` PMA register
+> sequences (the 0x888 kick-start writes flagged in the parent project's
+> `project_ufs_bringup_state.md` memory), AOSP's `__set_pcs` mechanism in
+> `gs101_ufs_pre_link`, and AOSP's `gs101_ufs_post_link` content vs
+> mainline's. The empirical fact that the AOSP graft on `mainline-graft`
+> reaches `UFS link start-up passes` at HS-G4 dual-lane while mainline
+> wedges with `dl_err 0x80000002` confirms the gap is real — we just
+> isolated the wrong piece.
+
+**Status (original, retained for context):** Empirically observed via
+vendor-driver graft on Pixel Fold (gs201, Tensor G2). Upstream patch not
+yet written — this document describes the finding, evidence, and shape
+of the fix so it can be turned into a real patch + cover letter.
 
 **Source tree where this was found:** `mainline-graft` branch of
 junkyard-boot-img, kernel at `kernel/source/` (junkyard-computing/linux,
