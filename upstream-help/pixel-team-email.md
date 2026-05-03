@@ -169,6 +169,37 @@ D. **Why does the gs201 secure firmware open CMU access only when
    someone in the know would let us upstream a proper note in the
    gs201 binding doc.
 
+E. **AOC firmware on mainline — is there a non-AOC-driver path to
+   load `aoc.bin`?** On AOSP felix, our `customservice` writes
+   `"aoc.bin"` to `/sys/devices/platform/19000000.aoc/firmware`,
+   which is the AOSP AOC driver's sysfs interface. Empirically, if
+   that write hasn't happened, the AOC coprocessor sits in a retry
+   loop that **starves UART RX completely** — kernel printk still
+   reaches the UART, but typing at the prompt gets nothing back to
+   the kernel. Confirmed in our own testing under both AOSP and
+   mainline.
+
+   Mainline has no AOC driver, so the sysfs path doesn't exist and
+   our overlay's `customservice` write fails silently. We've been
+   working around this by treating UART as printk-only, but a real
+   fix is needed before users can ever log in over serial. Three
+   possible angles, any pointer would help:
+     1. Is BL31 / GSA / pre-Linux firmware able to load AOC's blob
+        autonomously? If not, why not?
+     2. Has anyone started a mainline-track AOC driver, even
+        unsubmitted? The AOSP one is in
+        `google-modules/aoc/aoc.c` and looks tractable.
+     3. Is there a way to suppress AOC's retry loop entirely
+        (e.g., a fastboot oem flag, a DTS override, a BL31
+        SMC) so it doesn't poison UART?
+
+   Note: we also see something where USB ethernet adapter and UART
+   adapter "don't play well together" on the USB-C port — visible
+   as `enter-reason: f key pressed` in fastboot getvar even when
+   no key was pressed. Possibly unrelated to AOC, possibly the
+   same coprocessor mis-reading USB-C state when AOC firmware
+   isn't loaded; flagging in case it rings a bell.
+
 ---
 
 ## Open questions (original — Q2 closed by 2026-05-03 update above)
