@@ -1,0 +1,74 @@
+From 9c55a4bcb98c1a45d0b2e7fd1f4177eaca95a0f5 Mon Sep 17 00:00:00 2001
+From: "Christopher L. Crutchfield" <ccrutchf@ucsd.edu>
+Date: Sun, 3 May 2026 20:09:18 -0700
+Subject: [PATCH] tty: serial: samsung: add google,gs201-uart compat
+ (UPIO_MEM32)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+gs201 (Tensor G2) UART register block requires 32-bit-aligned
+access. The 8-bit register access path that .iotype = UPIO_MEM
+selects (samsung,exynos850-uart on every other Exynos-family SoC)
+makes samsung_tty's wr_reg() use writeb_relaxed() on UTXH; on gs201
+that 8-bit write to the UART block raises an asynchronous SError
+that the kernel ultimately panics on inside console_unlock().
+
+Empirically verified: a kernel built from upstream that declares
+gs201's UART node with samsung,exynos850-uart panics on first
+console output via samsung_tty (i.e. as soon as register_console()
+runs). Switching to google,gs101-uart (which selects
+gs101_serial_drv_data with .iotype = UPIO_MEM32) clears the abort
+and serial-getty@ttySAC0 works end-to-end on Pixel Fold (felix).
+gs201's register layout otherwise matches gs101's at the UART
+register block, and earlycon already uses 32-bit access (cmdline:
+earlycon=exynos4210,mmio32,...) so it was unaffected.
+
+Until now there's been no upstream-blessed compat for gs201 UART.
+This patch adds google,gs201-uart as an alias for
+gs101_serial_drv_data — DT authors writing gs201 .dtsi files should
+use google,gs201-uart explicitly so the SoC-vs-fork lineage is
+clear in the binding doc, and so the next person bringing up gs201
+doesn't trip the UPIO_MEM trap by reaching for the more-generic
+samsung,exynos850-uart compat.
+
+Also adds the matching OF_EARLYCON_DECLARE so cmdlines can specify
+'earlycon=gs201-uart,mmio32,0x...' directly (today they have to
+spell it 'earlycon=exynos4210,mmio32,0x...' which is technically
+correct but lineage-misleading).
+
+Cc: Krzysztof Kozlowski <krzk@kernel.org>
+Cc: Greg Kroah-Hartman <gregkh@linuxfoundation.org>
+Cc: Jiri Slaby <jirislaby@kernel.org>
+Cc: Peter Griffin <peter.griffin@linaro.org>
+Cc: linux-samsung-soc@vger.kernel.org
+Cc: linux-serial@vger.kernel.org
+Signed-off-by: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+---
+ drivers/tty/serial/samsung_tty.c | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/drivers/tty/serial/samsung_tty.c b/drivers/tty/serial/samsung_tty.c
+index c1fabad6ba1f..89cb6bf6a1f6 100644
+--- a/drivers/tty/serial/samsung_tty.c
++++ b/drivers/tty/serial/samsung_tty.c
+@@ -2659,6 +2659,8 @@ static const struct of_device_id s3c24xx_uart_dt_match[] = {
+ 		.data = ARTPEC8_SERIAL_DRV_DATA },
+ 	{ .compatible = "google,gs101-uart",
+ 		.data = GS101_SERIAL_DRV_DATA },
++	{ .compatible = "google,gs201-uart",
++		.data = GS101_SERIAL_DRV_DATA },
+ 	{ .compatible = "samsung,exynos8895-uart",
+ 		.data = EXYNOS8895_SERIAL_DRV_DATA },
+ 	{},
+@@ -2843,6 +2845,7 @@ static int __init gs101_early_console_setup(struct earlycon_device *device,
+ }
+ 
+ OF_EARLYCON_DECLARE(gs101, "google,gs101-uart", gs101_early_console_setup);
++OF_EARLYCON_DECLARE(gs201, "google,gs201-uart", gs101_early_console_setup);
+ 
+ /* Apple S5L */
+ static int __init apple_s5l_early_console_setup(struct earlycon_device *device,
+-- 
+2.43.0
+

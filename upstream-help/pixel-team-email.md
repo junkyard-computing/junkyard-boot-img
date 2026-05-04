@@ -122,6 +122,28 @@ context, but you can skip Q2 if you only have time to skim.
 The full new patch series (12 patches now) is at
 `upstream-patches/README.md` in <MY GITHUB OR ATTACH>.
 
+**One more update from later the same day**: bidirectional UART now
+works on mainline gs201. We have a `fold login:` prompt over
+`serial-getty@ttySAC0` and just logged in on a kernel built straight
+from upstream Linus's tree (modulo our pending patch series). The
+fix involved three pieces of CMU work — a minimal
+`peric0_cmu_info_gs201` with the gs201-specific PERIC0 register
+offsets, the `skip_ids[]` infrastructure for CMU_TOP register holes,
+and `auto_clock_gate=false` because gs201 has no DBG mirrors at
+base+0x4000 for gates — but the **actual** gating bug was simpler:
+the `samsung,exynos850-uart` compat that mainline's gs201 fork was
+using selects `iotype = UPIO_MEM` (8-bit register access) inside
+samsung_tty, and gs201's UART register block requires 32-bit-aligned
+access. Switching the DT compat to `google,gs101-uart` (which
+selects `UPIO_MEM32`) clears the asynchronous SError. Question F
+below has more detail; the takeaway for anyone seeing similar
+"console panics on first write" symptoms on gs201 is "check your
+UART iotype." This entire chain is the original "AOC firmware
+starves UART RX" story I had earlier — wrong root cause, AOC has
+nothing to do with UART input on mainline. Question E (originally
+about AOC) is reframed below to ask about gs201's CMU register-
+layout deltas, which is what we actually need help with.
+
 ---
 
 ## New questions raised by this session
@@ -169,36 +191,88 @@ D. **Why does the gs201 secure firmware open CMU access only when
    someone in the know would let us upstream a proper note in the
    gs201 binding doc.
 
-E. **AOC firmware on mainline — is there a non-AOC-driver path to
-   load `aoc.bin`?** On AOSP felix, our `customservice` writes
-   `"aoc.bin"` to `/sys/devices/platform/19000000.aoc/firmware`,
-   which is the AOSP AOC driver's sysfs interface. Empirically, if
-   that write hasn't happened, the AOC coprocessor sits in a retry
-   loop that **starves UART RX completely** — kernel printk still
-   reaches the UART, but typing at the prompt gets nothing back to
-   the kernel. Confirmed in our own testing under both AOSP and
-   mainline.
+E. **gs201 CMU register layout — is there documentation we don't
+   have?** Mainline's `clk-gs101.c` advertises `google,gs201-cmu-*`
+   compats but reuses gs101's register-offset tables for everything
+   except CMU_TOP. Empirically that doesn't fly:
 
-   Mainline has no AOC driver, so the sysfs path doesn't exist and
-   our overlay's `customservice` write fails silently. We've been
-   working around this by treating UART as printk-only, but a real
-   fix is needed before users can ever log in over serial. Three
-   possible angles, any pointer would help:
-     1. Is BL31 / GSA / pre-Linux firmware able to load AOC's blob
-        autonomously? If not, why not?
-     2. Has anyone started a mainline-track AOC driver, even
-        unsubmitted? The AOSP one is in
-        `google-modules/aoc/aoc.c` and looks tractable.
-     3. Is there a way to suppress AOC's retry loop entirely
-        (e.g., a fastboot oem flag, a DTS override, a BL31
-        SMC) so it doesn't poison UART?
+     - CMU_TOP requires a `gs201_top_skip_ids[]` because gs201
+       implements fewer SHARED-PLL fan-out dividers than gs101 (only
+       SHARED0_DIV2/DIV3; everything from SHARED0_DIV4 onwards plus
+       all of SHARED1/2/3 is a register hole). That's already in our
+       fork as a partial port and queued upstream as a separate patch.
 
-   Note: we also see something where USB ethernet adapter and UART
-   adapter "don't play well together" on the USB-C port — visible
-   as `enter-reason: f key pressed` in fastboot getvar even when
-   no key was pressed. Possibly unrelated to AOC, possibly the
-   same coprocessor mis-reading USB-C state when AOC firmware
-   isn't loaded; flagging in case it rings a bell.
+     - CMU_PERIC0's layout is *substantively* different (not just an
+       offset shift): the PERIC0_TOP1 cluster gs101 has — IPCLK_0 /
+       PCLK_0 / IPCLK_2 / PCLK_2 sub-bridges feeding the USI
+       peripherals — doesn't exist on gs201 at all. Each peripheral
+       on gs201 gates from RSTNSYNC directly. The "BUS" path is also
+       renamed "NOC" with corresponding offset shifts (e.g.
+       DIV_CLKCMU_PERIC0_BUS at 0x18d4 on gs101 → DIV_CLKCMU_PERIC0_NOC
+       at 0x18e8 on gs201). For the USI0_UART path specifically:
+       `DIV_CLK_PERIC0_USI0_UART` moved 0x1804 → 0x1808 (+4); the
+       RSTNSYNC USI0_UART gate moved 0x20bc → 0x20c0 (+4); the user
+       mux at 0x620 stayed the same.
+
+     - There appear to be no DBG mirrors at base+0x4000 for gates on
+       gs201 (only for muxes at 0x4xxx and dividers at 0x5xxx), which
+       trips mainline's `auto_clock_gate=true` path — reading the
+       non-existent DBG variant for the USI0_UART gate at 0x60c0
+       raises an asynchronous SError that the kernel ultimately
+       panics on inside `console_unlock`. We work around this by
+       setting `auto_clock_gate=false` on `peric0_cmu_info_gs201`.
+
+   We've been deriving all of this from AOSP cal-if's
+   `private/google-modules/soc/gs/drivers/soc/google/cal-if/gs201/
+   cmucal-sfr.c`, which appears authoritative for the offsets, but a
+   confirmation that the cal-if SFR table is the canonical reference
+   would be reassuring (and let us cite it in the binding doc /
+   commit messages cleanly). If there's an internal doc that maps
+   the gs101 → gs201 register-layout deltas across all CMU domains,
+   we'd appreciate a pointer — saves a lot of empirical bisecting on
+   each domain (APM, DPU, HSI0, HSI2, PERIC1 still pending).
+
+F. **Does gs201's UART register block officially require
+   32-bit-aligned access?** This is the "actual" UART RX blocker
+   that gave us a few days of confused debugging. samsung_tty's
+   `wr_reg(port, S3C2410_UTXH, ch)` does an 8-bit `writeb_relaxed`
+   under `iotype = UPIO_MEM` (which is what `samsung,exynos850-uart`
+   selects) but a 32-bit `writel_relaxed` under `iotype = UPIO_MEM32`
+   (which is what `google,gs101-uart` selects). On gs201 the 8-bit
+   write to the UART register block raises an asynchronous SError
+   that surfaces inside `console_unlock`. Our fix: declare gs201's
+   UART node with `compatible = "google,gs101-uart"` instead of
+   `"samsung,exynos850-uart"`, even though the binding documentation
+   has historically associated the latter with all post-Exynos850
+   parts. With that change, `serial-getty@ttySAC0` works
+   bidirectionally on real felix hardware (we just logged in over
+   UART for the first time on a kernel built from upstream Linux).
+
+   Question: should the gs201/gs101 UART binding doc explicitly call
+   out the 32-bit-only access requirement? AOSP's bootloader and
+   kernel both work because both consistently use 32-bit access
+   (bootloader's earlycon uses `mmio32`, AOSP's downstream samsung
+   driver presumably uses UPIO_MEM32 on these compats). Mainline
+   only trips the trap because the upstream binding docs make
+   `samsung,exynos850-uart` look like a viable choice for gs201.
+
+   We'd also like to add `google,gs201-uart` (alias for
+   `google,gs101-uart` on the same compat row) to the samsung_tty of_match
+   table so DTs can be explicit. Sending it as a one-liner upstream
+   patch unless you object. Note for the binding doc: 32-bit-only
+   access also matches what we observed for gs201 CMU register reads
+   (anything not 32-bit aborts) — feels SoC-wide, not UART-specific.
+
+G. **Post-boot AOC** (was previously a UART blocker — disregard).
+   Earlier drafts of this email described AOC's retry loop as
+   starving UART RX on mainline. That hypothesis is wrong; the
+   actual cause was UART register-access width (point F). With F
+   fixed, UART works fine without an AOC driver. AOC is still
+   eventually needed for low-power audio / sensor hub / hotword
+   support, but that's a separate multi-month "port the AOC
+   subsystem to mainline" project, not a boot blocker. Detail in
+   `kernel/asop_port_questions/aoc.md` if anyone wants to chime in
+   on prior art.
 
 ---
 

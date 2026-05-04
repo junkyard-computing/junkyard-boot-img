@@ -501,4 +501,90 @@ applied and `cmu_top` declared in DT (with `kvm-arm.mode=
 protected` on cmdline), CMU_TOP probes cleanly. UART consumers
 (`samsung,exynos850-uart`) and any other downstream peripheral
 that wants real clock rates from CMU_PERIC0 still defer-probe
-forever — those wait for the follow-up gs201-cmu-peric0 work.
+forever — those wait for patch 0014.
+
+## 0014-clk-samsung-gs101-add-gs201-CMU_PERIC0-USI0_UART-cha.patch
+
+Follow-up to 0013. Adds a minimal validated `peric0_cmu_info_gs201`
+covering just the USI0_UART clock chain (mux user → divider → gate)
+plus PCLK gates for `sysreg_peric0` / `gpio_peric0` so any consumer
+of those doesn't EPROBE_DEFER forever. With this and a DT node
+referencing `google,gs201-cmu-peric0`, samsung_tty's ttySAC0
+surfaces on real felix hardware.
+
+Three pieces of empirical calibration in the new info struct that
+deserve callout:
+
+  - **`auto_clock_gate = false`**: gs201 doesn't have DBG mirrors
+    for gates at `base+0x4000` (only mux DBGs at 0x4xxx and div
+    DBGs at 0x5xxx per AOSP `cmucal-sfr-gs201.c`). The mainline
+    auto-gate framework reads from the DBG mirror to determine
+    state; reading the non-existent 0x60c0 raises an asynchronous
+    SError that surfaces inside `console_unlock`. Manual gating
+    writes to base directly and side-steps this.
+
+  - **PNAME parents reference *global* clock-output-names**:
+    `"oscclk"` and `"peric0_ip"` (matching the `clock-output-names`
+    of the cmu_peric0 input fixed-clocks declared in gs201.dtsi),
+    not the local DT clock-name (`"oscclk"`, `"ip"`). The samsung
+    clk framework looks parents up by the globally-registered name;
+    using the local DT name leaves the chain unresolved and
+    `clk_get_rate()` returns 0.
+
+  - **gs201's PERIC0 layout is structurally different from gs101's**:
+    no `PERIC0_TOP1` cluster (each peripheral on gs201 gates from
+    RSTNSYNC directly), and the "BUS" path is renamed "NOC" with
+    matching offset shifts. Reusing the gs101 `peric0_cmu_info`
+    with skip_ids alone wasn't enough — needs a separate struct.
+
+The new info struct only registers the USI0_UART chain. Other
+PERIC0 peripherals (USI1..14, I2C, I3C, SPI) need their own
+per-peripheral audit against AOSP cal-if and aren't included.
+
+End-to-end test on Pixel Fold (felix, gs201): with patches 0013 +
+0014 applied, DT declarations for `cmu_peric0` (compat
+`google,gs201-cmu-peric0`) + `serial_0` (compat `google,gs201-uart`,
+see 0015), and `kvm-arm.mode=protected` on the cmdline, samsung_tty
+completes probe and serial-getty@ttySAC0.service reaches active.
+
+## 0015-tty-serial-samsung-add-google-gs201-uart-compat.patch
+
+The fix that actually made bidirectional UART work on gs201.
+
+samsung_tty's `wr_reg()` does an 8-bit `writeb_relaxed` under
+`iotype = UPIO_MEM` (selected by `samsung,exynos850-uart`) versus a
+32-bit `writel_relaxed` under `iotype = UPIO_MEM32` (selected by
+`google,gs101-uart`). gs201's UART register block does NOT support
+8-bit-aligned writes — a byte write to UTXH raises an asynchronous
+SError that the kernel ultimately panics on inside `console_unlock()`
+during `register_console`.
+
+Adding `google,gs201-uart` as an alias for `gs101_serial_drv_data`
+in samsung_tty's of_match table (plus the matching
+`OF_EARLYCON_DECLARE`) gives DT authors a name they can use to
+opt into 32-bit access without claiming the gs101-specific compat
+on a gs201 device. After this patch, the fix on the consumer side
+is a one-line DT change:
+
+```diff
+-compatible = "samsung,exynos850-uart";
++compatible = "google,gs201-uart";
+```
+
+This is small, mechanical, and standalone — applies cleanly against
+upstream Linux 7.0-rc4 with no dependencies on 0013/0014. Sending
+to a different maintainer thread (linux-serial / Greg KH / Jiri
+Slaby) than the CMU work.
+
+## Send order (revised — second update for 2026-05-03)
+
+The CMU + UART trio (0013, 0014, 0015) goes in parallel with the UFS
+series since they touch unrelated subsystems. Within the trio:
+
+  1. **0015** first — smallest, most independently useful, lowest
+     review burden. Even without 0013/0014 it stops anyone bringing
+     up gs201 from tripping the UPIO_MEM SError trap.
+  2. **0013** second — the skip_ids[] infrastructure plus CMU_TOP
+     work. Foundation for any future per-domain gs201 CMU bring-up.
+  3. **0014** third — the validated CMU_PERIC0 USI0_UART chain.
+     Depends on 0013 for the skip_ids infrastructure.
