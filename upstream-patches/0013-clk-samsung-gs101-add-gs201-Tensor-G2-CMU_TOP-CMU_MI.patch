@@ -1,0 +1,365 @@
+From b360533104c9251a343fb87bc652fa289766b671 Mon Sep 17 00:00:00 2001
+From: "Christopher L. Crutchfield" <ccrutchf@ucsd.edu>
+Date: Sun, 3 May 2026 17:35:05 -0700
+Subject: [PATCH] clk: samsung: gs101: add gs201 (Tensor G2) CMU_TOP and
+ CMU_MISC support
+
+Pixel Fold (felix) and Pixel 7 / 7 Pro (cheetah/panther) ship Tensor G2
+(gs201), a successor SoC to Tensor (gs101). The two share register-block
+base addresses across the entire CMU hierarchy, but gs201 is *not* a
+strict superset of gs101: at least one CMU_TOP region (the SHARED1/2/3
+PLL fan-out dividers) is fully present on gs101 and absent on gs201, and
+several power-gated sub-block bridges in CMU_TOP fault when read without
+their domain having been pre-powered. Reading any of these unmapped
+registers from non-secure EL1 produces an asynchronous SError that this
+driver doesn't try to recover from -- the kernel panics in
+clk_divider_recalc_rate() before /init runs.
+
+This patch lays the groundwork for gs201 CMU support without enabling
+domains that would crash. Three pieces:
+
+  1. Generic skip_ids[] infrastructure in drivers/clk/samsung/clk.c so
+     a CMU driver can declare a list of clock IDs that
+     samsung_cmu_register_clocks() should drop from the per-clock-type
+     register helpers. The filter pre-allocates a copy of each clock
+     array with the matching IDs removed; the existing register helpers
+     are unchanged. No behavior change for any driver that doesn't set
+     skip_ids.
+
+  2. clk-gs101.c: add gs201_top_skip_ids[], a list of every CMU_TOP
+     clock ID that empirically fails to read on a real gs201 boot.
+     Two categories:
+
+       - Power-gated sub-block bridges (BO/AUR/CSIS/DNS/G3AA/IPP/MCSC
+         camera ISP, DPU display, G2D, GDC, G3D GPU, MFC video, TNR,
+         TPU). AOSP's vendor stack pre-powers these via pkvm-s2mpu +
+         exynos-pd at EL2 before CMU registration; mainline doesn't,
+         so the simplest fix is to skip the bridges and leave those
+         domains powered-down.
+
+       - SHARED PLL fan-out dividers from SHARED0_DIV4 onwards plus
+         all of SHARED1/2/3. gs201 only physically implements
+         SHARED0_DIV2 and SHARED0_DIV3 in CMU_TOP -- the rest are
+         register holes that abort when read. No CMU_TOP mux or gate
+         references these IDs, so dropping the div definitions is
+         sufficient.
+
+     The accompanying top_cmu_info_gs201 reuses the gs101 PLL/mux/div/
+     gate tables but layers gs201_top_skip_ids on top via the new
+     skip_ids field.
+
+  3. of_match additions for "google,gs201-cmu-top" (using
+     top_cmu_info_gs201) and a CLK_OF_DECLARE for "google,gs201-cmu-misc"
+     (sharing gs101_cmu_misc_init -- gs201's CMU_MISC is layout-identical
+     to gs101's per AOSP cal-if cmucal-sfr-gs201.c).
+
+Other gs201 CMU domains (APM, DPU, HSI0, HSI2, PERIC0, PERIC1) likewise
+have new compats reserved in the AOSP and Google bootloader DT, but
+their gs101 register tables don't apply cleanly to gs201 (PERIC0 was
+empirically confirmed to panic the same way CMU_TOP did before this
+skip-list work). Adding those compats here without validated gs201 data
+would just produce the same SError on probe, so they're left out of
+this patch.
+
+Tested on Pixel Fold (felix, gs201): the gs201_top_skip_ids list was
+built up empirically by enabling CMU_TOP probe with kvm-arm.mode=
+protected on the cmdline (BL31 firewalls CMU access from non-secure
+EL1 unless EL2 is in pKVM mode -- separate concern, handled at the
+DT-consumer level), then bisecting through panics in
+clk_divider_recalc_rate() until probe completed. With "google,gs201-
+cmu-top" declared in DT and the skip list applied, CMU_TOP clocks
+register without async-aborting the kernel.
+
+Cc: Sylwester Nawrocki <s.nawrocki@samsung.com>
+Cc: Tomasz Figa <tomasz.figa@gmail.com>
+Cc: Chanwoo Choi <cw00.choi@samsung.com>
+Cc: Peter Griffin <peter.griffin@linaro.org>
+Cc: linux-samsung-soc@vger.kernel.org
+Cc: linux-clk@vger.kernel.org
+Signed-off-by: Christopher L. Crutchfield <ccrutchf@ucsd.edu>
+---
+ drivers/clk/samsung/clk-gs101.c |  94 +++++++++++++++++++++++++++++
+ drivers/clk/samsung/clk.c       | 101 +++++++++++++++++++++++++++++---
+ drivers/clk/samsung/clk.h       |  10 ++++
+ 3 files changed, 196 insertions(+), 9 deletions(-)
+
+diff --git a/drivers/clk/samsung/clk-gs101.c b/drivers/clk/samsung/clk-gs101.c
+index 44a8ecd332fd..3b2a30449792 100644
+--- a/drivers/clk/samsung/clk-gs101.c
++++ b/drivers/clk/samsung/clk-gs101.c
+@@ -1443,6 +1443,83 @@ static const struct samsung_cmu_info top_cmu_info __initconst = {
+ 	.option_offset		= CMU_CMU_TOP_CONTROLLER_OPTION,
+ };
+ 
++/*
++ * gs201 CMU_TOP: clocks that feed power-gated sub-blocks must be skipped
++ * during registration, otherwise samsung_clk_register_{mux,div,gate}() will
++ * readl() a register whose target power-domain is off and trigger an
++ * asynchronous SError. AOSP's vendor tree handles this by turning on power
++ * domains via pkvm-s2mpu + exynos-pd pKVM modules before probing CMU; we
++ * don't have those, so we just avoid touching the problem registers.
++ *
++ * Blocks skipped here: BO (boost), AUR (AI unit), CSIS+DNS+G3AA+IPP+MCSC
++ * (camera ISP), DPU (display), G2D, GDC (global distortion correction), G3D
++ * (GPU), MFC (video), TNR (temporal noise reduction), TPU. HSI0/HSI2/MIF/
++ * PERIC0/PERIC1 and other always-on paths stay in the registered set.
++ *
++ * If any of these domains later needs to be managed, power it on first, then
++ * drop the corresponding ID from this list.
++ */
++static const unsigned int gs201_top_skip_ids[] __initconst = {
++	CLK_MOUT_CMU_BO_BUS,     CLK_DOUT_CMU_BO_BUS,     CLK_GOUT_CMU_BO_BUS,
++	CLK_MOUT_CMU_CSIS_BUS,   CLK_DOUT_CMU_CSIS_BUS,   CLK_GOUT_CMU_CSIS_BUS,
++	CLK_MOUT_CMU_DNS_BUS,    CLK_DOUT_CMU_DNS_BUS,    CLK_GOUT_CMU_DNS_BUS,
++	CLK_MOUT_CMU_DPU_BUS,    CLK_DOUT_CMU_DPU_BUS,    CLK_GOUT_CMU_DPU_BUS,
++	CLK_MOUT_CMU_G2D_G2D,    CLK_DOUT_CMU_G2D_G2D,    CLK_GOUT_CMU_G2D_G2D,
++	CLK_MOUT_CMU_G2D_MSCL,   CLK_DOUT_CMU_G2D_MSCL,   CLK_GOUT_CMU_G2D_MSCL,
++	CLK_MOUT_CMU_G3AA_G3AA,  CLK_DOUT_CMU_G3AA_G3AA,  CLK_GOUT_CMU_G3AA_G3AA,
++	CLK_MOUT_CMU_G3D_BUSD,   CLK_DOUT_CMU_G3D_BUSD,   CLK_GOUT_CMU_G3D_BUSD,
++	CLK_MOUT_CMU_G3D_GLB,    CLK_DOUT_CMU_G3D_GLB,    CLK_GOUT_CMU_G3D_GLB,
++	CLK_MOUT_CMU_G3D_SWITCH, CLK_DOUT_CMU_G3D_SWITCH, CLK_GOUT_CMU_G3D_SWITCH,
++	CLK_MOUT_CMU_GDC_GDC0,   CLK_DOUT_CMU_GDC_GDC0,   CLK_GOUT_CMU_GDC_GDC0,
++	CLK_MOUT_CMU_GDC_GDC1,   CLK_DOUT_CMU_GDC_GDC1,   CLK_GOUT_CMU_GDC_GDC1,
++	CLK_MOUT_CMU_GDC_SCSC,   CLK_DOUT_CMU_GDC_SCSC,   CLK_GOUT_CMU_GDC_SCSC,
++	CLK_MOUT_CMU_IPP_BUS,    CLK_DOUT_CMU_IPP_BUS,    CLK_GOUT_CMU_IPP_BUS,
++	CLK_MOUT_CMU_MCSC_ITSC,  CLK_DOUT_CMU_MCSC_ITSC,  CLK_GOUT_CMU_MCSC_ITSC,
++	CLK_MOUT_CMU_MCSC_MCSC,  CLK_DOUT_CMU_MCSC_MCSC,  CLK_GOUT_CMU_MCSC_MCSC,
++	CLK_MOUT_CMU_MFC_MFC,    CLK_DOUT_CMU_MFC_MFC,    CLK_GOUT_CMU_MFC_MFC,
++	CLK_MOUT_CMU_TNR_BUS,    CLK_DOUT_CMU_TNR_BUS,    CLK_GOUT_CMU_TNR_BUS,
++	CLK_MOUT_CMU_TPU_BUS,    CLK_DOUT_CMU_TPU_BUS,    CLK_GOUT_CMU_TPU_BUS,
++	CLK_MOUT_CMU_TPU_TPU,    CLK_DOUT_CMU_TPU_TPU,    CLK_GOUT_CMU_TPU_TPU,
++	CLK_MOUT_CMU_TPU_TPUCTL, CLK_DOUT_CMU_TPU_TPUCTL, CLK_GOUT_CMU_TPU_TPUCTL,
++	CLK_MOUT_CMU_TPU_UART,   CLK_DOUT_CMU_TPU_UART,   CLK_GOUT_CMU_TPU_UART,
++	/*
++	 * Empirically, on gs201 only SHARED0_DIV2 and SHARED0_DIV3 are
++	 * physically present in CMU_TOP — everything from SHARED0_DIV4
++	 * onwards (div4/5, all of shared1/2/3) is a register-hole and
++	 * reading async-aborts the kernel. gs201 has fewer shared-PLL
++	 * fan-out dividers than gs101. No muxes or gates reference these
++	 * IDs, so just dropping the divs is sufficient.
++	 */
++	CLK_DOUT_CMU_SHARED0_DIV4,
++	CLK_DOUT_CMU_SHARED0_DIV5,
++	CLK_DOUT_CMU_SHARED1_DIV2,
++	CLK_DOUT_CMU_SHARED1_DIV3,
++	CLK_DOUT_CMU_SHARED1_DIV4,
++	CLK_DOUT_CMU_SHARED2_DIV2,
++	CLK_DOUT_CMU_SHARED3_DIV2,
++};
++
++static const struct samsung_cmu_info top_cmu_info_gs201 __initconst = {
++	.pll_clks		= cmu_top_pll_clks,
++	.nr_pll_clks		= ARRAY_SIZE(cmu_top_pll_clks),
++	.mux_clks		= cmu_top_mux_clks,
++	.nr_mux_clks		= ARRAY_SIZE(cmu_top_mux_clks),
++	.div_clks		= cmu_top_div_clks,
++	.nr_div_clks		= ARRAY_SIZE(cmu_top_div_clks),
++	.fixed_factor_clks	= cmu_top_ffactor,
++	.nr_fixed_factor_clks	= ARRAY_SIZE(cmu_top_ffactor),
++	.gate_clks		= cmu_top_gate_clks,
++	.nr_gate_clks		= ARRAY_SIZE(cmu_top_gate_clks),
++	.nr_clk_ids		= CLKS_NR_TOP,
++	.clk_regs		= cmu_top_clk_regs,
++	.nr_clk_regs		= ARRAY_SIZE(cmu_top_clk_regs),
++	.auto_clock_gate	= true,
++	.gate_dbg_offset	= GS101_GATE_DBG_OFFSET,
++	.option_offset		= CMU_CMU_TOP_CONTROLLER_OPTION,
++	.skip_ids		= gs201_top_skip_ids,
++	.nr_skip_ids		= ARRAY_SIZE(gs201_top_skip_ids),
++};
++
+ static void __init gs101_cmu_top_init(struct device_node *np)
+ {
+ 	exynos_arm64_register_cmu(NULL, np, &top_cmu_info);
+@@ -1452,6 +1529,17 @@ static void __init gs101_cmu_top_init(struct device_node *np)
+ CLK_OF_DECLARE(gs101_cmu_top, "google,gs101-cmu-top",
+ 	       gs101_cmu_top_init);
+ 
++/*
++ * GS201 (Tensor G2) CMU register bases match GS101 1:1 per the AOSP cal-if
++ * SFR tables, so each gs201-* compat aliases to the gs101 init/info data.
++ *
++ * NOTE: on gs201, CMU access is gated by BL31 until pKVM initializes at EL2
++ * (see memory/project_pkvm_cmu_unlock.md). time_init() runs before KVM init,
++ * so gs201-cmu-top must NOT be declared via CLK_OF_DECLARE — instead it's
++ * registered as a platform device in gs101_cmu_of_match below, which probes
++ * at late_initcall (after KVM has brought up pKVM and opened the CMU gate).
++ */
++
+ /* ---- CMU_APM ------------------------------------------------------------- */
+ 
+ /* Register Offset definitions for CMU_APM (0x17400000) */
+@@ -3753,6 +3841,9 @@ static void __init gs101_cmu_misc_init(struct device_node *np)
+ /* Register CMU_MISC early, as it's needed for MCT timer */
+ CLK_OF_DECLARE(gs101_cmu_misc, "google,gs101-cmu-misc",
+ 	       gs101_cmu_misc_init);
++/* GS201 CMU_MISC shares the GS101 layout (SFR_BLOCK base 0x10010000). */
++CLK_OF_DECLARE(gs201_cmu_misc, "google,gs201-cmu-misc",
++	       gs101_cmu_misc_init);
+ 
+ /* ---- CMU_PERIC0 ---------------------------------------------------------- */
+ 
+@@ -4738,6 +4829,9 @@ static const struct of_device_id gs101_cmu_of_match[] = {
+ 	}, {
+ 		.compatible = "google,gs101-cmu-peric1",
+ 		.data = &peric1_cmu_info,
++	}, {
++		.compatible = "google,gs201-cmu-top",
++		.data = &top_cmu_info_gs201,
+ 	}, {
+ 	},
+ };
+diff --git a/drivers/clk/samsung/clk.c b/drivers/clk/samsung/clk.c
+index 94b2bccc7d02..13c69762c058 100644
+--- a/drivers/clk/samsung/clk.c
++++ b/drivers/clk/samsung/clk.c
+@@ -457,10 +457,60 @@ void samsung_clk_extended_sleep_init(void __iomem *reg_base,
+  * @cmu: CMU object with clocks to register
+  * @np:  CMU device tree node
+  */
++static bool samsung_cmu_skip_id(const struct samsung_cmu_info *cmu,
++				unsigned int id)
++{
++	unsigned int i;
++
++	for (i = 0; i < cmu->nr_skip_ids; i++)
++		if (cmu->skip_ids[i] == id)
++			return true;
++	return false;
++}
++
++/*
++ * Copy `src` into a newly allocated array, dropping entries whose `.id` is in
++ * cmu->skip_ids. Used by samsung_cmu_register_clocks() so each per-clock-type
++ * register helper sees a filtered list without having to be skip-aware itself.
++ *
++ * Each samsung_{mux,div,gate,pll,...}_clock has `.id` at the same position —
++ * the helper macro below works because C allows us to treat the first field
++ * as unsigned int via a cast when all structs follow the same layout.
++ * (Verified: pll/mux/div/gate/fixed_rate/fixed_factor all start with
++ * `unsigned int id`.)
++ */
++#define SAMSUNG_FILTER_CLKS(type_, dst_arr_, dst_cnt_, src_arr_, src_cnt_, cmu_) \
++do {									\
++	unsigned int _i, _n = 0;					\
++	type_ *_out;							\
++	_out = kcalloc((src_cnt_), sizeof(*_out), GFP_KERNEL);		\
++	if (!_out) {							\
++		(dst_arr_) = (src_arr_);				\
++		(dst_cnt_) = (src_cnt_);				\
++		break;							\
++	}								\
++	for (_i = 0; _i < (src_cnt_); _i++) {				\
++		if (samsung_cmu_skip_id((cmu_), (src_arr_)[_i].id))	\
++			continue;					\
++		_out[_n++] = (src_arr_)[_i];				\
++	}								\
++	(dst_arr_) = _out;						\
++	(dst_cnt_) = _n;						\
++} while (0)
++
+ void __init samsung_cmu_register_clocks(struct samsung_clk_provider *ctx,
+ 					const struct samsung_cmu_info *cmu,
+ 					struct device_node *np)
+ {
++	const struct samsung_pll_clock *pll_clks = cmu->pll_clks;
++	const struct samsung_mux_clock *mux_clks = cmu->mux_clks;
++	const struct samsung_div_clock *div_clks = cmu->div_clks;
++	const struct samsung_gate_clock *gate_clks = cmu->gate_clks;
++	unsigned int nr_pll_clks = cmu->nr_pll_clks;
++	unsigned int nr_mux_clks = cmu->nr_mux_clks;
++	unsigned int nr_div_clks = cmu->nr_div_clks;
++	unsigned int nr_gate_clks = cmu->nr_gate_clks;
++
+ 	if (cmu->auto_clock_gate && samsung_is_auto_capable(np))
+ 		ctx->auto_clock_gate = cmu->auto_clock_gate;
+ 
+@@ -469,15 +519,37 @@ void __init samsung_cmu_register_clocks(struct samsung_clk_provider *ctx,
+ 	ctx->drcg_offset = cmu->drcg_offset;
+ 	ctx->memclk_offset = cmu->memclk_offset;
+ 
+-	if (cmu->pll_clks)
+-		samsung_clk_register_pll(ctx, cmu->pll_clks, cmu->nr_pll_clks);
+-	if (cmu->mux_clks)
+-		samsung_clk_register_mux(ctx, cmu->mux_clks, cmu->nr_mux_clks);
+-	if (cmu->div_clks)
+-		samsung_clk_register_div(ctx, cmu->div_clks, cmu->nr_div_clks);
+-	if (cmu->gate_clks)
+-		samsung_clk_register_gate(ctx, cmu->gate_clks,
+-					  cmu->nr_gate_clks);
++	if (cmu->nr_skip_ids && cmu->skip_ids) {
++		if (pll_clks)
++			SAMSUNG_FILTER_CLKS(struct samsung_pll_clock,
++					    pll_clks, nr_pll_clks,
++					    cmu->pll_clks, cmu->nr_pll_clks,
++					    cmu);
++		if (mux_clks)
++			SAMSUNG_FILTER_CLKS(struct samsung_mux_clock,
++					    mux_clks, nr_mux_clks,
++					    cmu->mux_clks, cmu->nr_mux_clks,
++					    cmu);
++		if (div_clks)
++			SAMSUNG_FILTER_CLKS(struct samsung_div_clock,
++					    div_clks, nr_div_clks,
++					    cmu->div_clks, cmu->nr_div_clks,
++					    cmu);
++		if (gate_clks)
++			SAMSUNG_FILTER_CLKS(struct samsung_gate_clock,
++					    gate_clks, nr_gate_clks,
++					    cmu->gate_clks, cmu->nr_gate_clks,
++					    cmu);
++	}
++
++	if (pll_clks)
++		samsung_clk_register_pll(ctx, pll_clks, nr_pll_clks);
++	if (mux_clks)
++		samsung_clk_register_mux(ctx, mux_clks, nr_mux_clks);
++	if (div_clks)
++		samsung_clk_register_div(ctx, div_clks, nr_div_clks);
++	if (gate_clks)
++		samsung_clk_register_gate(ctx, gate_clks, nr_gate_clks);
+ 	if (cmu->fixed_clks)
+ 		samsung_clk_register_fixed_rate(ctx, cmu->fixed_clks,
+ 						cmu->nr_fixed_clks);
+@@ -486,6 +558,17 @@ void __init samsung_cmu_register_clocks(struct samsung_clk_provider *ctx,
+ 						  cmu->nr_fixed_factor_clks);
+ 	if (cmu->cpu_clks)
+ 		samsung_clk_register_cpu(ctx, cmu->cpu_clks, cmu->nr_cpu_clks);
++
++	if (cmu->nr_skip_ids && cmu->skip_ids) {
++		if (pll_clks != cmu->pll_clks)
++			kfree(pll_clks);
++		if (mux_clks != cmu->mux_clks)
++			kfree(mux_clks);
++		if (div_clks != cmu->div_clks)
++			kfree(div_clks);
++		if (gate_clks != cmu->gate_clks)
++			kfree(gate_clks);
++	}
+ }
+ 
+ /* Each bit enable/disables DRCG of a bus component */
+diff --git a/drivers/clk/samsung/clk.h b/drivers/clk/samsung/clk.h
+index b1192ca03db5..dfd48b2b0177 100644
+--- a/drivers/clk/samsung/clk.h
++++ b/drivers/clk/samsung/clk.h
+@@ -395,6 +395,16 @@ struct samsung_cmu_info {
+ 	u32 option_offset;
+ 	u32 drcg_offset;
+ 	u32 memclk_offset;
++
++	/*
++	 * Optional list of clock IDs to skip during registration. Used on
++	 * gs201 where some CMU_TOP dividers/muxes/gates feed power-gated
++	 * sub-blocks (BO, AUR, G3D, DPU, MFC, etc.); reading their registers
++	 * before the power-domain driver turns the block on triggers an
++	 * asynchronous SError that panics the kernel.
++	 */
++	const unsigned int *skip_ids;
++	unsigned int nr_skip_ids;
+ };
+ 
+ struct samsung_clk_provider *samsung_clk_init(struct device *dev,
+-- 
+2.43.0
+

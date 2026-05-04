@@ -50,10 +50,17 @@ on its own merit.
 6. **0001 IOCC** — defensive cleanup; describe carefully because it
    reverses a recent intentional change.
 7. **0004, 0005, 0006, 0008, 0009, 0012** — supporting cast.
+8. **0013 gs201 CMU_TOP/MISC + skip_ids** — independent of the UFS
+   series; goes to a different maintainer (linux-clk / Sylwester
+   Nawrocki) than the others (linux-scsi / linux-samsung-soc / Peter
+   Griffin). Send as its own thread.
 
 `0001` is a defensive correctness fix that doesn't change observable
 behavior on its own. `0011` is the only patch where landing it
 dramatically changes whether this controller works on mainline.
+`0013` is foundation work — by itself it doesn't make any new
+hardware functional, but it unblocks per-domain follow-ups for
+gs201 CMU support.
 
 ## 0001-ufs-exynos-don-t-clobber-bootloader-IOCC-bits-when-d.patch
 
@@ -434,3 +441,64 @@ This is **not** an upstream-quality patch (it's a quick
 sending — keep `dev_warn`/`dev_err`, drop the dump helpers
 entirely or gate them behind a Kconfig debug option. Tracked
 in the auto-memory `feedback_uart_verbosity.md`.
+
+## 0013-clk-samsung-gs101-add-gs201-Tensor-G2-CMU_TOP-CMU_MI.patch
+
+First step toward gs201 CMU support upstream. Three pieces:
+
+1. **`skip_ids[]` infrastructure in `clk.c`/`clk.h`.** Adds a generic
+   way for a CMU driver to declare clock IDs that
+   `samsung_cmu_register_clocks()` should drop from its per-clock-type
+   register helpers. Filters the input arrays once into a kcalloc'd
+   copy, runs the existing register helpers against the filtered
+   list, then frees the copies. No behavior change for any CMU
+   driver that doesn't set `skip_ids`.
+
+2. **`gs201_top_skip_ids[]` + `top_cmu_info_gs201`.** Empirical list
+   of CMU_TOP clock IDs that read-fault on real gs201 hardware:
+     - Power-gated sub-block bridges (BO/AUR/CSIS/DNS/DPU/G2D/G3AA/
+       G3D/GDC/IPP/MCSC/MFC/TNR/TPU and their bus dividers). gs201's
+       AOSP stack pre-powers these via pkvm-s2mpu + exynos-pd at EL2
+       before CMU registration; mainline doesn't, so we just don't
+       touch them.
+     - SHARED PLL fan-out dividers from SHARED0_DIV4 onwards plus
+       all of SHARED1/2/3 — register holes on gs201 (gs201 implements
+       fewer fan-out dividers than gs101).
+   `top_cmu_info_gs201` reuses gs101's PLL/mux/div/gate tables and
+   layers `skip_ids` on top.
+
+3. **`google,gs201-cmu-top` of_match entry + `google,gs201-cmu-misc`
+   `CLK_OF_DECLARE`.** Two compats with validated cal data; the
+   former wires up `top_cmu_info_gs201`, the latter shares
+   `gs101_cmu_misc_init` (CMU_MISC layout is identical between
+   gs101 and gs201 per AOSP cal-if `cmucal-sfr-gs201.c`).
+
+**Deliberately NOT included:** gs201 compats for APM, DPU, HSI0,
+HSI2, PERIC0, PERIC1. Their gs101 `_cmu_info` data tables don't
+apply cleanly to gs201 — the most recent test (2026-05-03,
+concurrent `cmu_top` + `cmu_peric0` enable on real felix
+hardware) panicked the same way CMU_TOP did before its skip list
+was built (`Asynchronous SError Interrupt` inside
+`clk_divider_recalc_rate`). Adding these compats will require
+auditing each domain's register layout against AOSP
+`private/google-modules/soc/gs/drivers/soc/google/cal-if/gs201/
+cmucal-sfr.c` and adding per-domain `skip_ids` lists (or full
+gs201-specific `samsung_cmu_info` structs if the layouts diverge
+more). Multi-day project; this patch is the foundation it builds on.
+
+**Init-call ordering:** kept at `core_initcall` to match existing
+gs101 behavior. On gs201 specifically the platform driver needs to
+probe **after** pKVM has unlocked CMU access at EL2 (BL31 firewalls
+the CMU register block from non-secure EL1 unless `kvm-arm.mode=
+protected`), but consumers downstream of CMU all support
+defer-probe so the existing ordering should work in practice. If
+clk-gs101 probe ends up firing before pKVM init on real gs201
+boards, a follow-up patch will move just the gs201 path to a
+later initcall.
+
+**Practical impact for the felix bring-up tree:** with this patch
+applied and `cmu_top` declared in DT (with `kvm-arm.mode=
+protected` on cmdline), CMU_TOP probes cleanly. UART consumers
+(`samsung,exynos850-uart`) and any other downstream peripheral
+that wants real clock rates from CMU_PERIC0 still defer-probe
+forever — those wait for the follow-up gs201-cmu-peric0 work.

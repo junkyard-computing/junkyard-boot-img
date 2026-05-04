@@ -50,7 +50,11 @@ PIXEL_DEVINFO_SOURCES := $(wildcard $(PIXEL_DEVINFO_DIR)/Cargo.toml $(PIXEL_DEVI
 # whose postinst points /etc/resolv.conf at a stub that only resolves when
 # systemd-resolved is running (it isn't, under nspawn). Without this flag,
 # any nspawn call after that postinst loses DNS, including reruns.
-NSPAWN := sudo systemd-nspawn --resolv-conf=bind-host
+# --register=no + --keep-unit let nspawn run inside containers that don't have
+# systemd-machined / a unit manager (e.g. tools/dockershell), and are harmless
+# on a host with full systemd. dbus must be reachable; tools/dockershell starts
+# a system dbus on container entry.
+NSPAWN := sudo systemd-nspawn --register=no --keep-unit --resolv-conf=bind-host
 
 # Running `make` directly bypasses the env vars set by the justfile (notably
 # KERNEL_VERSION, which is read from kernel/kernel_version). Always go through
@@ -68,10 +72,10 @@ all:
 .debootstrap: .create_image
 	just mount_rootfs
 	sudo debootstrap --variant=minbase --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR)
-	sudo systemd-nspawn -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
-	sudo systemd-nspawn -D $(SYSROOT_DIR) symlinks -cr .
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
+	$(NSPAWN) -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
+	$(NSPAWN) -D $(SYSROOT_DIR) symlinks -cr .
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
 	just unmount_rootfs
 	touch $@
 
@@ -179,7 +183,7 @@ all:
 	sudo rsync -a rootfs/unpack/modules_install/lib/modules/ $(SYSROOT_DIR)/lib/modules/
 	sudo cp $(KERNEL_BUILD_DIR)/System.map $(SYSROOT_DIR)/boot/System.map-$(KERNEL_VERSION)
 	@echo "Updating module dependencies"
-	sudo systemd-nspawn -D $(SYSROOT_DIR) depmod \
+	$(NSPAWN) -D $(SYSROOT_DIR) depmod \
 		--errsyms \
 		--all \
 		--filesyms /boot/System.map-$(KERNEL_VERSION) \
@@ -200,7 +204,7 @@ all:
 	# (/vendor/firmware, set by the dtb's /chosen/bootargs) points at.
 	# Without it, the AOC coprocessor retry-loops in dracut and starves
 	# UART RX, so emergency-shell keystrokes are dropped.
-	sudo systemd-nspawn -D $(SYSROOT_DIR) dracut \
+	$(NSPAWN) -D $(SYSROOT_DIR) dracut \
 		--kver $(KERNEL_VERSION) \
 		--lz4 \
 		--show-modules \
@@ -216,8 +220,12 @@ all:
 	# Kernel cmdline.
 	#   earlycon=exynos4210,mmio32,0x10A00000  UART0 output using the bootloader's
 	#                                          divider setup (polled, no reprogramming)
-	#   keep_bootcon                           keep earlycon attached even after the
-	#                                          full console registers
+	#   keep_bootcon                           keep earlycon attached even after a
+	#                                          full console registers — important
+	#                                          if samsung_tty registers and then
+	#                                          panics, otherwise printk goes silent
+	#                                          and the only signal is the APC
+	#                                          early-watchdog reboot 60s later
 	#   root=...                               rootfs location (super partition)
 	#   firmware_class.path=/vendor/firmware   replaces the stock felix dtb's
 	#                                          /chosen/bootargs entry; without it
@@ -234,9 +242,10 @@ all:
 	#                                          works (controller can handle the
 	#                                          parallel storm at HS speed).
 	#
-	# No console=ttySAC0 — samsung_tty stays disabled in gs201.dtsi because the
-	# gs201 CMU is non-secure-EL1-protected; with &oscclk stub clocks the baud
-	# divider would be mis-calculated and serial output would garble.
+	# No console=ttySAC0,115200 — samsung_tty stays disabled in gs201-felix.dts
+	# until we have a working serial-getty story (tentative attempt with a 200 MHz
+	# fixed-clock stub for clk_uart_baud0 produced an APC-early-watchdog bootloop;
+	# bisect pending).
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
 		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=8 ignore_loglevel" \

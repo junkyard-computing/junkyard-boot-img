@@ -48,6 +48,11 @@ tty_args=(-i)
 
 [ $# -eq 0 ] && set -- bash
 
+# systemd-nspawn (used by the Makefile's debootstrap / install-packages /
+# install-kernel / install-initramfs stages) needs a system dbus to register
+# with. Docker containers don't run dbus by default, so start one inside
+# /run/dbus before exec'ing the user's command. Idempotent — a no-op once
+# the socket already exists.
 exec docker run --rm \
   "${tty_args[@]}" \
   --privileged \
@@ -55,5 +60,12 @@ exec docker run --rm \
   -v "$REPO_ROOT:/work" \
   -w /work \
   ${device_args[@]+"${device_args[@]}"} \
+  --entrypoint /usr/bin/env \
   "$IMAGE" \
-  "$@"
+  bash -c '
+    if [ ! -S /run/dbus/system_bus_socket ]; then
+      sudo mkdir -p /run/dbus
+      sudo dbus-daemon --system --fork --nopidfile 2>/dev/null
+    fi
+    exec "$@"
+  ' -- "$@"
