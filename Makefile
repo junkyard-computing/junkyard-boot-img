@@ -164,8 +164,23 @@ all:
 		"nmcli --offline connection add type ethernet con-name default_connection ipv4.method auto autoconnect true \
 		> /etc/NetworkManager/system-connections/default_connection.nmconnection"
 	$(NSPAWN) -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/default_connection.nmconnection
+	# usb0 is the CDC-NCM gadget interface (created by usb-gadget.service when
+	# the host plugs in). Static 10.42.0.1/24 — host gets matching DHCP from
+	# us via dnsmasq if installed, or sets its own static; SSH target is then
+	# 10.42.0.1.
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+		"nmcli --offline connection add type ethernet ifname usb0 con-name usb0-gadget \
+		ipv4.method manual ipv4.addresses 10.42.0.1/24 ipv6.method disabled autoconnect true \
+		> /etc/NetworkManager/system-connections/usb0-gadget.nmconnection"
+	$(NSPAWN) -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/usb0-gadget.nmconnection
 	# Apply tracked overlay (usb_gadget, blacklist.conf, custom service, ...).
 	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
+	# pstore-beacon: surface previous-boot panic dmesg/console/pmsg from
+	# /sys/fs/pstore to /dev/kmsg (UART) and archive to /var/log/pstore.
+	# systemd-pstore.service would otherwise race us for the records, so mask
+	# it — our beacon is the single owner of /sys/fs/pstore consumption.
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl enable pstore-beacon.service
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl mask systemd-pstore.service
 	just unmount_rootfs
 	touch $@
 
@@ -227,6 +242,17 @@ all:
 	#                                          and the only signal is the APC
 	#                                          early-watchdog reboot 60s later
 	#   root=...                               rootfs location (super partition)
+	#   rw                                     mount rootfs read-write at the
+	#                                          initial mount. Without it the
+	#                                          kernel mounts root RO by default
+	#                                          and systemd-remount-fs.service
+	#                                          only escalates to RW if /etc/fstab
+	#                                          says so — debootstrap leaves
+	#                                          /etc/fstab empty, so RO sticks.
+	#                                          Symptoms when missing: mkdir
+	#                                          under /var fails with EROFS,
+	#                                          beacons silently lose their logs,
+	#                                          journald/sshd writes fail.
 	#   firmware_class.path=/vendor/firmware   replaces the stock felix dtb's
 	#                                          /chosen/bootargs entry; without it
 	#                                          AOC retry-loops and starves UART RX.
@@ -248,7 +274,7 @@ all:
 	# bisect pending).
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=8 ignore_loglevel" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=8 ignore_loglevel clk_ignore_unused" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \

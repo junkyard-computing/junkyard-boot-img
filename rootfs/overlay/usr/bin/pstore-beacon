@@ -1,0 +1,110 @@
+#!/bin/sh
+# Dump previous-boot pstore records (panic dmesg, console log, pmsg) to
+# /dev/kmsg so they surface on UART, then archive to /var/log/pstore/ and
+# clear /sys/fs/pstore so the same records don't dump again next boot.
+#
+# Why: felix has a single USB-C port and we frequently can't have UART
+# attached during the boot that crashes (e.g. when testing a USB ethernet
+# adapter). pstore/ramoops keeps the panic dmesg in a 4 MiB DRAM carveout
+# (ramoops_mem@fd3ff000, declared by gs201-android-handoff.dtsi) across the
+# warm reboot, and this script is what surfaces it on the next UART-attached
+# boot — same pattern as /usr/bin/network-beacon.
+#
+# Pairs with pstore-beacon.service. Replaces systemd-pstore.service (masked
+# in the Makefile) so we don't race over which process unlinks the records.
+#
+# Intentionally no `set -eu` here: an early failure in any one step should
+# not silently kill the rest of the diagnostic surface. Each step traces
+# its own progress to /dev/kmsg so the UART always shows where we got to.
+
+PSTORE=/sys/fs/pstore
+ARCHIVE=/var/log/pstore
+
+kmsg() { echo "[PSTORE] $*" > /dev/kmsg 2>/dev/null; }
+
+kmsg "beacon: starting"
+
+if [ ! -d "$PSTORE" ]; then
+    kmsg "beacon: $PSTORE does not exist; kernel pstore unavailable"
+    exit 0
+fi
+
+if mount | grep -q " $PSTORE "; then
+    kmsg "beacon: $PSTORE already mounted"
+else
+    kmsg "beacon: mounting pstore at $PSTORE"
+    if mount -t pstore pstore "$PSTORE" 2>/dev/null; then
+        kmsg "beacon: mount ok"
+    else
+        kmsg "beacon: mount failed (errno from mount(8) suppressed); aborting"
+        exit 0
+    fi
+fi
+
+if [ ! -d "$ARCHIVE" ]; then
+    err=$(mkdir -p "$ARCHIVE" 2>&1)
+    rc=$?
+    if [ "$rc" -ne 0 ] || [ ! -d "$ARCHIVE" ]; then
+        kmsg "beacon: mkdir $ARCHIVE failed (rc=$rc): $err"
+        kmsg "beacon: archive disabled; continuing with kmsg-only dump"
+    fi
+fi
+
+stamp=$(date -u +%Y%m%dT%H%M%SZ 2>/dev/null)
+[ -z "$stamp" ] && stamp=unknown
+
+count=0
+for f in "$PSTORE"/*; do
+    [ -e "$f" ] || continue
+    bn=$(basename "$f" 2>/dev/null)
+    [ -z "$bn" ] && bn=record
+    count=$((count + 1))
+    kmsg "=== BEGIN $bn ==="
+    while IFS= read -r line || [ -n "$line" ]; do
+        kmsg "$line"
+    done < "$f"
+    kmsg "=== END $bn ==="
+    if [ -d "$ARCHIVE" ]; then
+        cp "$f" "$ARCHIVE/${stamp}-${bn}" 2>/dev/null
+    fi
+    rm -f "$f"
+done
+
+if [ "$count" -eq 0 ]; then
+    kmsg "beacon: no previous-boot records (clean boot, or first boot after enable)"
+else
+    kmsg "beacon: surfaced $count record(s); archive under $ARCHIVE/${stamp}-*"
+fi
+
+# Raw dump of the ramoops physical region. Goal: when pstore returns nothing,
+# tell apart "DRAM zeroed during master-disconnect reboot" (region is all
+# zeros) vs "data is present but next-boot ramoops driver rejected the
+# signature/format" (region has bytes that look like a kernel log but no
+# parsed records). Requires CONFIG_STRICT_DEVMEM=n on this kernel build.
+RAMOOPS_PHYS=0xfd3ff000
+RAMOOPS_SIZE=0x400000
+
+if [ ! -e /dev/mem ]; then
+    kmsg "raw: /dev/mem not present; skipping region dump"
+elif [ "$count" -ne 0 ]; then
+    kmsg "raw: pstore parsed records; skipping region dump (regions consumed)"
+else
+    kmsg "raw: dumping first 256 bytes of ramoops region at $RAMOOPS_PHYS"
+    dd if=/dev/mem bs=256 count=1 iflag=skip_bytes \
+        skip=$((RAMOOPS_PHYS)) 2>/dev/null \
+        | xxd \
+        | while IFS= read -r line; do
+            kmsg "raw: $line"
+        done
+    if [ -d "$ARCHIVE" ]; then
+        bin="$ARCHIVE/${stamp}-ramoops-raw.bin"
+        if dd if=/dev/mem bs=$((RAMOOPS_SIZE)) count=1 iflag=skip_bytes \
+            skip=$((RAMOOPS_PHYS)) of="$bin" 2>/dev/null; then
+            kmsg "raw: full $RAMOOPS_SIZE-byte region archived to $bin"
+        else
+            kmsg "raw: full region dump failed (likely STRICT_DEVMEM=y or /dev/mem ENXIO)"
+        fi
+    fi
+fi
+
+exit 0

@@ -11,8 +11,8 @@ RemainAfterExit=yes
 # Source: github.com/junkyard-computing/pixel-devinfo (vendored at
 # tools/pixel-devinfo and cross-compiled to aarch64 by the build).
 ExecStart=/usr/local/bin/pixel-devinfo /dev/disk/by-partlabel/devinfo /dev/disk/by-partlabel/devinfo --successful true --unbootable false --retries 7 --quiet
-StandardOutput=journal+kmsg
-StandardError=journal+kmsg
+StandardOutput=journal+console
+StandardError=journal+console
 
 [Install]
 WantedBy=multi-user.target

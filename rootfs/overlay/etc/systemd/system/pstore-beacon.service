@@ -1,0 +1,14 @@
+[Unit]
+Description=Surface previous-boot pstore records to UART (and archive)
+After=local-fs.target
+ConditionPathExists=/sys/fs/pstore
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/pstore-beacon
+StandardOutput=kmsg
+StandardError=kmsg
+
+[Install]
+WantedBy=multi-user.target
