@@ -23,6 +23,15 @@ just all                          # everything else
 ./flash.sh
 ```
 
+**Always run build/flash commands through `./tools/dockershell`** — `just all`, `./flash.sh`, kernel `make` invocations, etc. The dockershell wrapper provides the cross-compiler, passwordless sudo for the loop-mount/nspawn steps, and USB passthrough for fastboot. Direct host invocation of `just all` will hit a sudo password prompt at `mount_rootfs`; direct host `make ... gs201-felix.dtb` works only because dtb compilation doesn't need sudo. Examples:
+```
+./tools/dockershell just all
+./tools/dockershell ./flash.sh
+./tools/dockershell fastboot devices
+./tools/dockershell sh -c 'make -C kernel/source ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- O=out exynos/google/gs201-felix.dtb'
+```
+See the "Docker build environment" section below for the full rationale (privileged container, host UID match, qemu-binfmt setup).
+
 Individual stages are also exposed as justfile targets (`build_kernel`, `build_rootfs`, `install_apt_packages`, `update_kernel_modules_and_source`, `update_initramfs`, `build_boot_images`, `create_rootfs_image`, `mount_rootfs`, `unmount_rootfs`, `clean_rootfs`, `clean_kernel`). They all call `make` under the hood.
 
 Why the split: `just all` runs two make invocations in sequence so the second picks up the fresh `KERNEL_VERSION` written by `.build_kernel` (justfile `read()` is parse-time; an empty `kernel/kernel_version` at parse would otherwise propagate). Individual `update_*` / `build_boot_images` targets also re-read `kernel/kernel_version` at recipe time for the same reason.

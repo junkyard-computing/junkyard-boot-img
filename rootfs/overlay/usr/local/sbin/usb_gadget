@@ -1,14 +1,82 @@
 #!/bin/sh
-mkdir /sys/kernel/config/usb_gadget/g1
-mkdir /sys/kernel/config/usb_gadget/g1/strings/0x409
-echo 0x18D1 > /sys/kernel/config/usb_gadget/g1/idVendor
-echo 0xD001 > /sys/kernel/config/usb_gadget/g1/idProduct
-echo "Google" > /sys/kernel/config/usb_gadget/g1/strings/0x409/manufacturer
-echo "DEADC0FFE" > /sys/kernel/config/usb_gadget/g1/strings/0x409/serialnumber
-echo "Fold" > /sys/kernel/config/usb_gadget/g1/strings/0x409/product
-mkdir /sys/kernel/config/usb_gadget/g1/functions/ncm.usb0
-mkdir /sys/kernel/config/usb_gadget/g1/configs/c.1
-mkdir -p /sys/kernel/config/usb_gadget/g1/configs/c.1/strings/0x409
-echo "USB network" > /sys/kernel/config/usb_gadget/g1/configs/c.1/strings/0x409/configuration
-ln -s /sys/kernel/config/usb_gadget/g1/functions/ncm.usb0 /sys/kernel/config/usb_gadget/g1/configs/c.1/
-echo 11210000.dwc3 > /sys/kernel/config/usb_gadget/g1/UDC
+# Configure a composite USB gadget: CDC-NCM (network) + CDC-ACM (serial).
+# Host sees one device that exposes both `usb0` (DHCP/SSH) and
+# `/dev/ttyACM0` (login console via serial-getty@ttyGS0.service).
+#
+# UDC node name differs between AOSP and mainline (AOSP: 11210000.dwc3,
+# mainline gs201: 11110000.dwc3), so we glob /sys/class/udc/ instead of
+# hardcoding.
+
+set -eu
+
+GADGET=/sys/kernel/config/usb_gadget/g1
+
+# Idempotent: if g1 is already bound to a UDC, leave it alone.
+if [ -f "$GADGET/UDC" ] && [ -n "$(cat "$GADGET/UDC" 2>/dev/null || true)" ]; then
+	exit 0
+fi
+
+mkdir -p "$GADGET"
+echo 0x18D1 > "$GADGET/idVendor"
+echo 0xD001 > "$GADGET/idProduct"
+echo 0x0100 > "$GADGET/bcdDevice"
+echo 0x0200 > "$GADGET/bcdUSB"
+
+mkdir -p "$GADGET/strings/0x409"
+echo "Google" > "$GADGET/strings/0x409/manufacturer"
+echo "Pixel Fold (mainline)" > "$GADGET/strings/0x409/product"
+echo "DEADC0FFE" > "$GADGET/strings/0x409/serialnumber"
+
+mkdir -p "$GADGET/functions/ncm.usb0"
+mkdir -p "$GADGET/functions/acm.usb0"
+
+mkdir -p "$GADGET/configs/c.1/strings/0x409"
+echo "NCM + ACM" > "$GADGET/configs/c.1/strings/0x409/configuration"
+echo 250 > "$GADGET/configs/c.1/MaxPower"
+
+ln -sf "$GADGET/functions/ncm.usb0" "$GADGET/configs/c.1/ncm.usb0"
+ln -sf "$GADGET/functions/acm.usb0" "$GADGET/configs/c.1/acm.usb0"
+
+UDC=$(ls /sys/class/udc/ 2>/dev/null | head -n1)
+log() { printf "[USB-GADGET] %s\n" "$*" | tee -a /dev/kmsg >/dev/null 2>&1 || true; }
+
+# Enable dwc3 dynamic debug + ftrace tracepoints so the next host enumeration
+# attempt produces IRQ-by-IRQ traces. dwc3 logs most diagnostic info via
+# tracepoints (trace_dwc3_event, trace_dwc3_ep0, ...) rather than dev_dbg,
+# so dynamic_debug alone doesn't surface much.
+DDBG=/sys/kernel/debug/dynamic_debug/control
+if [ -e "$DDBG" ]; then
+	echo 'module dwc3 +p' > "$DDBG" 2>/dev/null || log "dynamic_debug: failed module-wide enable"
+	echo 'module phy_exynos5_usbdrd +p' > "$DDBG" 2>/dev/null || true
+	log "dwc3 dynamic_debug enabled"
+fi
+# ftrace path removed (CONFIG_FTRACE off — its instrumentation broke
+# serial-getty intermittently). dwc3 IRQ visibility now comes from explicit
+# pr_info() patches in drivers/usb/dwc3/{gadget,ep0}.c (look for DWC3-DBG
+# prefix in dmesg / UART).
+if [ -z "$UDC" ]; then
+	log "no UDC available under /sys/class/udc/"
+	exit 1
+fi
+log "binding UDC=$UDC"
+echo "$UDC" > "$GADGET/UDC"
+log "after-bind state=$(cat /sys/class/udc/$UDC/state 2>/dev/null)"
+log "after-bind soft_connect=$(cat /sys/class/udc/$UDC/soft_connect 2>/dev/null)"
+
+# gs201 dwc3 doesn't reliably drive D+ pullup from a passive UDC bind alone
+# (no usb-role-switch / TCPC in mainline → dwc3's auto-connect path doesn't
+# fire). Force a soft-disconnect + reconnect to re-issue the pullup.
+SOFT="/sys/class/udc/$UDC/soft_connect"
+if [ -e "$SOFT" ]; then
+	sleep 1
+	log "disconnecting via soft_connect"
+	echo disconnect > "$SOFT" 2>/dev/null || log "disconnect failed"
+	sleep 1
+	log "reconnecting via soft_connect"
+	echo connect > "$SOFT" 2>/dev/null || log "connect failed"
+	sleep 1
+	log "after-cycle state=$(cat /sys/class/udc/$UDC/state 2>/dev/null)"
+	log "after-cycle soft_connect=$(cat /sys/class/udc/$UDC/soft_connect 2>/dev/null)"
+else
+	log "soft_connect attribute missing at $SOFT"
+fi

@@ -1,0 +1,19 @@
+[Unit]
+Description=Configure CDC-NCM + CDC-ACM USB gadget (felix mainline)
+# Run AFTER getty / login prompts are rendered. The script writes verbose
+# [USB-GADGET] / [DWC3-DBG] traffic to /dev/kmsg, which intermixes with
+# agetty's terminal-size probe sequence on ttySAC0; running early made
+# login-prompt rendering intermittent. Putting this after getty.target
+# means agetty's probe completes (and the prompt is drawn) before the
+# gadget service starts and writes to kmsg.
+After=getty.target sys-kernel-config.mount
+Requires=sys-kernel-config.mount
+ConditionPathExistsGlob=/sys/class/udc/*
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/usb_gadget
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
