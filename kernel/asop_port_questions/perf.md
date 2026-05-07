@@ -30,6 +30,7 @@ in this checkout.
 
 ## Boot-relevance reasoning
 
-Profiling is a debug feature. The kernel boots, mounts UFS (or fails to), and runs
-userspace independent of whether perf counters are exported. Score 1 — completely
-orthogonal to the UFS HS-Rate-B problem.
+Profiling is a debug feature. The kernel boots, mounts UFS HS-G4 Rate-B
+ext4, and runs userspace independent of whether perf counters are
+exported. Score 1 — completely orthogonal to the active partial bring-up
+(USB gadget HS RX path).

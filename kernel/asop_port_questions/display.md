@@ -19,4 +19,19 @@ Effectively everything: DECON for gs201, DPP for gs201, MIPI-DSIM register set f
 
 ## Boot-relevance reasoning
 
-The kernel boots, mounts root, and runs systemd/kmscon entirely over the serial UART today; the panel is dark and the user has explicitly accepted that. Display has zero impact on the active boot blockers (UFS HS-gear wedge, AOC firmware loading). Score is 2 rather than 1 only because in the long run a real display would be nice to have; in the short run it is pure post-boot peripheral work and competes for attention with UFS.
+The kernel boots, mounts root from UFS HS-G4 Rate-B, and runs systemd/kmscon
+entirely over the serial UART today; the panel is dark and the user has
+explicitly accepted that. Display has zero impact on the current open work
+(USB gadget HS RX path). Score 2 rather than 1 only because in the long run
+a real display would be nice to have; short-term this is pure post-boot
+peripheral work.
+
+## 7.1 rebase impact
+
+The reference snapshot indicates recent gs101 DPU / cmu_dpu activity in
+mainline 7.1. That doesn't add any gs201 display capability directly, but it
+does provide a more complete template for any future port: the gs101 DPU
+driver, when it lands, will be the model for a gs201 DPU driver. The DECON
+register layouts between gs101 and gs201 are similar but not identical
+(same shape as the rest of the gs201-vs-gs101 deltas), so even after rebase
+this remains a from-scratch port.

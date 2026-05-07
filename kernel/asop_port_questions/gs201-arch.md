@@ -46,10 +46,23 @@ What mainline lacks that AOSP gs201 ships:
 
 ## Boot-relevance reasoning
 
-**Score 10**: gs201 *is* the platform we're booting. Every driver gap discussed in the other gs-* files compounds here. The most impactful gaps for current state:
-- Missing **HSI2 CMU clock entries** → UFS clocks are fixed-clocks → HS gear can't be programmed correctly (very likely root cause).
-- Missing **HSI0 PD driver** → UFS analog island sequencing left to BL31, possibly incomplete for HS PMC.
-- Missing **PMIC + regulator** → can't tweak UFS rails for HS.
-- Missing **ACPM** → MIF/INT can't follow UFS bandwidth requests.
+**Score 10**: gs201 *is* the platform we're booting. Every driver gap
+discussed in the other gs-* files compounds here. As of 2026-05-07, boot
+itself reaches a kmscon login on UART with `ssh.service` listening, ext4
+rootfs mounted from UFS HS-G4 Rate-B. The remaining gaps that still bite:
 
-This is the umbrella module-name; concretely, focus first on porting the gs201 HSI2 entries in `clk-gs101.c` (or, ideally, splitting gs201 into its own `clk-gs201.c`) so `ufs_aclk` becomes a real CCF clock with reprogrammable dividers. That alone will likely change UFS HS behavior. See [gs-clk.md](gs-clk.md), [gs-soc.md](gs-soc.md).
+- Missing **HSI0 PD driver** (`exynos-pd_hsi0.c`) → USB PHY-rail sequencing
+  is left to BL31. Currently a credible suspect for the Phase A USB gadget
+  EP0 RX silence (see [gs-soc.md](gs-soc.md)).
+- Missing **PMIC + regulator** (s2mpg12/13) → all 8 USB supplies go through
+  a fixed-1V8 stub; can't sequence PHY rails properly. See
+  [gs-mfd.md](gs-mfd.md), [gs-regulator.md](gs-regulator.md).
+- Missing **ACPM** → MIF/INT can't follow bandwidth requests; CPU/MIF/GPU
+  pinned at boot rates.
+- Missing **gs201 SS PMA register table** → Phase B.5 SuperSpeed debt; HS
+  works but SS PLL never locks.
+
+Historical (resolved): UFS HS gear was the primary bring-up blocker through
+2026-05-05; fixed by upstream patches 0010 + 0011. The HSI2 CMU clock-rate
+hypothesis was investigated and ruled out — see [gs-clk.md](gs-clk.md),
+[gs-soc.md](gs-soc.md), [gs-ufs.md](gs-ufs.md).

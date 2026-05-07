@@ -40,11 +40,27 @@ at all — there's no battery node, no charger node, nothing on the charging I2C
 
 ## Boot-relevance reasoning
 
-Felix's UFS rail (`ufs_fixed_vcc`) is a GPIO-controlled fixed regulator off `gpp0-1` —
-not a PMIC rail. The kernel boot path doesn't touch the charger or fuel gauge to get a
-mounted rootfs. With a charged battery (or USB power supplied) the SoC just runs; without
-any battery driver the kernel will assume AC-powered and proceed. Score 2 because (a) it
-has zero relationship to UFS HS-Rate-B (the only real blocker), and (b) the absence of a
-charger driver only becomes painful for sustained operation (no charge management → battery
-drains, but boot completes). Bumped from 1 only because long-running kernel-hacking
-sessions on the device benefit from working charging.
+Felix's UFS rail (`ufs_fixed_vcc`) is a GPIO-controlled fixed regulator off
+`gpp0-1` — not a PMIC rail. The kernel boot path doesn't touch the charger
+or fuel gauge to get a mounted rootfs. With a charged battery (or USB power
+supplied) the SoC just runs; without any battery driver the kernel will
+assume AC-powered and proceed. Score 2 because (a) it had zero relationship
+to the (now-resolved) UFS HS-Rate-B blocker, and (b) the absence of a
+charger driver only becomes painful for sustained operation (no charge
+management → battery drains, but boot completes). Bumped from 1 only
+because long-running kernel-hacking sessions on the device benefit from
+working charging.
+
+**MAX77759 caveat for the USB gadget bring-up task:** felix's charger lives
+on the same MAX77759 chip whose TCPC subfunction is what Phase B
+(full DRD) depends on (see [typec.md](typec.md)). The two halves are
+distinct subfunctions, so a Phase B port can stop at the TCPC half — but
+anyone porting the TCPC will see this file's silicon list and may want to
+double-up.
+
+## 7.1 rebase impact
+
+`max77759` and `max77779` still have no upstream charger drivers as of the
+7.1-rc2 snapshot in `reference_mainline_gs201_status.md`. No rebase impact
+expected on this file; if/when a `max77759-charger` driver lands upstream,
+update this file's status line.

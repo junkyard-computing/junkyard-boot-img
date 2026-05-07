@@ -23,5 +23,11 @@ Entire vendor stack. Without it: DDR runs at whatever rate BL31/the bootloader l
 
 ## Boot-relevance reasoning
 
-5/10. Boot succeeds with DDR pinned to a single rate. However, **bus-fabric clocks affect UFS performance** — at PWM gear the IO traffic is small enough that any DDR rate is fine, but if UFS HS comes online, we'd want DRAM scaled up to keep up. Score 5 because (a) doesn't block boot, (b) once HS-Rate-B works, devfreq absence will become a perf bottleneck for I/O-bound workloads, (c) memlat/dsulat governors have nothing equivalent in mainline.
+5/10. Boot succeeds with DDR pinned to a single rate. **Now that UFS
+HS-G4 Rate-B works** (fixed 2026-05-06), the devfreq absence is the next
+real perf bottleneck for I/O-bound workloads — DDR/MIF/INT all stay at
+boot rate while UFS could push significantly more bandwidth. Score 5
+because (a) doesn't block boot, (b) memlat/dsulat governors have nothing
+equivalent in mainline, (c) any port depends on ACPM IPC being available
+to drive MIF DVFS — see [gs-soc.md](gs-soc.md).
 

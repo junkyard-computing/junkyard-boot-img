@@ -3,7 +3,7 @@
 - **AOSP path**: `private/google-modules/soc/gs/drivers/soc/google/`
 - **Mainline counterpart**: partial (`drivers/soc/samsung/exynos-pmu.c` covers PMU only; `drivers/soc/samsung/exynos-chipid.c` covers chipid; nothing else)
 - **Status**: not-ported (most subsystems)
-- **Boot-relevance score**: 2/10 (downgraded from 9 → 5 → 2; D2 verification 2026-05-02 confirmed PD_HSI0 doesn't apply to UFS on felix)
+- **Boot-relevance score**: 2/10 for boot; 8/10 for the USB gadget bring-up task (D2 verification 2026-05-02 confirmed `EXYNOS_PD_HSI0` is a **USB power-island driver**, not a UFS one; with UFS HS now fixed the relevance shifts to USB)
 
 ## What it does
 
@@ -66,4 +66,17 @@ What's left in this directory that's still potentially useful (but lower-relevan
 - **debug-snapshot, ITMON**: would help diagnose bus errors if we hit any, but our wedge has no bus-error signature.
 - **GSA / S2MPU**: needed before any peripheral marked protected by the bootloader can talk over the bus.
 
-None is on the path to fixing the dl_err 0x80000002 wedge.
+None was on the path to fixing the dl_err 0x80000002 wedge (now resolved by
+patches 0010 + 0011 in the UFS path; see [gs-ufs.md](gs-ufs.md)).
+
+**For the USB gadget bring-up task**: `exynos-pd_hsi0.c` is suddenly
+relevant. The HSI0 power island contains the USB31DRD controller, the
+USB31DRD PHY, the eUSB2 PHY + repeater, and their associated rails
+(`vdd_hsi/vdd30/vdd18/vdd085`). On mainline today we route all 8 USB
+supplies through a single `reg_placeholder` fixed-1V8 stub and rely on the
+bootloader to have left HSI0 in a usable PD state. That has been enough to
+get HS chirp + line-state events firing, but it does **not** sequence the
+PHY rails through the AOSP-style power-stable handshake — and given that
+our open Phase A blocker is "PHY analog edges work but HS RX path is dead",
+porting `exynos-pd_hsi0.c` (or at least its PHY-rail sequencing semantics)
+is now a credible suspect line of investigation. Score 8/10 for that task.

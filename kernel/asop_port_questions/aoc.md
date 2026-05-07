@@ -19,4 +19,28 @@ Everything is missing. There is no mainline AOC driver, no AOC device-tree bindi
 
 ## Boot-relevance reasoning
 
-Score 6/10. The system already boots without a kernel-side AOC driver because mainline never tries to boot AOC, never claims its IRQ, and never reads/writes its mailbox. The "AOC starves UART RX" failure mode that bit us was an *AOC firmware retry-loop* problem solved entirely in userspace by dropping `/vendor/firmware/*` blobs into the rootfs and adding `firmware_class.path=/vendor/firmware` to the cmdline — once the firmware request resolves, the bootloader-launched AOC stops thrashing. So for the literal "does it POST and reach a login prompt" question the answer is "no porting needed." However, AOC is the gateway to a huge swath of the Pixel's interesting hardware: the on-die microphones, the low-power sensor hub, hotword detection, USB audio offload, and low-power audio playback all funnel through AOC services. Without this driver, none of that hardware is reachable from Linux. The score would be 9-10 if AOC's absence broke boot, but it doesn't — so 6 reflects "important subsystem, big future-work flag, post-boot value only." This is the highest-value but also the hardest-to-port AOSP module in the tree.
+Score 6/10. The system already boots without a kernel-side AOC driver because
+mainline never tries to boot AOC, never claims its IRQ, and never reads/writes
+its mailbox.
+
+History note: there was a brief period where we suspected an "AOC starves UART
+RX" failure mode and tried to mitigate it by dropping `/vendor/firmware/*`
+blobs into the rootfs (with `firmware_class.path=/vendor/firmware` on the
+cmdline). That was the **AOSP-side** UART RX issue, not the mainline one. On
+mainline, AOC never spins up because no driver is bound, so it doesn't
+actually retry-loop on missing firmware and doesn't actually starve UART RX.
+The real mainline UART RX bug was a binding-doc trap in `samsung_tty`
+(`samsung,exynos850-uart` selects 8-bit MMIO; gs201's UART block needs 32-bit
+access). Switching the DT compat to `google,gs101-uart` (UPIO_MEM32) fixed
+RX. The `/vendor/firmware` install is kept as belt-and-suspenders, not as a
+real fix — see [gs-tty.md](gs-tty.md).
+
+So for the literal "does it POST and reach a login prompt" question the
+answer is "no porting needed." However, AOC is the gateway to a huge swath of
+the Pixel's interesting hardware: the on-die microphones, the low-power
+sensor hub, hotword detection, USB audio offload, and low-power audio
+playback all funnel through AOC services. Without this driver, none of that
+hardware is reachable from Linux. The score would be 9-10 if AOC's absence
+broke boot, but it doesn't — so 6 reflects "important subsystem, big
+future-work flag, post-boot value only." This is the highest-value but also
+the hardest-to-port AOSP module in the tree.

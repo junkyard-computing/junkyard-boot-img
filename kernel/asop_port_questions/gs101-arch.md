@@ -27,4 +27,27 @@ Same general gap pattern as gs201: ACPM, DVFS Manager, S2MPU, SysMMU v8/v9, gsa,
 
 ## Boot-relevance reasoning
 
-**Score 5**: gs101 is not the SoC in felix, so gs101-specific code paths don't run on our hardware. The score reflects "indirectly important" — every patch that lands for gs101 in mainline is one we benefit from because gs201 inherits or extends those patterns. Concretely, when we want to bring up a missing gs201 CMU domain or PD, the gs101 mainline implementation is the template. Watch gs101 mainline activity as a leading indicator for gs201 features that will be easy to extend. Direct UFS impact: zero, unless a gs101 UFS PHY patch exposes a quirk also relevant to gs201 (which our [upstream-patches/](upstream-patches/) tree already tracks).
+**Score 5**: gs101 is not the SoC in felix, so gs101-specific code paths
+don't run on our hardware. The score reflects "indirectly important" —
+every patch that lands for gs101 in mainline is one we benefit from because
+gs201 inherits or extends those patterns. Concretely, when we want to bring
+up a missing gs201 CMU domain or PD, the gs101 mainline implementation is
+the template. Watch gs101 mainline activity as a leading indicator for
+gs201 features that will be easy to extend.
+
+## 7.1 rebase impact
+
+The big upstream movement to watch in 7.1 (per
+`reference_mainline_gs201_status.md`):
+
+- **gs101 USB DT + clock controller now full upstream.** Our gs201 USB
+  Phase A wrapper extends `phy-exynos5-usbdrd.c` directly, sitting on top
+  of the gs101 USB DRD compat. Anything new in 7.1 will affect us
+  transitively. See [gs-usb.md](gs-usb.md), [gs-phy.md](gs-phy.md).
+- **gs101 cmu_dpu work** (recent activity per the snapshot). Template for
+  any future gs201 DPU port. See [display.md](display.md),
+  [gs-clk.md](gs-clk.md).
+- **S2MPG11 ACPM PMIC scaffold (Feb 2026, gs101 sub-PMIC).** First in-tree
+  template for the Samsung-ACPM-PMIC pattern. When we port S2MPG12/13
+  (gs201) it should follow this shape, not the AOSP MFD core. See
+  [gs-mfd.md](gs-mfd.md), [gs-regulator.md](gs-regulator.md).

@@ -2,8 +2,8 @@
 
 - **AOSP path**: `private/google-modules/soc/gs/drivers/ufs/`
 - **Mainline counterpart**: `drivers/ufs/host/ufs-exynos.c` (+ `phy/samsung/phy-gs101-ufs.c`, `phy-samsung-ufs.c`)
-- **Status**: partially-ported
-- **Boot-relevance score**: 10/10
+- **Status**: mostly-ported (HS-G4 Rate-B lockup fixed 2026-05-06; remaining gaps are upstream-quality, not boot)
+- **Boot-relevance score**: 10/10 (historical — was the primary blocker through 2026-05-05; now resolved)
 
 ## What it does
 
@@ -33,5 +33,49 @@ The CAL infrastructure (`gs201/ufs-cal-if.c`) is **not** ported as a self-contai
 
 ## Boot-relevance reasoning
 
-10/10. UFS HS gear is the single open boot blocker — system is stuck at PWM 5–10 MB/s, dl_err 0x80000002 (TCx_REPLAY_TIMER_EXPIRED) on the first frame after pwr_change at every HS gear and both rates. The `ufs30_cal_wait_cdr_lock` kick-start writes to PMA byte 0x888 are the most plausible single missing piece (CDR-lock never advances on mainline; AOSP's wait-loop literally pokes the PHY between polls). `exynos_ufs_get_caps_after_link` + `exynos_ufs_update_active_lanes` are required to make any cal-table walk that gates on `connected_*_lane`/`active_*_lane`/`max_gear` apply the right entries — these are cheap to port and a prerequisite for any further cal-faithfulness work. This module is the entire ballgame for the active blocker.
+10/10 (historical). UFS HS gear was the single open boot blocker through
+2026-05-05 — system stuck at PWM 5–10 MB/s, dl_err 0x80000002
+(TCx_REPLAY_TIMER_EXPIRED) on the first frame after pwr_change at every HS
+gear and both rates. **Fixed 2026-05-06 by upstream patches 0010 and 0011**:
+
+- **0010 — three missing cal-if writes on the 38.4 MHz refclk path.** Single
+  writes in `tensor_gs101_pre_init_cfg`, `gs101_ufs_pre_link`, and
+  `gs201_ufs_post_link` that AOSP's systematic cal-if walk includes and
+  mainline's open-coded tables didn't. With these, M-PHY CDR locks first
+  iteration and link startup completes. (The earlier-suspected
+  `ufs30_cal_wait_cdr_lock` PMA-byte-0x888 kick-start turned out **not** to
+  be the missing piece — once the cal-if writes from 0010 land, CDR locks
+  cleanly without any kick.)
+- **0011 — pin `FMPSECURITY0.DESCTYPE = 0`.** The most load-bearing patch in
+  the series. Without it every multi-PRD read or write hangs on gs201
+  mainline (PWM and HS alike). The downstream FMP SMC pair leaves DESCTYPE
+  in whatever state the last secure call set it to; setting it explicitly
+  matches the controller's `sg_entry_size`.
+
+What's still in the AOSP backlog (no longer boot-blocking, but
+upstream-quality TODOs):
+
+- The remaining `__set_pcs` / `exynos_ufs_get_caps_after_link` /
+  `exynos_ufs_update_active_lanes` / `exynos_ufs_init_pmc_req` divergences
+  documented below are now cosmetic — none of them blocked HS lock once
+  patches 0010 + 0011 landed. They remain worth porting before sending the
+  series to LKML, since AOSP's behaviour is more robust for cross-gear /
+  cross-lane configurations.
+- The PWM back-to-back-READ_10 wedge (the controller-level race documented
+  in question D of the upstream-help email) is no longer a primary concern
+  because we no longer use PWM as a workaround. Note: a reproducer is still
+  available if Google's UFS team wants to compare HCI register state.
+
+## 7.1 rebase impact
+
+Our 12 UFS-related patches (0001 through 0012) live in
+`drivers/ufs/host/ufs-exynos.c` and `drivers/phy/samsung/phy-gs101-ufs.c`.
+Patches 0004, 0007, 0009, 0010 specifically modify the
+`tensor_gs101_*_config` arrays and PMA-register writes; if mainline 7.1
+re-touches the same arrays, rebase will surface conflicts. Re-grep for
+`tensor_gs101_pre_init_cfg`, `gs101_post_pwr_hs_config`, and the
+`PHY_PMA_TRSV_ADDR` macro after the rebase. Patches 0001 (IOCC bits),
+0002 (PRDT_BYTE_GRAN), 0003 (DMA mask), 0005 (PRDT prefetch), 0010 (cal-if
+writes), 0011 (FMPSECURITY0.DESCTYPE) are local to `ufs-exynos.c` and
+likely conflict-free unless upstream also added gs201-specific quirks.
 

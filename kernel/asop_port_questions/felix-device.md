@@ -46,4 +46,29 @@ Mainline has only `gs201-felix.dts` (~93 lines, vs ~3000 lines if you sum the AO
 
 ## Boot-relevance reasoning
 
-**Score 6**: the *boardfile* part of felix-device is what lets the kernel know it's a felix at all. Without `gs201-felix.dts` we couldn't pick the right DTB at boot. We have it — sparse but functional. Most of the missing dtsi data (display, touch, charger, camera) is post-boot peripheral wiring; without it the device boots to console (which we have) but you can't drive the screen or take input from touch. UFS is independent of felix-specific board data — UFS is wired in `gs201.dtsi`, not in any `felix-*.dtsi` (verified by greping the AOSP tree: only `gs201-sysreg-hsi2` reference appears, no felix-side UFS). So this doesn't affect HS gear bring-up. The score is moderate because expanding the boardfile is the gating step for everything past console (display, touch, audio, battery). For the user's stated focus (UFS), this directory is a 3.
+**Score 6**: the *boardfile* part of felix-device is what lets the kernel
+know it's a felix at all. Without `gs201-felix.dts` we couldn't pick the
+right DTB at boot. We have it — and as of the Phase A USB work it now
+contains: the gs201 USB DT remap (controller `0x11210000`, PHY
+`0x11200000`, PMA `0x11100000`, IRQ 379), the `reg_placeholder` fixed-1V8
+stub for all 8 USB supplies, the gadget-mode dwc3 properties, the UART
+`google,gs201-uart` compat, and the felix-specific HSPPARACON tune values.
+Most of the missing dtsi data (display, touch, charger, camera) is
+post-boot peripheral wiring; without it the device boots to console (which
+we have) but you can't drive the screen or take input from touch. UFS HS-G4
+Rate-B works without any felix-side UFS DT (UFS is wired in `gs201.dtsi`,
+not in any `felix-*.dtsi`). The score is moderate because expanding the
+boardfile is the gating step for everything past console.
+
+For the AOSP-side authoritative reference: `gs201-felix-usb.dtsi` carries
+the felix `&usb_hs_tune` block and TCPC node definitions; this is what we
+should consult when adding the MAX77759 TCPC node in Phase B.
+
+## 7.1 rebase impact
+
+`gs201-felix.dts` lives in our submodule on the `felix` branch and is the
+file we own outright; the rebase on 7.1 will not move it. What may move
+underneath it: any `gs201.dtsi` (parent) changes that mainline adds in 7.1.
+Re-grep `arch/arm64/boot/dts/exynos/google/gs201.dtsi` for new nodes after
+the rebase — if mainline adds a USB or UFS node we currently override, our
+felix.dts may need adjustment.

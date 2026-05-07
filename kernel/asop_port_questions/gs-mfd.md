@@ -32,4 +32,18 @@ Everything for s2mpg10/11/12/13/14/15 — MFD cores, IRQ controllers, GPIO expan
 1. Mainline's `ufs-exynos.c` won't get a useful regulator handle for VCC/VCCQ, so calls like `regulator_set_voltage()` / `regulator_set_load()` for power-mode-change become no-ops. Some PHY-init sequences expect to bump VCCQ briefly during HS gear change.
 2. Without the s2mpg12 RTC subdriver mainline has no battery-backed RTC.
 
-The PMIC is unlikely to be the root cause of HS-Rate-A/B wedge (we'd see broader instability if rails were under-volted), but it's plausibly contributing — and porting it is a prerequisite for any UFS-rail experiment. Score 8 reflects "boot-critical infrastructure, currently invisible to the kernel."
+The PMIC was suspected but ruled out for the UFS HS bring-up (now fixed by
+patches 0010 + 0011 — see [gs-ufs.md](gs-ufs.md)). It remains 8/10 because
+the rest of the SoC's power management depends on it: USB PHY rails, GPU
+rails, MIF/CPU/INT DVFS rails, and so on.
+
+## 7.1 rebase impact
+
+Mainline 7.1 includes a **first ACPM-mediated PMIC scaffold** for S2MPG11
+(the gs101 sub-PMIC; landed Feb 2026 per the
+`reference_mainline_gs201_status.md` snapshot). That's the **first in-tree
+template** for the Samsung-ACPM-PMIC pattern that S2MPG12/13 fit. When we
+do port S2MPG12/13 we should follow the S2MPG11 driver's shape rather than
+porting the AOSP MFD core directly — the upstream-quality implementation
+will look more like S2MPG11 than like AOSP's `s2mpg13-core.c`. Re-read
+`drivers/mfd/` after the rebase before starting any S2MPG12/13 work.

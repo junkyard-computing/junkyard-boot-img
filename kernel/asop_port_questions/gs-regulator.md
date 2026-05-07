@@ -35,4 +35,16 @@ Together they let the kernel actually change voltages on every rail of the SoC.
 - set the regulator load mode (high-current PWM vs low-current PFM) when crossing gears
 - query the actual rail voltage to validate against the spec
 
-This is plausibly a contributor to HS-Rate-A/B wedge — at least it deserves to be ruled in or out. But it's secondary to the clock controller (see [gs-clk.md](gs-clk.md)) which is more directly suspect.
+UFS HS-G4 Rate-B was fixed (2026-05-06) without porting any of the
+s2mpg12/13 regulator code (patches 0010 + 0011 in [gs-ufs.md](gs-ufs.md)
+were the resolution), so the PMIC was a non-cause for that bring-up.
+Score 8 reflects the broader importance of having real regulator handles
+for any future power-management work (USB suspend/resume, GPU DVFS, etc.).
+
+## 7.1 rebase impact
+
+Mainline 7.1 includes the S2MPG11 ACPM regulator driver (Feb 2026). Same
+template story as in [gs-mfd.md](gs-mfd.md): when we port S2MPG12/13
+regulators we should follow the S2MPG11 driver's shape, not the AOSP
+`s2mpg1X-regulator.c` directly. Re-read `drivers/regulator/` after the
+rebase before any port work.
