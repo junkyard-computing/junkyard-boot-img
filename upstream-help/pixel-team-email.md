@@ -1,19 +1,25 @@
 To: <PIXEL TEAM CONTACT>
-Subject: Mainline Linux on Pixel Fold (gs201) — UFS HS-G4 + serial-getty working, 15 upstream patches, a few questions
+Subject: Mainline Linux on Pixel Fold (gs201) — UFS HS-G4 + serial-getty + USB peripheral up to host enumeration, a few questions
 
 Hi <NAME>,
 
 I've been bringing up mainline Linux on a Pixel Fold (felix / Tensor G2).
 The end goal is a Debian rootfs from `/dev/disk/by-partlabel/super`,
 kernel built straight from Linus's tree (not the AOSP gs201 fork).
-Current state on real hardware as of 2026-05-03:
+Current state on real hardware as of 2026-05-06:
 
   - UFS reaches HS-G4 Rate-B with both lanes locked, ext4 rootfs mounts.
   - Bidirectional UART works — `serial-getty@ttySAC0` is active and
-    I can `ssh`-equivalent log in over the serial console as
-    `kalm@fold`.
+    I can log in over the serial console as `kalm@fold`.
   - systemd reaches multi-user.target at ~[42 s], `ssh.service` is
-    listening (only blocker to actual SSH is DWC3, see question E).
+    listening.
+  - USB peripheral mode: dwc3-exynos + phy-exynos5-usbdrd now probe,
+    the UDC `11210000.usb` registers, configfs-gadget binds (CDC-NCM
+    + CDC-ACM composite), and the host enumerates a HS device. **But
+    no SETUP packet ever reaches dwc3's EP0 OUT TRB**, so EP0 control
+    transfers fail (`device descriptor read/64, error -71` on the
+    host side). See question E — that's the new blocker on getting
+    SSH-over-USB running.
 
 15 upstream-eligible patches have come out of this — the original 6
 UFS fixes I started with, plus 6 more UFS/PHY follow-ups discovered
@@ -276,17 +282,143 @@ D. **Sustained PWM operation wedges the controller silently — second
      to see if any latched state differs.
 
 
-E. **Why does mainline gs201 not probe DWC3 at all?** Mainline
-   defconfig has `CONFIG_USB_DWC3=y` and `CONFIG_USB_DWC3_EXYNOS=y`,
-   the gs201.dtsi has `compatible = "samsung,exynos850-dwusb3"` and
-   `compatible = "snps,dwc3"` (gs201.dtsi:790, 799), and yet our
-   boot log shows zero `dwc3` lines in dmesg — only the usbcore
-   class registrations. Is there a Tensor-specific role-switch /
-   PD-controller driver missing (Maxim PMIC?), or is the DTS just
-   incomplete and we need to graft from gs101.dtsi (which has the
-   USBDRD31 PHY + controller scaffolding fully wired)? This is the
-   only thing standing between us and an SSH-reachable mainline
-   Debian on felix.
+E. **What configures gs201's HS USB PHY RX path on top of the gs101
+   mainline driver?** Mainline `phy-exynos5-usbdrd.c` (gs101 binding)
+   and `dwc3-exynos.c` can drive gs201 USB up to the point of host
+   HS enumeration, but the EP0 RX path goes silent — line-state
+   events fire repeatedly, no actual SETUP packet ever lands. The
+   open question is what register sequence is missing.
+
+   **What works (after DT remap and a few mainline patches):**
+   - DT: gs201's HSI0 register layout is shifted from gs101 — controller
+     wrapper at `0x11210000` (not `0x11110000`), IRQ 379 (not 463),
+     PHY base `0x11200000` size 0x200, "pcs" `0x110f0000`, "pma"
+     `0x11100000` size 0x2800. Address shifts confirmed against
+     AOSP `private/devices/google/gs201/dts/gs201.dtsi`. We pin
+     dr_mode = "peripheral" and route all 8 PHY/dwc3 supplies through
+     a single fixed-1V8 always-on stub since S2MPG12/13 PMIC drivers
+     don't exist mainline yet.
+   - PHY ref clock: cmu_hsi0's user-mux reports back the bootloader
+     PLL rate (~614 MHz on a Phase A boot) and trips the PHY driver's
+     strict-rate check, so we feed `phy_ref` from a 26 MHz fixed-clock
+     stub.
+   - Driver: a `google,gs201-usb31drd-phy` compat in
+     phy-exynos5-usbdrd.c with `phy_cfg_gs201` (UTMI same as gs101,
+     PIPE3 a no-op since the gs101 PIPE3 init crashes ep0out DEPCFG
+     on gs201 — gs101 PMA register layout doesn't apply) and a
+     `gs201_tunes_utmi_postinit` HSPPARACON tune block matching AOSP
+     felix's `&usb_hs_tune` (TXVREF=8, TXRES=3, TXPREEMPAMP=1,
+     SQRX=2, COMPDIS=7).
+   - dwc3 core: SOFITPSYNC=1 when `dis_u2_freeclk_exists_quirk` is
+     set (matches AOSP's dwc3-exynos behavior; mainline only set
+     SOFITPSYNC for host/OTG via the 210A–250A workaround).
+
+   With the above, we get to: UDC creates, configfs-gadget binds,
+   `/dev/ttyGS0` exists, soft-disconnect/connect cycle moves UDC to
+   `state=default`, host sees `new high-speed USB device number N
+   using xhci_hcd`.
+
+   **Where it breaks:** `device descriptor read/64, error -71`
+   (EPROTO) on the host, infinite retry. Instrumented dwc3 with
+   `dev_info` patches at `dwc3_gadget_reset_interrupt`,
+   `dwc3_gadget_conndone_interrupt`, `dwc3_process_event_entry`, and
+   `dwc3_ep0_inspect_setup`, plus a register dump in
+   `dwc3_ep0_out_start`. Over a single host enumeration storm we get
+   thousands of:
+
+     - `DWC3-DBG: reset_interrupt entry`            (~1500 events)
+     - `DWC3-DBG: conndone HIGHSPEED ep0 maxpkt=64` (~1500 events)
+     - `event devt_type=6` (SUSPEND/EOPF)            (~330 events)
+     - **0** `ep0 inspect_setup` events
+     - **0** endpoint events of any kind (no `is_devspec=0` events
+       ever appear in the ring — only device-level events)
+
+   So: line-state events fire (PHY analog edge detection works, HS
+   chirp completes), the ep0 SETUP TRB is armed exactly once at
+   gadget bind (`dwc3_ep0_out_start ret=0`), but no DEPEVT
+   XFERCOMPLETE on ep0 OUT after each conndone — meaning host SETUP
+   bytes never make it from the PHY into the controller's RX FIFO.
+
+   **Register state at the time of bind, captured by our dump
+   patch in `dwc3_ep0_out_start`:**
+
+   ```
+   GUSB2PHYCFG=0x00102500  PHYIF=0 (8-bit UTMI), USBTRDTIM=9,
+                           ENBLSLPM=1, SUSPHY=0, U2_FREECLK_EXISTS=0
+   GCTL=0x30c12404         SOFITPSYNC=1, PRTCAP=2 (device)
+   DCTL=0x00f00000         RUN_STOP=0 (set later), KEEP_CONNECT=0
+   DSTS=0x00d20204         DEVCTRLHLT=1 (pre-RUN), USBLNKST=0x4
+                           (USB3 Disabled — no SS partner, expected),
+                           CONNECTSPD=4 (SS — controller default
+                           before HS chirp; flips to 0 after CONDONE)
+   ```
+
+   **Hypotheses we've tried (each: build, flash, capture UART, plug
+   in USB-2 cable, capture host dmesg). None moved the symptom:**
+
+   1. **`G2PHY_CNTL0/CNTL1` ss_cap power-stable handshake** at
+      offsets 0x8c / 0x90 (`ANA_PWR_EN | PCS_PWR_STABLE |
+      PMA_PWR_STABLE` on CNTL1; `UPCS_PWR_STABLE` set,
+      `TEST_POWERDOWN` cleared on CNTL0). Mainline gs101 driver
+      doesn't touch these; AOSP's `phy_exynos_usb_v3p1_enable()`
+      ss_cap branch does. **No effect** on RX symptom.
+
+   2. **Clear `HSP_EN_UTMISUSPEND` and `HSP_COMMONONN`** after the
+      gs101 init sets them. AOSP felix sets `common_block_disable=0`
+      in DT, which makes its phy enable fn skip both bits. **No
+      effect.**
+
+   3. **PHYIF = 16-bit UTMI** (`phy_type = "utmi_wide";` on the
+      dwc3 child). Confirmed via reg dump that the controller now
+      programs `PHYIF=1, USBTRDTIM=5`, but symptom unchanged. **No
+      effect** — so the PHY-to-controller UTMI width is correct at
+      the default 8-bit (which matches HW reset).
+
+   4. **`CLKRST_LINK_PCLK_SEL`** in the SS PHY init. Mainline gs101's
+      `usbdp_g2_v4_ctrl_pma_ready()` sets this; our gs201 PIPE3 init
+      is a no-op (the rest of `ctrl_pma_ready` crashes ep0out
+      DEPCFG). Setting just this single bit also breaks ep0out enable
+      with `failed to enable ep0out`. So the link's pipe_pclk source
+      genuinely needs the SS PMA to come up — but the SS PMA path
+      uses gs101 PMA register offsets that don't apply to gs201, and
+      we don't have the gs201 PMA register reference.
+
+   5. The `snps,dis-u2-freeclk-exists-quirk` route — set, then
+      cleared, both produce the same EPROTO. (AOSP's gs201 DT
+      doesn't set the quirk; mainline behavior depends on whether
+      the U2 PHY actually has a free clock, and we can't tell from
+      here.)
+
+   **Specific questions for someone with gs201 PHY context:**
+
+   - Is the AOSP gs PHY driver
+     `private/google-modules/soc/gs/drivers/phy/samsung/phy-exynos-usb3p1.c`
+     (~2500 lines, Samsung CAL-based) the canonical reference for
+     gs201 USB PHY register sequences, the same way the cal-if SFR
+     table is canonical for the CMU layouts? We've been treating it
+     as such, but a confirmation would help — and a pointer to the
+     gs201-specific datasheet section that covers the HS RX bring-up
+     sequence (if such a doc exists internally) would save a lot of
+     empirical bisecting.
+
+   - The pattern "many RESET + many CONNECT_DONE, zero endpoint
+     events, EP0 SETUP TRB armed once and never completed" — does
+     that ring a bell as a known gs201 silicon quirk? It feels
+     specifically like the PHY's HS RX analog block isn't enabled
+     (or isn't calibrated) even though chirp/J-K detection works.
+     Is there a CAL hook on the AOSP side that runs after CONNECT_DONE
+     to enable HS RX, that mainline's `phy_init` lifecycle wouldn't
+     hit?
+
+   - If it'd be easier to share an HCI register dump from a working
+     AOSP boot at the same point in time we wedge (right after host
+     enumeration starts), I can compare ours against it and probably
+     find the missing write myself.
+
+   For now we have UART login as a workaround, so this isn't
+   blocking the rest of the bring-up — but USB peripheral is the
+   last piece between us and an SSH-reachable mainline Debian on
+   felix without a UART cable.
 
 F. **Why does the gs201 secure firmware open CMU access only when
    EL2 is in pKVM?** We boot mainline with `kvm-arm.mode=protected`
