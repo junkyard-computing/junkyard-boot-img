@@ -216,10 +216,24 @@ This section indicates which AOSP modules are load-bearing for the **active
 partial bring-up**: gs201 USB peripheral mode (`dr_mode = "peripheral"`,
 HS-only, configfs CDC-NCM + CDC-ACM gadget). Phase A covers HS gadget; Phase B
 covers MAX77759 TCPC for full DRD; Phase B.5 covers the gs201 SS PHY tune
-table. State as of 2026-05-06: dwc3-exynos + phy-exynos5-usbdrd probe, UDC
-registers, gadget binds, host enumerates a HS device, **but no SETUP packet
-ever reaches dwc3's EP0 OUT TRB** (line-state events fire; zero endpoint
-events).
+table.
+
+**State as of 2026-05-08 (Phase G walks complete; G.11 fix in flight).**
+6 PHY hypotheses, 6 dwc3 hypotheses, dma-ranges, S2MPU stub, and CR-port
+force-write all NEGATIVE. Phase G.11 walk through AOSP
+`dwc3_exynos_core_init()` found a major divergence at the GFLADJ
+programming for DWC31 180A-190A: AOSP hardcodes 19.2 MHz values
+(DECR=0xc, PLS1=1, REFCLK_LPM_SEL=1, FLADJ=0); mainline computes from
+`clk_get_rate(dwc->ref_clk)`. **Instrumentation showed the rate
+returned is 614,400,000 Hz (= 32 × 19.2 MHz, the upstream PLL rate
+not the divided dwc3 reference)**, so mainline programs period=1ns
+instead of 52ns and GFLADJ ends up completely miscalibrated. HS
+chirp/handshake (link-state) survives this, but byte-level NRZI
+decode + ITP/SOF spacing don't — exactly matching the SETUP-no-show
+symptom we've been chasing. Phase G.11c fix dropped the inner dwc3
+node's `clocks/clock-names = "ref"` so `dwc->ref_clk = NULL` and the
+`snps,ref-clock-period-ns = <52>` override takes effect; result of
+that test is the next data point.
 
 Authoritative AOSP references for any porting decision:
 
@@ -250,7 +264,7 @@ Authoritative AOSP references for any porting decision:
 | Module | Score | Status | Note |
 |-------|-------|--------|------|
 | [gs-soc.md](gs-soc.md) | 8/10 (was 2/10 for UFS) | not-ported | `exynos-pd_hsi0.c` is the **HSI0 power-island driver**: it manages `vdd_hsi/vdd30/vdd18/vdd085` (USB PHY rails) and calls `eusb_repeater_update_usb_state()`. The "HSI0" name was the source of the earlier UFS confusion — it's actually the USB island. Mainline relies on whatever PD state BL31 left HSI0 in, which has worked so far for HS but may matter when bringing the SS PMA online. |
-| [gs-clk.md](gs-clk.md) | 8/10 (was 3/10 for UFS) | partially-ported | gs201 cmu_hsi0 is in mainline (USI0_UART path + USB ref clock fan-out). However the user-mux for the USB ref clock reports back the bootloader PLL rate (~614 MHz on Phase A boot), which trips `phy-exynos5-usbdrd`'s strict-rate check. We currently feed `phy_ref` from a 26 MHz fixed-clock stub. A real cmu_hsi0 USB ref clock entry that exposes the 26 MHz feed would replace the stub. |
+| [gs-clk.md](gs-clk.md) | **9/10** (was 3/10 for UFS, 8/10 pre-G.11) | partially-ported | gs201 cmu_hsi0 is in mainline but the USB ref-clock chain misreports the rate. **Two distinct knock-on effects on mainline USB**: (1) PHY-side, the user-mux returns ~614 MHz, tripping phy-exynos5-usbdrd's strict-rate check — workaround was a 26 MHz fixed-clock stub for `phy_ref`. (2) dwc3-side (Phase G.11, 2026-05-08), `clk_get_rate(dwc->ref_clk)` on `CLK_GOUT_HSI0_USB31DRD_I_USB31DRD_REF_CLK_40` also returns 614,400,000 Hz, causing dwc3 core to program GUCTL.REFCLKPER + GFLADJ with completely wrong values (period=1ns, fladj=78450, decr=0). Workaround: drop `clocks/clock-names="ref"` from inner dwc3 + `snps,ref-clock-period-ns = <52>;` override. **Both workarounds replaceable by fixing the gs101 clk driver's USB31DRD chain to expose the actual 19.2 MHz feed** (the clock name "REF_CLK_40" itself misleadingly suggests 40 MHz). |
 | [gs-mfd.md](gs-mfd.md) / [gs-regulator.md](gs-regulator.md) | 8/10 | not-ported (s2mpg12/13) | All 6 PHY supplies + 2 dwc3-exynos supplies are routed through a single fixed-1V8 always-on stub (`reg_placeholder`) because S2MPG12/13 PMIC drivers don't exist mainline. **For Phase A this is fine** — the rails are powered by the bootloader, the consumer paths don't reprogram them. For longer-term USB power management (suspend/resume, OTG VBUS control on a TCPC), the real PMIC stack matters. |
 
 ### Tier 3 — Type-C / DRD (Phase B)

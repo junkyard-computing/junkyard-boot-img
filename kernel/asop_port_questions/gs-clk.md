@@ -56,6 +56,41 @@ reports back the bootloader PLL rate (~614 MHz), which trips
 26 MHz fixed-clock stub. A real cmu_hsi0 USB ref clock entry that exposes
 the 26 MHz feed would replace that stub but is not on the critical path.
 
+**Related dwc3-side finding (Phase G.11, 2026-05-08).** The same
+614.4 MHz misreport bites the inner dwc3 controller too. Mainline
+`drivers/usb/dwc3/core.c:dwc3_ref_clk_period` does
+`clk_get_rate(dwc->ref_clk)` against the clock named "ref" on the
+inner `snps,dwc3` node (`CLK_GOUT_HSI0_USB31DRD_I_USB31DRD_REF_CLK_40`
+in our gs201.dtsi:1096) and uses the result to compute
+GUCTL.REFCLKPER + GFLADJ.REFCLK_FLADJ + GFLADJ.240MHZ_DECR + PLS1.
+Instrumented log shows:
+
+```
+DWC3-DBG: ref_clk_period rate=614400000 period=1ns fladj=78450 decr=0 lpm_sel=1
+GUCTL=0x00416802 GFLADJ=0x00b27220
+```
+
+— mainline programmed period=1ns instead of 52, fladj=78450 instead of 0,
+decr=0 instead of 25. HS bus timing relies on these being correct;
+chirp/handshake at link-state still works (independent of refclk
+calibration) but the byte-level NRZI decode + ITP/SOF spacing collapse,
+matching our SETUP-no-show symptom (no endpoint events ever fire).
+
+Phase G.11c workaround tested 2026-05-08: `/delete-property/ clocks;`
++ `/delete-property/ clock-names;` on the inner dwc3 node makes
+`dwc->ref_clk = NULL` and forces the `dwc->ref_clk_per` override
+(populated from `snps,ref-clock-period-ns = <52>` on the same node).
+Combined with `clk_ignore_unused` keeping the bootloader-enabled HSI0
+ref clock running, this should make mainline program the right values.
+
+Long-term: fixing the gs101 clk driver's USB31DRD ref-clock chain so
+`clk_get_rate(REF_CLK_40)` returns 19.2 MHz would let both stubs
+(PHY-side 26 MHz fixed-clock + dwc3-side ref-clock-period-ns) drop.
+The clock name itself ("`_REF_CLK_40`") is misleading — suggests
+40 MHz but felix is 19.2 — likely an artifact of the gs101 tree the
+driver was originally derived from. See [gs-usb.md](gs-usb.md)
+"Phase G.11" for the full investigation log.
+
 Secondary concern unchanged: gs201 CMU_MISC is in mainline but several adjacent domains needed by AOC, MIF, and HSI1 (PCIe) are not — those subsystems will quietly clamp to bootloader rates even when they "appear" to work. That's still a real gap but not boot-blocking.
 
 ## 7.1 rebase impact

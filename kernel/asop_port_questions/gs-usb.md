@@ -399,6 +399,189 @@ The remaining surface where the gap can hide:
    720 RESET + 720 CONDONE cycles and ZERO endpoint events across
    ~50 host plug attempts. This exonerates the embedded SS PHY's
    RXDET timing as a contributor on gs201's combo PHY.
+
+## Phase G.11 — GFLADJ refclk programming (active 2026-05-08)
+
+Walking AOSP's `dwc3-exynos.c:356` (`dwc3_exynos_core_init`) found a
+significant divergence at lines 365–383 — for our exact silicon
+revision (DWC31 180A-190A) AOSP runs an unconditional GFLADJ
+programming block:
+
+```c
+if (DWC3_VER_IS_WITHIN(DWC31, 180A, 190A)) {
+    /* FOR ref_clk 19.2MHz */
+    reg = dwc3_exynos_readl(dwc->regs, DWC3_GFLADJ);
+    /* preserve the 30MHz fladj (= dwc->fladj) */
+    reg |= DWC3_GFLADJ_REFCLK_240MHZ_DECR(0xc);
+    reg |= DWC3_GFLADJ_REFCLK_240MHZDECR_PLS1;
+    reg |= DWC3_GFLADJ_REFCLK_LPM_SEL;
+    reg &= ~DWC3_GFLADJ_REFCLK_FLADJ_MASK;     /* zero */
+    reg |= DWC3_GFLADJ_30MHZ_SDBND_SEL;
+    dwc3_exynos_writel(dwc->regs, DWC3_GFLADJ, reg);
+}
+```
+
+Mainline has the same machinery but as
+`drivers/usb/dwc3/core.c:dwc3_ref_clk_period`. It computes the
+fields from `clk_get_rate(dwc->ref_clk)` (with `dwc->ref_clk_per`
+from `snps,ref-clock-period-ns` as a fallback only when no clock
+is set).
+
+### What instrumentation found
+
+A `dev_info` added in `dwc3_ref_clk_period()` reports:
+
+```
+DWC3-DBG: ref_clk_period rate=614400000 period=1ns fladj=78450 decr=0 lpm_sel=1 GUCTL=0x00416802 GFLADJ=0x00b27220
+```
+
+`clk_get_rate(dwc->ref_clk)` on felix (with the inner dwc3 node's
+`clocks = <&cmu_hsi0 CLK_GOUT_HSI0_USB31DRD_I_USB31DRD_REF_CLK_40>;
+ clock-names = "ref";`) returns **614,400,000 Hz** — that's the
+upstream PLL rate (`32 × 19.2 MHz`), not the divided-down 19.2 MHz
+that actually clocks the dwc3 reference.
+
+Consequence: mainline programs
+
+- `period = 1e9 / 614400000 = 1ns` (should be `52`)
+- `decr = 480000000 / 614400000 = 0` (should be `25`, i.e.
+  `DECR=12 + PLS1=1` per AOSP)
+- `fladj = (125000 * 1e9) / (614e6 * 1) - 125000 = 78450`
+  (should be `0` per AOSP for 19.2 MHz)
+- `GUCTL.REFCLKPER = 0x802` (the low 10 bits of `0x00416802`)
+- `GFLADJ = 0x00b27220` (all the wrong fields)
+
+Hypothesis: HS bus timing depends on these being correct. Chirp
+and bus-reset are link-state events that don't depend on refclk
+timing — they fire regardless. But byte-level NRZI decode and
+the controller's MAC-layer SOF/ITP timing **do** depend on
+GFLADJ + GUCTL.REFCLKPER. With `GUCTL.REFCLKPER = 0x802` instead
+of `52`, the controller's internal time base is 16x off,
+causing it to drop or misframe SETUP packets even though the
+PHY is presenting valid bus traffic.
+
+### gs101 clk driver as the underlying culprit
+
+`drivers/clk/samsung/clk-gs101.c:2701` defines
+`CLK_GOUT_HSI0_USB31DRD_I_USB31DRD_REF_CLK_40` as a `GATE()` whose
+parent is `mout_hsi0_usb31drd`. Gate clocks inherit their parent's
+rate. The mux's parent on felix is the upstream USB31DRD PLL
+configured by the bootloader for 614.4 MHz, but the actual line
+that clocks the dwc3 reference input is divided down to 19.2 MHz
+at the silicon level — divide that the kernel's clock tree
+representation doesn't reflect.
+
+Two paths to a long-term fix:
+
+1. **Audit the gs101 clk driver's USB31DRD chain** and add the
+   missing divider so `clk_get_rate(REF_CLK_40)` returns 19.2 MHz.
+   The clock name itself ("`_REF_CLK_40`") is misleading — it
+   suggests 40 MHz but felix is 19.2; gs101 (which the driver
+   was originally built for) may have had this clock at a
+   different rate. Fixing the clock tree is the proper upstream
+   answer.
+
+2. **Patch dwc3 core.c to prefer `dwc->ref_clk_per`** when both
+   the clock and the period override are set. One-line change.
+   Useful as a workaround for any platform whose clock-tree
+   accounting is wrong.
+
+### Phase G.11c workaround test
+
+Cheapest immediate test (in flight 2026-05-08):
+
+- Add `snps,gfladj-refclk-lpm-sel-quirk;` and
+  `snps,ref-clock-period-ns = <52>;` to the inner dwc3 node in
+  felix.dts.
+- `/delete-property/ clocks;` and `/delete-property/ clock-names;`
+  on the inner dwc3 node so `dwc->ref_clk` is NULL and the
+  override path runs.
+- `clk_ignore_unused` in our kernel cmdline keeps the
+  bootloader-enabled HSI0 ref clock running, so the controller +
+  PHY still get their reference signal at 19.2 MHz.
+
+Expected post-fix values:
+
+- `rate = 19230769` (= `1e9 / 52`)
+- `period = 52`
+- `fladj = 0` (matches AOSP)
+- `decr = 24` (or 25 depending on integer div)
+- `GUCTL.REFCLKPER = 0x34` (= 52)
+- `GFLADJ.REFCLK_LPM_SEL = 1`
+
+If SETUP delivery starts working with this fix in place, GFLADJ
+miscalibration was the gap and we've found the answer. If it
+doesn't, GFLADJ refclk programming is exonerated and the gap
+sits even deeper.
+
+### Result (Phase G.11d, 2026-05-08): NEGATIVE
+
+The override took effect cleanly. Post-fix instrumentation:
+
+```
+DWC3-DBG: ref_clk_period rate=19230769 period=52ns fladj=0 decr=24 lpm_sel=1
+GUCTL=0x0d016802 GFLADJ=0x0c800020
+```
+
+- `rate = 19230769` (= `1e9 / 52`, ~19.23 MHz) ✓
+- `period = 52` ns ✓
+- `fladj = 0` ✓ (matches AOSP exactly)
+- `decr = 24` (close to AOSP's 25, integer-div drift)
+- `lpm_sel = 1` ✓
+- `GUCTL.REFCLKPER` field (bits 31:22) = `0x34` = `52` ✓
+- `GFLADJ.REFCLK_LPM_SEL` (bit 23) = `1` ✓
+- `GFLADJ.30MHZ_MASK` (bits 5:0) = `0x20` = `32` ✓
+   (matches our `snps,quirk-frame-length-adjustment = <0x20>`)
+
+But the data-path symptom is unchanged. Across this boot:
+
+- 0 `is_devspec=0` events (zero endpoint events, ever)
+- DCFG = `0x00e00800` always (DevAddr field forever 0)
+- TRB ctrl = `0x00000c23` always (HWO=1; controller never consumes)
+- ep0_trb_addr = `0x8283e000` (lower DRAM bank, identity-mapped, fine)
+- 216 RESET + 216 CONDONE + 52 EOPF cycles, no SETUP framing
+
+GFLADJ refclk programming is exonerated as a cause of the
+SETUP-delivery failure. Cumulative ruled-out list now spans:
+
+1. PHY HS-init register sequence (mainline AND AOSP CAL graft, identical
+   symptom)
+2. dwc3 controller state (RUN_STOP=1, EP0 OUT/IN enabled, TRB armed
+   correctly)
+3. EP0 RX/TX FIFO sizing (GRXFIFO0=0x413 = 1043 dwords, plenty)
+4. DEPSTRTXFER address propagation (PAR0/PAR1 match
+   `dwc->ep0_trb_addr` exactly)
+5. DMA buffer location (lower DRAM bank, where bootloader fastboot operates)
+6. S2MPU permission gating
+7. Embedded SS PHY CR-port (RXDET_MEAS_TIME poke executed)
+8. GUCTL.REFCLKPER + GFLADJ programming for ITP/SOF timing
+9. HSPPARACON tune values (mainline applies them via PTS_UTMI_POSTINIT)
+10. xhci_dma reserved-memory carveout
+11. HSP_EN_UTMISUSPEND / HSP_COMMONONN bits (both polarities tested)
+12. LINKCTRL_FORCE_QACT (load-bearing for link-state events but doesn't
+    fix data-layer)
+
+Empirical fingerprint: dwc3 fires link-state events (RESET / CONDONE)
+and clock-driven heartbeat (EOPF), but **zero byte-stream events**.
+The PHY → MAC byte forwarding pipeline is broken at a level we cannot
+poke from any register-write candidate we've found. Possibilities at
+this depth:
+
+a. **PHY HS RX analog frontend** decoding chirp K/J (low-freq level
+   signaling) but failing on HS NRZI bytes (high-freq). Some calibration
+   we haven't found, possibly outside the AOSP CAL.
+b. **UTMI bus** between PHY and controller is partially dead (link-state
+   pins working, data pins not). Pin-mux, sub-clock, or sub-PD issue.
+c. **Some block we haven't powered up** — e.g. a sub_pd_hsi0 child PD
+   that gates the UTMI byte-fetcher.
+d. The mainline dwc3 driver has a quirk path we haven't enabled that
+   gs201 silicon needs.
+
+The AOSP-vs-mainline diff hunting has reached diminishing returns.
+Next step (Phase G.12) should be **diagnostic-by-instrumentation** —
+read controller-internal "RX byte counter" / "PHY status" registers to
+distinguish (a) from (b/c/d), rather than continue shotgun-testing
+register writes.
 2. **An HSI0 NOC bus clock or APB clock** the kernel doesn't
    explicitly enable. AOSP's dwc3 outer wrapper has three
    clocks: `aclk`, `sclk`, `bus` (the third is
