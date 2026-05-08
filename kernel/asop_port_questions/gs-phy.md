@@ -62,6 +62,99 @@ What's still missing — and is the active blocker for Phase A:
 - **gs201 SS PMA register table** for a non-stub PIPE3 init (Phase B.5
   debt, needed for SuperSpeed).
 
+### Hypotheses tested 2026-05-07 (all negative)
+
+A systematic AOSP register-walk through `phy_exynos_usb_v3p1_enable()` +
+`phy_exynos_usb_v3p1_pipe_ovrd()` surfaced four candidate divergences from
+the mainline path. Each was tested by editing
+`exynos5_usbdrd_gs201_utmi_init`, building, flashing, and capturing host
+dmesg. All four produced byte-identical EPROTO storms (`device descriptor
+read/64, error -71` plus `Device not responding to setup address`). None
+moved the symptom.
+
+| # | Hypothesis | Edit | Result |
+|---|---|---|---|
+| 1 | Mainline's `exynos5_usbdrd_usb_v3p1_pipe_override` unconditionally sets `SECPMACTL_PMA_LOW_PWR` (powers down the COMBO PMA). AOSP's `phy_exynos_usb_v3p1_pipe_ovrd` gates the PMA disable on `!ss_cap` — for gs201 (ss_cap=true) it leaves the PMA powered. Expected the gs201 G2 PHY's HS analog path to share calibration with COMBO PMA. | Clear `SECPMACTL_PMA_LOW_PWR` after `exynos850_usbdrd_utmi_init` returns. | Negative — same EPROTO storm. |
+| 2 | Mainline's `exynos850_usbdrd_utmi_init` unconditionally sets `LINKCTRL_FORCE_QACT` (HWACG disable). AOSP's `exynos_cal_usbphy_q_ch` only manipulates QACT for VER_03_0_0 (gs101). For VER_05_0_0+ (gs201) AOSP leaves the Q-channel alone. Expected forcing QACT high to break the natural Q-channel handshake on gs201. | Clear `LINKCTRL_FORCE_QACT` after `exynos850_usbdrd_utmi_init` returns. | **Regression — mainline's setting is load-bearing.** With FORCE_QACT cleared, the dwc3 event ring went from ~200 RESET + ~200 CONNECT_DONE down to **0 RESET + 0 CONNECT_DONE + 0 endpoint events** — even gadget-bind dumps showed no subsequent device activity. The PHY clock was auto-gating when the controller idled, killing line-state event delivery entirely. AOSP's bootloader/PMU presumably leaves QACT effectively high via a different path (or `exynos_cal_usbphy_q_ch` runs from a different code path on gs201 that we haven't found). Reverted; mainline's FORCE_QACT is correct. |
+| 5 | Felix's AOSP `&usb_hs_tune` DT node has `status = "disabled"`. AOSP doesn't apply the HSPPARACON tune values on felix; the PHY runs with HSPPARACON at hardware reset values. Mainline's `gs201_tunes_utmi_postinit` block reconfigures HSPPARACON on every probe (TXVREF=8, TXRES=3, TXPREEMPAMP=1, SQRX=2, COMPDIS=7). Hypothesis: HSPPARACON tune values may put the PHY in a state AOSP never tested. | Set `gs201_usbd31rd_phy.phy_tunes = NULL` so `apply_phy_tunes()` short-circuits and HSPPARACON stays at reset. | Negative — same baseline shape (162 RESET + 144 CONDONE + 364 device events + 0 endpoint events). HSPPARACON tune is not the gap. Reverted. |
+| 3 | OTP-override path: AOSP's `exynos_usbdrd_utmi_init` runs `samsung_exynos_cal_usb3phy_write_register` for every entry in `phy_drd->otp_data[]` after enable. Speculated felix carries per-device PHY calibration in OTP that mainline doesn't apply. | Investigated; **`CONFIG_EXYNOS_OTP` is not set in `felix_defconfig`**, so the OTP block (`#if IS_ENABLED(CONFIG_EXYNOS_OTP)`) is dead code on AOSP felix. Ruled out without a build. | N/A — dead code on AOSP. |
+| 4 | `GUSB2PHYCFG.ENBLSLPM=1` (controller parks PHY in low-power between transfers). Speculated PHY doesn't wake fast enough to catch SETUP after CONNECT_DONE. | Investigated; AOSP DT doesn't carry `snps,dis_enblslpm_quirk` either, so AOSP also has `ENBLSLPM=1`. Not the gap. | N/A — matches AOSP. |
+
+### Implications for the active blocker
+
+The FORCE_QACT regression actually narrows the search usefully. Two
+distinct PHY behaviours can now be characterised:
+
+- **Link-layer reception** (the path that fires `RESET` + `CONNECT_DONE`
+  events into dwc3 when the host drives the bus): healthy on gs201
+  **only when** `LINKCTRL_FORCE_QACT=1`. The PHY clock has to be held
+  un-gated for the link-state machine to deliver bus-event interrupts.
+  Mainline's unconditional FORCE_QACT setting is load-bearing here.
+- **Data-layer packet reception** (the path that delivers SETUP bytes
+  from the host into the controller's RX FIFO): broken on gs201
+  regardless of every PHY-register tweak we've tested. Both with
+  FORCE_QACT=1 (link layer works, ~200 RESET + ~200 CONNECT_DONE,
+  0 endpoint events) and with FORCE_QACT=0 (link layer also dies,
+  0 of everything), the data-layer delivery never happens.
+  `phy_tunes=NULL` (matching AOSP felix's `status = "disabled"`)
+  also produces the baseline 200/200/0 shape.
+
+So the missing AOSP step is **not** in the QACT/clock-gating layer and
+**not** in the per-register-write differences we've enumerated inside
+`phy_exynos_usb_v3p1_enable()`. Five hypotheses tested at the wrapper
+level (PMA, FORCE_QACT, OTP, ENBLSLPM, HSPPARACON-tune) — exactly one
+useful learning (FORCE_QACT is load-bearing). The cheap walk has hit
+its limit.
+
+Where the missing step plausibly lives now:
+
+- **dwc3 controller programming** (GSBUSCFG0 / GUCTL / GUSB3PIPECTL).
+  AOSP's `dwc3_core_config()` runs ~180 lines of register writes mainline
+  doesn't, particularly the `GSBUSCFG0` request-info bits that drive AXI
+  cache attributes during descriptor and data DMA. **This is now the
+  active investigation.** See [gs-usb.md](gs-usb.md) for the walk results
+  and ranked test plan.
+- **PMA/PCS register writes beyond CNTL0/1.** Our `phy_cfg_gs201`
+  has a no-op PIPE3 init because the gs101 PMA register layout doesn't
+  apply on gs201. AOSP's `phy_exynos_usb_v3p1_pma_ready`,
+  `phy_exynos_usb_v3p1_g2_pma_ready`, and `phy_exynos_usb_v3p1_pma_sw_rst_release`
+  do PMA-side writes we never make. Reverse-engineering the gs201 PMA
+  register set is the same blocker as Phase B.5.
+- **Real cmu_hsi0 USB ref clock** instead of the 26 MHz fixed-clock stub.
+  Speculative — but the user-mux trip we hit suggests the PHY's
+  expectations about its reference-clock provider may be more nuanced
+  than "any 26 MHz signal."
+- **CR / SSP_CR access protocol** in `late_enable` for ss_cap.
+  Single write of `0xf=0x03d0` (TX_VBOOST_LVL=0x7). Cheap to add if we
+  can implement the CR-access bus protocol.
+
+Remaining unexplored areas of the AOSP flow:
+
+- **The HSPPARACON tune block itself.** New finding 2026-05-07 mid-walk:
+  felix's AOSP `&usb_hs_tune` DT node has `status = "disabled"`. So
+  AOSP **does not apply** these tune values on felix in production —
+  the PHY runs with HSPPARACON at hardware reset values. Our
+  `gs201_tunes_utmi_postinit` applies them (TXVREF=8, TXRES=3,
+  TXPREEMPAMP=1, SQRX=2, COMPDIS=7), which means we are reconfiguring
+  HSPPARACON when AOSP isn't. **Worth testing whether disabling our
+  tune block (leaving HSPPARACON at reset) restores AOSP-equivalent
+  behaviour.** Note: there's also a `utmi_clk` tune entry in felix's
+  DT that the AOSP HSP walker doesn't handle — it's parsed but
+  unused by the standard tune path.
+- The Configuration-Register access protocol (`cr_access` /
+  `ssp_cr_access`) used by `late_enable` for ss_cap (writes
+  `0xf=0x03d0` for TX_VBOOST_LVL).
+- The Test Interface (`tif_access`) override mechanism — only used
+  by tune entries `tx_res_ovrd` and `tx_dis_inc`, which felix's DT
+  doesn't carry.
+- Anything outside the PHY: dwc3 core init, the dwc3-exynos glue, the
+  controller's GCTL / DCFG / DCTL programming sequence.
+
+The cheap walk has plausibly exhausted its ROI for the in-the-wrapper
+register tweaks. Higher-confidence move from here: the actual graft
+(stubbed-CAL build of `phy-exynos-usb3p1.c` running side-by-side) so we
+can A/B specific writes against a known-working reference.
+
 eUSB2 / eusb_repeater: not relevant on felix's USB-C port path (felix
 appears to take the direct USB3-DRD path, not the eUSB2-then-hub path that
 oriole/raven use). Re-verify when porting Phase B if surprises appear.

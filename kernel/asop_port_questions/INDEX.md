@@ -23,9 +23,18 @@ Active partial bring-ups (the new scoring lens):
    with the gs201-specific PHY init wrapper, the UDC `11210000.usb` registers,
    configfs gadget binds (CDC-NCM + CDC-ACM), and the host enumerates a HS
    device. **But no SETUP packet ever lands on dwc3's EP0 OUT TRB**: line-state
-   events fire (RESET + CONNECT_DONE in the thousands), zero endpoint events.
-   Phase B is the MAX77759 TCPC port for full DRD; Phase B.5 is the gs201 SS
-   PHY tune table. See the **"USB Gadget Bring-up"** section below.
+   events fire (RESET + CONNECT_DONE in the hundreds), zero endpoint events.
+   Empirical 2026-05-07: link-layer reception (RESET/CONDONE) requires
+   `LINKCTRL_FORCE_QACT=1` (mainline gets that right); data-layer reception
+   (SETUP delivery) is broken at a separate stage. Five PHY-side hypotheses
+   tested (PMA, FORCE_QACT, OTP, ENBLSLPM, HSPPARACON tune) — all negative or
+   regressions. **Active investigation pivoted to the dwc3-exynos layer**:
+   AOSP's `dwc3_core_config()` does ~180 lines of register writes (GSBUSCFG0
+   request-info / cache-attrs, GUCTL_USBHSTINAUTORETRYEN, GUSB3PIPECTL
+   quirks) that mainline opts out of by default. See [gs-phy.md](gs-phy.md)
+   for the PHY hypothesis log and [gs-usb.md](gs-usb.md) for the dwc3 walk
+   plan. Phase B is the MAX77759 TCPC port for full DRD; Phase B.5 is the
+   gs201 SS PHY tune table. See the **"USB Gadget Bring-up"** section below.
 2. **`sudo reboot` hangs** — Linux never reaches the bootloader's reset path.
    Workaround: `./flash.sh` re-flash from fastboot. Tracked under the Phase R
    set of TODOs (capture UART, fix root cause, write a BCB
@@ -233,8 +242,8 @@ Authoritative AOSP references for any porting decision:
 
 | Module | Status | Why it's primary |
 |--------|--------|------------------|
-| [gs-phy.md](gs-phy.md) | partially-ported (Phase A wrapper landed, HS RX path missing) | The single open question. AOSP CAL `phy_exynos_usb_v3p1_*` runs an HS-RX-enable + analog-block calibration sequence after CONNECT_DONE that mainline's `phy_init` lifecycle never reaches. Mainline's `phy_calibrate` hook is the sensible attach point but the gs201 register set isn't reverse-engineered yet. |
-| [gs-usb.md](gs-usb.md) | partially-ported | dwc3-exynos in mainline is generic; AOSP has a 1500-line OTG state machine (Pixel runs role-switch through extcon + LDO sequencing). For Phase A (peripheral-only) the mainline core path is enough; for Phase B (full DRD) we need the equivalent role-switch logic via a TCPC + USB-role-switch DT topology. |
+| [gs-usb.md](gs-usb.md) | partially-ported, **active investigation** | AOSP `dwc3_core_config()` runs unconditional register writes mainline opts out of: `GSBUSCFG0` request-info bits (cache attrs for descriptor/data DMA), `GUCTL.USBHSTINAUTORETRYEN`, `GUSB3PIPECTL` quirks. The cache-attrs candidate matches the symptom (controller fires events, gadget never sees them). 5 ranked test candidates documented in gs-usb.md — none tested yet. |
+| [gs-phy.md](gs-phy.md) | partially-ported (Phase A wrapper landed, HS RX path apparently complete) | Was the headline lead through 2026-05-07 morning. Five hypotheses tested at the wrapper level (PMA, FORCE_QACT, OTP, ENBLSLPM, HSPPARACON tune); the only useful learning is that mainline's `LINKCTRL_FORCE_QACT=1` is load-bearing. None of the in-wrapper register tweaks closed the data-layer gap, so the PHY layer is plausibly **not** where the missing step lives. |
 
 ### Tier 2 — Boot-supporting infrastructure for USB (8–9/10)
 
