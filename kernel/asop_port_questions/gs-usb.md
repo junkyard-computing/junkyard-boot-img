@@ -322,14 +322,106 @@ Next investigation order (cheapest → most expensive):
 - **Test 2 (HSI0 NOC bus clock)**: add the third `bus` clock to the
   dwc3 binding + drvdata. Need to identify which mainline gs101 clk
   ID corresponds to AOSP's `VDOUT_CLK_TOP_HSI0_NOC`.
-- **Test 3 (S2MPU)**: stub a no-op driver that just claims the
-  `google,s2mpu` compatible and (initially) does nothing — see
-  whether the DT topology change alone (i.e. correct probe ordering)
-  shifts the symptom. If yes, port the real AOSP S2MPU
-  configuration writes.
+- **Test 3 (S2MPU)** — DONE 2026-05-08, NEGATIVE.
+  - Stub `google,s2mpu` driver added at
+    [drivers/soc/samsung/gs201-s2mpu-stub.c](../source/drivers/soc/samsung/gs201-s2mpu-stub.c)
+    (probe-only, ioremaps regs, no register writes). DT node
+    `s2mpu_hsi0@11070000` enabled in felix.dts; `s2mpus =
+    <&s2mpu_hsi0>;` phandle on the PHY. CONFIG_GS201_S2MPU_STUB=y.
+    Stub probes successfully: UART line `gs201-s2mpu-stub
+    11070000.s2mpu: S2MPU stub claimed`.
+  - Same flash also added a **`dma-ranges` identity-mapping
+    constraint on the outer `&usbdrd31` wrapper**:
+    `dma-ranges = <0x80000000 0x0 0x80000000 0x40000000>;` —
+    forces the inner dwc3's `dma_alloc_coherent` allocations to
+    physical 0x80000000-0xc0000000 (lower DRAM bank, identity).
+    Verified working: EP0 TRB instrumentation went from
+    `ep0_trb_addr=0x8_9556a000` (upper bank, 34 GiB) to
+    `ep0_trb_addr=0x8283f000` (lower bank, identity-mapped, no
+    offset translation).
+  - Symptom: **completely unchanged**. DCFG.DevAddr stays 0 across
+    every CONDONE/SET_ADDRESS retry; TRB ctrl=0x00000c23 (HWO=1)
+    on every ep0_out_start re-prime, the controller NEVER consumes
+    the TRB; host gets the same -EPROTO loop.
+  - Together these two changes pin the TRB to physical addresses
+    that are AT MINIMUM in the same window the bootloader's own
+    fastboot USB transfers use. If S2MPU were the gate, this
+    region would be permitted (the bootloader's fastboot path
+    works against the same hardware). It isn't, so S2MPU is
+    exonerated as the SETUP-delivery cause.
+  - First attempt of the dma-ranges constraint
+    (`<0x0 0x0 0x80000000 0x40000000>;`) used an offset-translating
+    mapping (child-addr=0, parent-addr=0x80000000). The kernel
+    honored it, but `dma_alloc_coherent` returned child-side
+    `0x0281f000` and the dwc3 master then DMA-wrote to literal
+    physical `0x0281f000` — below DRAM. That tested whether
+    of_dma_configure propagates dma-ranges to the inner platform
+    device (it does — bph went from 0x8 to 0x0), but didn't test
+    S2MPU since the address landed in unmapped memory. Identity-
+    mapped retry above is the actually-decisive test.
 - **Test 4 (sub_pd_hsi0)**: same shape as #3 — stub
   `exynos-pd-hsi0`, see whether the sub-PD lifecycle hooks change
-  anything.
+  anything. Lower priority now that S2MPU is ruled out.
+
+## Where the gap is now (2026-05-08)
+
+Empirical state after the S2MPU + dma-ranges test:
+
+- PHY init code: not the gap (AOSP CAL graft = mainline init).
+- dwc3 controller register state: textbook-correct (RUN_STOP=1,
+  EP0 OUT/IN enabled, DALEPENA=0x3, EP0 TRB armed for SETUP with
+  HWO=1, ctrl=0xc23).
+- DMA pool location: not the gap (TRB now in lower-bank physical
+  identity-mapped DRAM, same region bootloader uses).
+- S2MPU permissions: not the gap (lower bank known-permitted).
+- Bus reset / chirp / HS handshake: working (RESET + CONDONE
+  fire on every host plug attempt).
+- EP0 TRB consumption: **broken**. Across many CONDONE cycles
+  the controller never consumes the TRB (HWO stays 1) and never
+  fires an EP0 XferComplete event. The host's SETUP packets exist
+  on the wire (host's xhci doesn't time out at the link layer)
+  but the dwc3's MAC layer never frames them.
+
+The remaining surface where the gap can hide:
+
+1. **UTMI/PIPE bridge between PHY and dwc3 controller** — the
+   bytes go PHY → UTMI → controller MAC. If UTMI isn't clocked
+   right, or the bridge is held in some pseudo-reset, the chirp
+   (which is link-state, NOT byte-stream) succeeds while the
+   actual SETUP byte stream fails. **CR-port sub-test (Phase G.10,
+   2026-05-08): NEGATIVE.** Re-grafted minimal CR-port machinery
+   (`phy_exynos_usb_v3p1_cr_access` + `cal_cr_write` from the AOSP
+   tree) and forced the unconditional CR write
+   (`0x1010 = 0x80`, `RXDET_MEAS_TIME`) regardless of the
+   `version > 0x500` gate. The CR-port hardware responds (readback
+   was `0x00000000`, not `0xFFFFFFFF`), the protocol completes
+   (function returns 0), but the data-path symptom is identical —
+   720 RESET + 720 CONDONE cycles and ZERO endpoint events across
+   ~50 host plug attempts. This exonerates the embedded SS PHY's
+   RXDET timing as a contributor on gs201's combo PHY.
+2. **An HSI0 NOC bus clock or APB clock** the kernel doesn't
+   explicitly enable. AOSP's dwc3 outer wrapper has three
+   clocks: `aclk`, `sclk`, `bus` (the third is
+   `VDOUT_CLK_TOP_HSI0_NOC`). Mainline gs101 drvdata declares
+   four different clocks (`bus_early`, `susp_clk`, `link_aclk`,
+   `link_pclk`). The AOSP `bus`/NOC clock is in CMU_TOP, not
+   CMU_HSI0; mainline has no CMU_TOP NOC clock framework yet.
+   If this clock gates off mid-handover or isn't running at the
+   right rate, the AXI fabric between dwc3 and the PHY may not
+   carry SETUP bytes promptly enough.
+3. **`sub_pd_hsi0` sub-power-domain** (AOSP gs201.dtsi:833,
+   `compatible = "exynos-pd-hsi0"`). Different from `pd_hsi0`.
+   Mainline DT references `pd_hsi0` but no sub-PD. If this
+   sub-block contains the dwc3's RX FIFO power gate or the EP0
+   buffer fetcher, an unconfigured sub-PD could leave the RX
+   path in a held-reset state.
+4. **A specific dwc3-exynos.c AOSP register write we haven't
+   reproduced** — the AOSP driver is 1500+ lines vs mainline's
+   285. We've already added the SOFITPSYNC + DWC31 180A
+   workaround block. The OTG state machine (~700 lines) is
+   irrelevant for peripheral mode. But there may be an
+   HSI0-specific PMU/CMU init in the AOSP probe path that
+   mainline + dwc3-of-simple skip.
 
 The graft itself stays on `feature/usb-graft` as scaffolding the
 S2MPU / sub-PD investigation can build on. Reverting the felix.dts
