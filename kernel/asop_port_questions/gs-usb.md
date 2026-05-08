@@ -180,6 +180,163 @@ side-by-side comparison rather than guessing, and unblocks Phase B.5
 - **`xhci-goog-dma`**: the AOSP xhci ring carveout allocator is host-side
   only. Confirmed irrelevant for peripheral-mode Phase A.
 
+## Graft verdict — PHY HS-init exonerated (2026-05-07)
+
+After both the dwc3-side walk and the PHY-side walk closed without a
+fix, we ran the AOSP CAL graft as an A/B PHY-init harness on
+`feature/usb-graft`: `phy-exynos-usb3p1.c` (~1130 lines after trim) +
+`phy-samsung-usb-cal.h` + `phy-exynos-usb3p1-reg.h` + `phy-exynos-usb3p1.h`
+copied into [drivers/phy/samsung/](../source/drivers/phy/samsung/),
+linked into a composite `phy-exynos5-usbdrd-mod.ko` via the existing
+mainline driver scaffold. New OF compatible
+`google,gs201-aosp-usb31drd-phy` selects a `gs201_aosp_utmi_init`
+wrapper that builds a stack-local `struct exynos_usbphy_info` from the
+AOSP felix DT property values (`version=0x301`,
+`refclk=DIFF_19_2MHZ`, `refsel=CLKCORE`, `common_block_disable=1`,
+`not_used_vbus_pad=1`) and calls
+`phy_exynos_usb_v3p1_link_sw_reset` → `_enable` → `_pipe_ovrd` —
+the **complete AOSP CAL HS bring-up** verbatim. Mainline's
+`exynos850_usbdrd_utmi_init` is bypassed entirely on this path.
+
+**Result: identical SETUP-delivery failure as the mainline init path.**
+Symptoms in UART (felix side) + host dmesg:
+
+- AOSP wrapper executes cleanly: `DWC3-DBG: AOSP CAL graft phy_init
+  (regs_base=...)` → `... done`. No error returns, no probe deferral.
+- dwc3 reaches HS connect: `conndone HIGHSPEED ep0 maxpkt=64` fires.
+  Post-CONDONE state dump shows DCTL=0x8cf00000 (RUN_STOP=1),
+  DALEPENA=0x3 (EP0 OUT/IN enabled), DSTS=0x00820000
+  (CONNECTSPD=HIGHSPEED), DEVTEN=0x257.
+- EP0 OUT TRB primed: `ep0_out_start ret=0`.
+- Host enumerates and assigns address: `usb 5-1.4.3: new high-speed
+  USB device number 64 using xhci_hcd` (cycles through 64..117 over
+  retry attempts).
+- **DCFG.DevAddr stays 0** across every CONDONE re-print
+  (DCFG=0x00e00800 unchanged) — proves the gadget side never received
+  a SET_ADDRESS SETUP. Same proof-by-DCFG as the pre-graft mainline
+  path.
+- Host reports `device descriptor read/64, error -71` and
+  `Device not responding to setup address` — same -EPROTO loop.
+
+**Implication.** PHY HS-init code is not the root cause. AOSP CAL ↔
+mainline both produce a working link layer (chirp, hi-speed handshake,
+RESET, CONDONE) but neither delivers SETUP packets to dwc3's EP0 OUT
+TRB. The gap is downstream of any HS PHY register write the AOSP
+driver makes — i.e. *not* fixable by porting more PHY code.
+
+What this rules out:
+- HSPPARACON tune values (graft uses `tune_param=NULL`, would have
+  applied bootloader defaults like the mainline path; same result).
+- POR / SW-reset sequence ordering (AOSP CAL has its own complete
+  sequence; same result).
+- HSP_EN_UTMISUSPEND / HSP_COMMONONN handling (AOSP path SETS both
+  per `common_block_disable=1`, mainline path CLEARS both; same
+  result either way).
+- SSP_PLL FSEL programming (AOSP REFCLK_DIFF_* path is a no-op for
+  this register; mainline reaches the same final state).
+- LINKCTRL_FORCE_QACT cycling (AOSP toggles via
+  `exynos_cal_usbphy_q_ch`; mainline relies on bootloader default;
+  same end-state).
+- `phy_power_en` HSP_TEST_SIDDQ clear for `EXYNOS_USBCON_VER_03_0_0`
+  (AOSP does it, mainline doesn't, but the bit is already clear from
+  bootloader; same result).
+- Combo (G2) PHY late-power signals — irrelevant for
+  HS-only path; both AOSP `g2pma_*` and our mainline G2PHY_CNTL0/CNTL1
+  writes leave the HS path unaffected.
+
+What it leaves on the table — DT diff against AOSP's `gs201.dtsi`:
+
+1. **dwc3 DMA carveout (`memory-region = <&xhci_dma>`)** — top
+   suspect. AOSP's inner Synopsys dwc3 node binds DMA allocations to
+   the `xhci_dma` reserved-memory pool (4 MiB shared-dma-pool at
+   `0x97000000`, declared in `gs201/dts/gs101-dma-heap.dtsi:162`).
+   Mainline dwc3 has no `memory-region` and uses generic
+   `dma_alloc_coherent`, which lands in normal DRAM. If the gs201
+   interconnect / S2MPU only permits dwc3 master access to the
+   `0x97000000` window, then:
+   - Event ring writes from the controller succeed (small/aligned
+     allocations may happen to fall in a permitted region by luck —
+     consistent with the CONDONE events we DO see arrive).
+   - EP0 OUT SETUP TRB writes silently drop because the gadget's
+     usb_request DMA buffer falls in a non-permitted region — exactly
+     the symptom (DCFG.DevAddr=0 across all retries, host -EPROTO).
+   Mainline `of_dma_configure` auto-routes `dma_alloc_coherent` for
+   any device with `memory-region` referencing a `shared-dma-pool` —
+   no driver changes needed; pure DT.
+2. **S2MPU (`s2mpus = <&s2mpu_hsi0>`)** — AOSP DT line 791 puts the
+   `s2mpus` phandle on the **PHY node**, not the dwc3 node. The
+   `s2mpu_hsi0` block is at `0x11070000` (`gs201-s2mpu.dtsi:140`),
+   `compatible = "google,s2mpu"`. Notice `s2mpu_hsi1` /
+   `s2mpu_hsi2` are `always-on` while `s2mpu_hsi0` is **not** —
+   meaning S2MPU_HSI0 is something the kernel needs to actively
+   configure. Mainline has no `google,s2mpu` driver. If the
+   bootloader programs S2MPU permissively for early boot but ATF
+   /power transitions reset it, the dwc3 master would lose access
+   without the kernel reprogramming.
+3. **HSI0 sub-power-domain (`sub_pd_hsi0`)**: AOSP defines
+   `sub_pd_hsi0` (line 833) with `compatible = "exynos-pd-hsi0"` and
+   parents to `pd_hsi0`. Mainline DT references `pd_hsi0` but no
+   sub-PD. If a controller sub-block (e.g. EP0 buffer fetcher, event
+   ring DMA master) is held in reset by the sub-PD remaining
+   unconfigured, the high-level controller can probe and reach
+   CONDONE but the data-receive path stays dead. No mainline driver
+   for `exynos-pd-hsi0` either.
+4. **Bus clock (`VDOUT_CLK_TOP_HSI0_NOC`, "bus")**: AOSP's outer
+   wrapper has THREE clocks (`aclk`, `sclk`, `bus`); the gs201.dtsi
+   we already have (and gs101 mainline drvdata) only declare two
+   (`aclk`, `sclk` for the inner dwc3, plus `phy_ref` and `aclk`
+   for the PHY). The HSI0 NOC bus clock not being explicitly held
+   on by Linux could mean it gates whenever the NOC is idle — and
+   if SETUP delivery requires NOC traffic at a moment when no other
+   activity holds the clock on, the SETUP gets stuck.
+5. **`is_not_vbus_pad = <1>`** appears on AOSP's outer wrapper but
+   isn't in any standard binding — out of scope.
+6. **`direct-usb-access`** — AOSP-only custom property; semantics
+   unclear, likely tied to USB-offload / faceauth — not relevant for
+   our gadget.
+
+Next investigation order (cheapest → most expensive):
+
+- **Test 1 (memory-region + dma-coherent)** — DONE 2026-05-07,
+  NEGATIVE. Declared `xhci_dma@97000000` `shared-dma-pool`
+  (4 MiB, no-map) in gs201-android-handoff.dtsi; added
+  `memory-region = <&xhci_dma>;` and `dma-coherent;` on
+  `&usbdrd31_dwc3` in felix.dts. Boot log confirms the reserved-mem
+  node was recognized (`OF: reserved mem: initialized node
+  xhci_dma@97000000, compatible id shared-dma-pool`) but **no
+  "assigning to device" message** — `of_dma_configure` did not
+  propagate the carveout to the inner dwc3 platform device.
+  Symptom: completely unchanged. Same DCFG=0x00e00800
+  (DevAddr=0), same host -EPROTO loop. Even if the carveout had
+  been wired up, the symptom shows the gap is not where dwc3's
+  DMA buffers land.
+  - Possible follow-up if we revisit: the dwc3 inner device
+    created by `of_platform_populate` may need an explicit
+    `of_reserved_mem_device_init_by_idx()` call from
+    dwc3-exynos's probe path. Mainline dwc3-exynos doesn't do
+    this; AOSP's `xhci-goog-dma` allocator handles the carveout
+    end-to-end including the mapping. Mainline path would need
+    ~30 lines in dwc3-exynos to call the helper. Low effort but
+    not justified until we have stronger reason to believe the
+    DMA pool is the issue.
+- **Test 2 (HSI0 NOC bus clock)**: add the third `bus` clock to the
+  dwc3 binding + drvdata. Need to identify which mainline gs101 clk
+  ID corresponds to AOSP's `VDOUT_CLK_TOP_HSI0_NOC`.
+- **Test 3 (S2MPU)**: stub a no-op driver that just claims the
+  `google,s2mpu` compatible and (initially) does nothing — see
+  whether the DT topology change alone (i.e. correct probe ordering)
+  shifts the symptom. If yes, port the real AOSP S2MPU
+  configuration writes.
+- **Test 4 (sub_pd_hsi0)**: same shape as #3 — stub
+  `exynos-pd-hsi0`, see whether the sub-PD lifecycle hooks change
+  anything.
+
+The graft itself stays on `feature/usb-graft` as scaffolding the
+S2MPU / sub-PD investigation can build on. Reverting the felix.dts
+compatible to `google,gs201-usb31drd-phy` rolls back to the mainline
+init path with no other changes — they are A/B sides of the same
+harness.
+
 ## Boot-relevance reasoning
 
 4/10 for boot (system reaches kmscon login on UART without USB).
