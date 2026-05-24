@@ -106,10 +106,15 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootst
 [working-directory: 'kernel/source']
 clone_kernel_source android_kernel_branch="android-gs-felix-6.1-android16":
     @echo "Cloning Android kernel from branch: {{ android_kernel_branch }}"
+    # `< /dev/null`: repo init's interactive color prompt otherwise writes color.ui
+    # to the global git config — on NixOS (home-manager) that's a read-only
+    # /nix/store symlink, so the write fails with "Read-only file system".
+    # Non-interactive stdin makes repo default the prompt to "no" (no write).
     {{ _repo }} init \
       --depth=1 \
       -u https://android.googlesource.com/kernel/manifest \
-      -b {{ android_kernel_branch }}
+      -b {{ android_kernel_branch }} \
+      < /dev/null
     {{ _repo }} sync -j {{ num_cpus() }}
     if [ ! -e custom_defconfig_mod ]; then \
         ln -s ../custom_defconfig_mod ./; \
