@@ -124,14 +124,16 @@
           fhs = fhsFor pkgs;
           felix-build = pkgs.writeShellApplication {
             name = "felix-build";
-            runtimeInputs = buildToolsFor pkgs;
+            runtimeInputs = buildToolsFor pkgs ++ [ pkgs.procps ];
             text = ''
               echo "[felix-build] 1/2 — kernel build in FHS env (kleaf needs real /bin/bash + /usr/bin/python3)"
-              # Shut down any stale bazel server first. A server started outside the FHS env
-              # (e.g. a prior plain `just all`) persists and runs actions in the non-FHS mount
-              # namespace, where /bin/bash doesn't exist -> "execvp(/bin/bash): No such file".
-              # Shutting it down forces a fresh server inside this FHS invocation.
-              "${fhs}/bin/felix-bazel-fhs" -c 'kernel/source/tools/bazel shutdown >/dev/null 2>&1 || true; just build_kernel'
+              # A bazel server started outside the FHS env (e.g. a prior plain `just all`)
+              # persists and runs actions in the non-FHS mount namespace, so an FHS build
+              # reuses it and fails `execvp(/bin/bash): No such file`. `bazel shutdown` from
+              # inside FHS doesn't reliably reach it, so kill this repo's bazel server here
+              # (host ns) to force a fresh one inside FHS. Harmless if none is running.
+              pkill -f "$PWD/kernel/source/out/bazel" 2>/dev/null || true
+              "${fhs}/bin/felix-bazel-fhs" -c 'just build_kernel'
               echo "[felix-build] 2/2 — rootfs/boot in normal env (kernel cached; needs sudo + aarch64 binfmt)"
               just all
             '';
