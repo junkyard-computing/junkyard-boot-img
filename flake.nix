@@ -90,8 +90,8 @@
               export CROSS_COMPILE=${crossPrefix}
               echo "felix build shell — ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE"
               echo
-              echo "AOSP/Bazel kernel build (main / btrfs-root): use the FHS shell instead —"
-              echo "  nix develop .#bazel        (interactive)   or   nix run .#bazel-fhs -- -c 'just build_kernel'"
+              echo "Full build on NixOS, one command (external sudo-capable terminal):  nix run .#build"
+              echo "Kernel build alone (kleaf needs the FHS env):  nix run .#bazel-fhs -- -c 'just build_kernel'"
               echo
               echo "NOTE — system-level prerequisites a flake CANNOT provide (set in your NixOS host / krg-nixos-flakes):"
               echo "  • binfmt for foreign-arch debootstrap:  boot.binfmt.emulatedSystems = [ \"aarch64-linux\" ];"
@@ -111,6 +111,34 @@
       packages = eachSystem (pkgs: {
         bazel-fhs = fhsFor pkgs;
       });
+
+      # One-command NixOS build. Nix lives ONLY here, so the Makefile/justfile stay
+      # portable (non-Nix hosts still build with a plain `just all`). The kernel build
+      # runs in the FHS env — kleaf execs /bin/bash and /usr/bin/env python3 with a
+      # sanitized PATH, and only real FHS files satisfy that (envfs resolves on exec
+      # but not on the stat() that `env`/bash do, so python3 isn't found). Everything
+      # else runs in the normal env where sudo works. Run from an external,
+      # sudo-capable terminal (VSCode terminals block sudo):  nix run .#build
+      apps = eachSystem (pkgs:
+        let
+          fhs = fhsFor pkgs;
+          felix-build = pkgs.writeShellApplication {
+            name = "felix-build";
+            runtimeInputs = buildToolsFor pkgs;
+            text = ''
+              echo "[felix-build] 1/2 — kernel build in FHS env (kleaf needs real /bin/bash + /usr/bin/python3)"
+              "${fhs}/bin/felix-bazel-fhs" -c 'just build_kernel'
+              echo "[felix-build] 2/2 — rootfs/boot in normal env (kernel cached; needs sudo + aarch64 binfmt)"
+              just all
+            '';
+          };
+        in
+        {
+          build = {
+            type = "app";
+            program = "${felix-build}/bin/felix-build";
+          };
+        });
 
       formatter = eachSystem (pkgs: pkgs.nixpkgs-fmt);
     };
