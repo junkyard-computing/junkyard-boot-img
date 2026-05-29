@@ -27,12 +27,17 @@ VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 
+# Wrap nspawn invocations through tools/nspawn-wrap.sh so each one starts
+# from a known-good sysroot/dev (no leftover mounts, no stale /dev/pts).
+# See the script header for the systemd >= 260 specifics that motivate it.
+# Trailing `--` separates the wrapper's sysroot arg from the nspawn argv.
+NSPAWN_WRAP := sudo tools/nspawn-wrap.sh $(SYSROOT_DIR) --
 # --resolv-conf=bind-host overrides the container's /etc/resolv.conf for the
 # lifetime of the nspawn session. Packages.txt installs systemd-resolved,
 # whose postinst points /etc/resolv.conf at a stub that only resolves when
 # systemd-resolved is running (it isn't, under nspawn). Without this flag,
 # any nspawn call after that postinst loses DNS, including reruns.
-NSPAWN := sudo systemd-nspawn --resolv-conf=bind-host
+NSPAWN := $(NSPAWN_WRAP) --resolv-conf=bind-host
 
 # Running `make` directly bypasses the env vars set by the justfile (notably
 # KERNEL_VERSION, which is read from kernel/kernel_version). Always go through
@@ -52,10 +57,10 @@ all:
 .debootstrap: .create_image
 	just mount_rootfs
 	sudo debootstrap --variant=minbase --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR)
-	sudo systemd-nspawn -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
-	sudo systemd-nspawn -D $(SYSROOT_DIR) symlinks -cr .
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) symlinks -cr .
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
 	just unmount_rootfs
 	touch $@
 
@@ -167,7 +172,7 @@ all:
 	@echo "Updating System.map"
 	sudo cp $(KERNEL_BUILD_DIR)/System.map $(SYSROOT_DIR)/boot/System.map-$(KERNEL_VERSION)
 	@echo "Updating module dependencies"
-	sudo systemd-nspawn -D $(SYSROOT_DIR) depmod \
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) depmod \
 		--errsyms \
 		--all \
 		--filesyms /boot/System.map-$(KERNEL_VERSION) \
@@ -204,7 +209,7 @@ all:
 	# (/vendor/firmware, set by the dtb's /chosen/bootargs) points at.
 	# Without it, the AOC coprocessor retry-loops in dracut and starves
 	# UART RX, so emergency-shell keystrokes are dropped.
-	sudo systemd-nspawn -D $(SYSROOT_DIR) dracut \
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) dracut \
 		--kver $(KERNEL_VERSION) \
 		--lz4 \
 		--show-modules \
