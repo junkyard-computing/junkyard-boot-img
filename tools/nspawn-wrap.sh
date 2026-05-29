@@ -34,6 +34,20 @@ fi
 sysroot="$1"
 shift 2  # drop sysroot and "--"
 
+# Refuse empty or "/" sysroot: we run `rm -rf "$sysroot/dev"` as root below,
+# which on an empty or root path would wipe the host's /dev and brick the
+# system. Also fail fast if the path isn't a directory.
+case "$sysroot" in
+    ""|"/")
+        echo "nspawn-wrap.sh: refusing to operate on sysroot='$sysroot'" >&2
+        exit 2
+        ;;
+esac
+if [ ! -d "$sysroot" ]; then
+    echo "nspawn-wrap.sh: sysroot '$sysroot' is not a directory" >&2
+    exit 2
+fi
+
 # Tear down anything left behind under sysroot/dev. -lR is lazy + recursive:
 # even if a previous run's container NS still holds refs, the mounts are
 # detached from our namespace immediately so the directory contents below

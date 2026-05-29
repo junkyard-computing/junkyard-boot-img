@@ -149,13 +149,15 @@ create_rootfs_image size="8100M": unmount_rootfs
 # / is mounted shared, so without it systemd-nspawn's container /dev mounts propagate
 # back to the host and nspawn (systemd >= 260) then trips over its own propagated mounts
 # with "/dev is pre-mounted and pre-populated" / "Failed to create /dev/pts: File exists".
+# Apply --make-rprivate unconditionally so a sysroot reused across runs (e.g. when a
+# prior nspawn failed mid-recipe) still becomes private even though we skip the mount.
 mount_rootfs size="8100M": (create_rootfs_image size)
     @mkdir -p {{ _sysroot_dir }}
     @if ! mountpoint -q {{ _sysroot_dir }}; then \
       echo "Mounting rootfs image at {{ _sysroot_dir }}"; \
       sudo mount {{ _sysroot_img }} {{ _sysroot_dir }}; \
-      sudo mount --make-rprivate {{ _sysroot_dir }}; \
     fi
+    @sudo mount --make-rprivate {{ _sysroot_dir }}
 
 # Unmount the ext4 rootfs image.  -R is recursive: a previous nspawn failure
 # (e.g. binfmt missing) can leave /dev tmpfs + bind mounts inside sysroot, and
