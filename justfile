@@ -106,10 +106,15 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootst
 [working-directory: 'kernel/source']
 clone_kernel_source android_kernel_branch="android-gs-felix-6.1-android16":
     @echo "Cloning Android kernel from branch: {{ android_kernel_branch }}"
+    # `< /dev/null`: repo init's interactive color prompt otherwise writes color.ui
+    # to the global git config — on NixOS (home-manager) that's a read-only
+    # /nix/store symlink, so the write fails with "Read-only file system".
+    # Non-interactive stdin makes repo default the prompt to "no" (no write).
     {{ _repo }} init \
       --depth=1 \
       -u https://android.googlesource.com/kernel/manifest \
-      -b {{ android_kernel_branch }}
+      -b {{ android_kernel_branch }} \
+      < /dev/null
     {{ _repo }} sync -j {{ num_cpus() }}
     if [ ! -e custom_defconfig_mod ]; then \
         ln -s ../custom_defconfig_mod ./; \
@@ -140,19 +145,29 @@ build_kernel: clone_kernel_source
 create_rootfs_image size="8100M": unmount_rootfs
     {{ _make }} -C {{ justfile_directory() }} .create_image SIZE={{ size }}
 
-# Mount the ext4 rootfs image at rootfs/sysroot.
+# Mount the ext4 rootfs image at rootfs/sysroot. The --make-rprivate is required:
+# / is mounted shared, so without it systemd-nspawn's container /dev mounts propagate
+# back to the host and nspawn (systemd >= 260) then trips over its own propagated mounts
+# with "/dev is pre-mounted and pre-populated" / "Failed to create /dev/pts: File exists".
+# Apply --make-rprivate unconditionally so a sysroot reused across runs (e.g. when a
+# prior nspawn failed mid-recipe) still becomes private even though we skip the mount.
 mount_rootfs size="8100M": (create_rootfs_image size)
     @mkdir -p {{ _sysroot_dir }}
     @if ! mountpoint -q {{ _sysroot_dir }}; then \
       echo "Mounting rootfs image at {{ _sysroot_dir }}"; \
       sudo mount {{ _sysroot_img }} {{ _sysroot_dir }}; \
     fi
+    @sudo mount --make-rprivate {{ _sysroot_dir }}
 
-# Unmount the ext4 rootfs image.
+# Unmount the ext4 rootfs image.  -R is recursive: a previous nspawn failure
+# (e.g. binfmt missing) can leave /dev tmpfs + bind mounts inside sysroot, and
+# the next nspawn then trips "/dev is pre-mounted and pre-populated".  Fall
+# back to a lazy unmount if any child is still busy so we never stall here.
 unmount_rootfs:
     @if mountpoint -q {{ _sysroot_dir }}; then \
       echo "Unmounting rootfs image from {{ _sysroot_dir }}"; \
-      sudo umount {{ _sysroot_dir }}; \
+      sudo umount -R {{ _sysroot_dir }} 2>/dev/null \
+        || sudo umount -lR {{ _sysroot_dir }}; \
     fi
 
 # Delete the rootfs image and associated sentinels.

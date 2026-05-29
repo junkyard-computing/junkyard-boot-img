@@ -27,12 +27,17 @@ VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 
+# Wrap nspawn invocations through tools/nspawn-wrap.sh so each one starts
+# from a known-good sysroot/dev (no leftover mounts, no stale /dev/pts).
+# See the script header for the systemd >= 260 specifics that motivate it.
+# Trailing `--` separates the wrapper's sysroot arg from the nspawn argv.
+NSPAWN_WRAP := sudo tools/nspawn-wrap.sh $(SYSROOT_DIR) --
 # --resolv-conf=bind-host overrides the container's /etc/resolv.conf for the
 # lifetime of the nspawn session. Packages.txt installs systemd-resolved,
 # whose postinst points /etc/resolv.conf at a stub that only resolves when
 # systemd-resolved is running (it isn't, under nspawn). Without this flag,
 # any nspawn call after that postinst loses DNS, including reruns.
-NSPAWN := sudo systemd-nspawn --resolv-conf=bind-host
+NSPAWN := $(NSPAWN_WRAP) --resolv-conf=bind-host
 
 # Running `make` directly bypasses the env vars set by the justfile (notably
 # KERNEL_VERSION, which is read from kernel/kernel_version). Always go through
@@ -43,25 +48,54 @@ all:
 
 .create_image:
 	mkdir -p $(SYSROOT_DIR)
-	sudo fallocate -l $(SIZE) $(ROOTFS_IMG)
+	# Use truncate (sparse file), not fallocate: the build host's root fs (ext2) returns
+	# "fallocate: Operation not supported". A sparse image is fine for mkfs.ext4 + fastboot.
+	sudo truncate -s $(SIZE) $(ROOTFS_IMG)
 	sudo mkfs.ext4 -F -L rootfs $(ROOTFS_IMG)
 	touch $@
 
 .debootstrap: .create_image
 	just mount_rootfs
 	sudo debootstrap --variant=minbase --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR)
-	sudo systemd-nspawn -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
-	sudo systemd-nspawn -D $(SYSROOT_DIR) symlinks -cr .
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
-	sudo systemd-nspawn -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
+	# nixpkgs heavily patches debootstrap: both the shebang AND in-script
+	# references to dpkg/chroot/unshare are rewritten to absolute /nix/store
+	# paths. --foreign copies the host script verbatim into sysroot, so
+	# inside the nspawn container those paths don't exist and the script
+	# either fails to exec or silently dies on `set -e` when the first
+	# nix-store binary is invoked. Rewrite both:
+	#   - line 1 (shebang): /nix/store/<hash>/bin/bash → /bin/bash
+	#   - lines 2..: strip /nix/store/<hash>/bin/ entirely so PATH lookup
+	#     resolves the (container's own) dpkg, chroot (/usr/sbin), unshare.
+	# No-op on non-Nix hosts (the upstream debootstrap has no /nix/store
+	# references at all).
+	sudo sed -i \
+		-e '1s|^#!/nix/store/[^/]*/bin/|#!/bin/|' \
+		-e '2,$$s|/nix/store/[^/]*/bin/||g' \
+		$(SYSROOT_DIR)/debootstrap/debootstrap
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) symlinks -cr .
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
 	just unmount_rootfs
 	touch $@
 
+# Must build inside the flake's FHS shell so kleaf's host tools (python3, perl, bash,
+# rsync) resolve and Bazel's server starts in the FHS mount namespace:
+#   nix run .#bazel-fhs -- -c 'just build_kernel'
+# --config=local is kleaf's "reduce sandboxes" mode (build/kernel/kleaf/docs/sandbox.md):
+# it runs the in-tree kernel_build/kernel_config actions locally (per-target cache dirs)
+# while keeping modules_install/dtbo/uapi/abi actions sandboxed. This is what makes
+# --config=use_source_tree_aosp (in-tree GKI build) work on NixOS. Do NOT replace it with
+# a blanket --spawn_strategy=local: that forces the sandbox-required actions to run local
+# and they abort with "FATAL: this action must be executed in a sandbox!".
+# NOTE: per the kleaf docs, run `tools/bazel clean` if you change --strategy/--config,
+# else stale cached action outputs cause confusing failures.
 .build_kernel: kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_defconfig_mod/custom_defconfig
 	cd $(KERNEL_SOURCE_DIR); $(BAZEL) run \
 		--config=use_source_tree_aosp \
 		--config=stamp \
 		--config=felix \
+		--config=local \
 		--defconfig_fragment=//custom_defconfig_mod:custom_defconfig \
 		//private/devices/google/felix:gs201_felix_dist
 	@echo "Updating kernel version string"
@@ -153,7 +187,7 @@ all:
 	@echo "Updating System.map"
 	sudo cp $(KERNEL_BUILD_DIR)/System.map $(SYSROOT_DIR)/boot/System.map-$(KERNEL_VERSION)
 	@echo "Updating module dependencies"
-	sudo systemd-nspawn -D $(SYSROOT_DIR) depmod \
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) depmod \
 		--errsyms \
 		--all \
 		--filesyms /boot/System.map-$(KERNEL_VERSION) \
@@ -190,7 +224,7 @@ all:
 	# (/vendor/firmware, set by the dtb's /chosen/bootargs) points at.
 	# Without it, the AOC coprocessor retry-loops in dracut and starves
 	# UART RX, so emergency-shell keystrokes are dropped.
-	sudo systemd-nspawn -D $(SYSROOT_DIR) dracut \
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) dracut \
 		--kver $(KERNEL_VERSION) \
 		--lz4 \
 		--show-modules \
