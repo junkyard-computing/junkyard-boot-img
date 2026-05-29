@@ -57,6 +57,21 @@ all:
 .debootstrap: .create_image
 	just mount_rootfs
 	sudo debootstrap --variant=minbase --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR)
+	# nixpkgs heavily patches debootstrap: both the shebang AND in-script
+	# references to dpkg/chroot/unshare are rewritten to absolute /nix/store
+	# paths. --foreign copies the host script verbatim into sysroot, so
+	# inside the nspawn container those paths don't exist and the script
+	# either fails to exec or silently dies on `set -e` when the first
+	# nix-store binary is invoked. Rewrite both:
+	#   - line 1 (shebang): /nix/store/<hash>/bin/bash → /bin/bash
+	#   - lines 2..: strip /nix/store/<hash>/bin/ entirely so PATH lookup
+	#     resolves the (container's own) dpkg, chroot (/usr/sbin), unshare.
+	# No-op on non-Nix hosts (the upstream debootstrap has no /nix/store
+	# references at all).
+	sudo sed -i \
+		-e '1s|^#!/nix/store/[^/]*/bin/|#!/bin/|' \
+		-e '2,$$s|/nix/store/[^/]*/bin/||g' \
+		$(SYSROOT_DIR)/debootstrap/debootstrap
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) symlinks -cr .
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
