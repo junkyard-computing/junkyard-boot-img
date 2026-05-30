@@ -75,8 +75,10 @@ all:
 
 .create_image:
 	mkdir -p $(SYSROOT_DIR)
-	# Use truncate (sparse file), not fallocate: the build host's root fs (ext2) returns
-	# "fallocate: Operation not supported". A sparse image is fine for mkfs.ext4 + fastboot.
+	# Use truncate, not fallocate: truncate makes a sparse file (8100M nominal but
+	# only the written blocks occupy host disk; `just trim_rootfs` keeps it that
+	# way), whereas fallocate would reserve the full size upfront. Sparse is fine
+	# for mkfs.ext4 + fastboot.
 	sudo truncate -s $(SIZE) $(ROOTFS_IMG)
 	sudo mkfs.ext4 -F -L rootfs $(ROOTFS_IMG)
 	touch $@
