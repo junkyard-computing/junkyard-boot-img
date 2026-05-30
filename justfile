@@ -107,6 +107,9 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootst
         HOSTNAME={{ hostname }} \
         KERNEL_VERSION=$KVER \
         INITRAMFS_PATH={{ _sysroot_dir }}/boot/initrd.img-$KVER
+    # Return blocks freed during the build (apt cache, pruned kernel trees) to
+    # the sparse backing file so boot/rootfs.img doesn't bloat over time.
+    just trim_rootfs
 
 [group('kernel')]
 [working-directory: 'kernel/source']
@@ -204,6 +207,17 @@ unmount_rootfs:
       sudo umount -R {{ _sysroot_dir }} 2>/dev/null \
         || sudo umount -lR {{ _sysroot_dir }}; \
     fi
+
+# Reclaim host disk space without rebuilding: return blocks freed inside the
+# rootfs image back to its sparse backing file. The image is a fixed-size ext4
+# file reused across builds, and neither ext4 nor the loop device hand freed
+# blocks back without an explicit fstrim, so the backing file only ever grows.
+# `just all` runs this automatically at the end; run it standalone any time to
+# shrink boot/rootfs.img on disk.
+[group('rootfs')]
+trim_rootfs: mount_rootfs
+    sudo fstrim -v {{ _sysroot_dir }}
+    just unmount_rootfs
 
 # Delete the rootfs image and associated sentinels.
 [group('rootfs')]

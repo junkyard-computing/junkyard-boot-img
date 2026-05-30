@@ -178,6 +178,10 @@ all:
 	# Packages from rootfs/packages.txt plus the staged kmscon .deb.
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"DEBIAN_FRONTEND=noninteractive apt-get -y install $(APT_PACKAGES) /var/cache/apt/archives/kmscon.deb"
+	# Drop the downloaded .deb cache so it doesn't accumulate in the image across
+	# rebuilds — it otherwise grows every time the snapshot pin / package set
+	# changes (new versions fetched, old ones never purged).
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "apt-get clean"
 	# Unprivileged user with passwordless sudo. Paired with the autologin
 	# override in rootfs/overlay/etc/systemd/system/kmsconvt@.service.d/.
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
@@ -275,6 +279,16 @@ all:
 	# Strip blacklisted modules so dracut --force-drivers doesn't pull them
 	# into the initramfs despite /etc/modprobe.d/blacklist.conf.
 	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d' $(MODULE_ORDER_PATH)
+	# Prune module/header/boot trees from other kernel versions so a
+	# KERNEL_VERSION bump doesn't accumulate stale ones in the image. (The new
+	# version's initrd is (re)created later in .install_initramfs.)
+	sudo find $(SYSROOT_DIR)/lib/modules -mindepth 1 -maxdepth 1 -type d \
+		! -name '$(KERNEL_VERSION)' -exec rm -rf {} +
+	sudo find $(SYSROOT_DIR)/usr/src -mindepth 1 -maxdepth 1 -type d \
+		-name 'linux-headers-*' ! -name 'linux-headers-$(KERNEL_VERSION)' -exec rm -rf {} +
+	sudo find $(SYSROOT_DIR)/boot -mindepth 1 -maxdepth 1 \
+		\( -name 'initrd.img-*' -o -name 'System.map-*' \) \
+		! -name '*-$(KERNEL_VERSION)' -exec rm -f {} +
 	just unmount_rootfs
 	touch $@
 
