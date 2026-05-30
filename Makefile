@@ -209,8 +209,12 @@ all:
 	# escape in /etc/issue (login banner); /etc/image-version is a standalone
 	# discoverable copy. Must run inside nspawn — /etc/os-release is a symlink
 	# into /usr/lib, which only resolves correctly within the container.
+	# Strip any prior IMAGE_* lines before appending so re-running this stage on
+	# an existing image doesn't accumulate duplicates. --follow-symlinks edits
+	# the symlink target in place, keeping /etc/os-release a symlink.
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
-		"echo 'IMAGE_VERSION=\"$(IMAGE_VERSION)\"' >> /etc/os-release; \
+		"sed -i --follow-symlinks '/^IMAGE_VERSION=/d; /^IMAGE_BUILD_DATE=/d' /etc/os-release; \
+		echo 'IMAGE_VERSION=\"$(IMAGE_VERSION)\"' >> /etc/os-release; \
 		echo 'IMAGE_BUILD_DATE=\"$(BUILD_DATE)\"' >> /etc/os-release; \
 		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version"
 	just unmount_rootfs
