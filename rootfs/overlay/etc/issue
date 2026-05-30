@@ -2,5 +2,6 @@ Debian GNU/Linux \n \l
 
 Image:  \S{IMAGE_VERSION}  (built \S{IMAGE_BUILD_DATE})
 Kernel: \r
+Battery: n/a
 IPv4:   \4
 
