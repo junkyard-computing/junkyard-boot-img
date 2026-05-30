@@ -44,11 +44,11 @@ OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 SNAPSHOT ?= $(shell cat rootfs/debian_snapshot 2>/dev/null)
 MIRROR ?= $(if $(SNAPSHOT),https://snapshot.debian.org/archive/debian/$(SNAPSHOT)/,)
 
-# Image version string for /etc/os-release + the login banner. VERSION holds
-# the human-bumped number; the git short hash (and -dirty marker) pin it to a
-# build. BUILD_DATE is informational — the snapshot pin above is the actual
-# reproducibility anchor, not the build date.
-IMAGE_BASE_VERSION := $(shell cat VERSION 2>/dev/null || echo 0.0.0)
+# Image version string for /etc/os-release + the login banner. version.txt holds
+# the human-bumped number (managed by release-please); the git short hash (and
+# -dirty marker) pin it to a build. BUILD_DATE is informational — the snapshot
+# pin above is the actual reproducibility anchor, not the build date.
+IMAGE_BASE_VERSION := $(shell cat version.txt 2>/dev/null || echo 0.0.0)
 GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 GIT_DIRTY := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo -dirty)
 IMAGE_VERSION ?= $(IMAGE_BASE_VERSION)-g$(GIT_REV)$(GIT_DIRTY)
@@ -142,7 +142,7 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.install_packages: .debootstrap $(APT_PACKAGES_FILE) $(OVERLAY_FILES) VERSION
+.install_packages: .debootstrap $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt
 	just mount_rootfs
 	# apt tuning for the snapshot.debian.org mirror (all harmless on the live
 	# mirror, so written unconditionally):
