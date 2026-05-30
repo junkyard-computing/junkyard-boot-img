@@ -1,0 +1,34 @@
+# Automates releases from Conventional Commits using release-please.
+#
+# On every push to main, release-please maintains a "release PR" that bumps
+# version.txt and updates CHANGELOG.md based on the feat:/fix:/... commits since
+# the last release. Merging that PR tags the release (vX.Y.Z) and publishes a
+# GitHub Release. version.txt is the same file the Makefile reads to stamp
+# IMAGE_VERSION into the image, so a release and the on-device version stay in
+# sync. Config lives in release-please-config.json + .release-please-manifest.json.
+
+name: release-please
+
+on:
+  # Re-evaluate the pending release on every push to the default branch.
+  push:
+    branches:
+      - main
+  # Allow kicking it manually from the Actions tab.
+  workflow_dispatch:
+
+# The action opens/updates the release PR and creates releases/tags on merge.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # Uses the default GITHUB_TOKEN. Note: PRs/commits made with GITHUB_TOKEN
+      # do not themselves trigger other workflows (e.g. build-kernel), so the
+      # release PR won't run CI. Swap in a PAT here if that's needed later.
+      - uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

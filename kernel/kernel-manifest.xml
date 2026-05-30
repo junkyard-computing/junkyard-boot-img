@@ -1,0 +1,154 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<manifest>
+  <remote name="aosp" fetch="https://android.googlesource.com/"/>
+  
+  <default remote="aosp" revision="android-gs-felix-6.1-android16" sync-j="4"/>
+  
+  <project name="kernel/build" path="build/kernel" revision="6483b5a6b74251440b266536c2dbc902a4fa3cf2" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner">
+    <linkfile src="kleaf/bazel.sh" dest="tools/bazel"/>
+    <linkfile src="build.sh" dest="build/build.sh"/>
+    <linkfile src="build_abi.sh" dest="build/build_abi.sh"/>
+    <linkfile src="build_test.sh" dest="build/build_test.sh"/>
+    <linkfile src="build_utils.sh" dest="build/build_utils.sh"/>
+    <linkfile src="config.sh" dest="build/config.sh"/>
+    <linkfile src="envsetup.sh" dest="build/envsetup.sh"/>
+    <linkfile src="_setup_env.sh" dest="build/_setup_env.sh"/>
+    <linkfile src="multi-switcher.sh" dest="build/multi-switcher.sh"/>
+    <linkfile src="abi" dest="build/abi"/>
+    <linkfile src="static_analysis" dest="build/static_analysis"/>
+  </project>
+  <project name="kernel/common" path="aosp" revision="8769cc47188c3bdca2a34d39ba0f39a945b85465" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner">
+    <linkfile src="build.config.constants" dest="common/build.config.constants"/>
+    <linkfile src="modules.bzl" dest="common/modules.bzl"/>
+  </project>
+  <project name="kernel/configs" revision="daf795dc9fa9a1174fd4fd1d222bc2949f425f0e" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16"/>
+  <project name="kernel/devices/google/akita" path="private/devices/google/akita" revision="b40eeb239b427c31762bcb1fcd0ac74ad54bd625" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="akita,partner">
+    <linkfile src="build_akita.sh" dest="build_akita.sh"/>
+    <linkfile src="device.bazelrc" dest=".d5.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/bluejay" path="private/devices/google/bluejay" revision="a501ab25545aa5e700b9499e25c1a9f4d7d2cd51" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="bluejay,partner">
+    <linkfile src="build_bluejay.sh" dest="build_bluejay.sh"/>
+    <linkfile src="device.bazelrc" dest=".d14.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/caimito" path="private/devices/google/caimito" revision="eebf64fead2640f127aeb57c06b4c10fc772e200" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="caimito,partner">
+    <linkfile src="build_caimito.sh" dest="build_caimito.sh"/>
+    <linkfile src="device.bazelrc" dest=".d7.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/comet" path="private/devices/google/comet" revision="73f3ef22785d005eb289fc865639b5e38e960c33" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="comet,partner">
+    <linkfile src="build_comet.sh" dest="build_comet.sh"/>
+    <linkfile src="device.bazelrc" dest=".d8.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/common" path="private/devices/google/common" revision="397babd94c06783d8430c838475955f0b6ff63c2" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner">
+    <linkfile src="bazel.WORKSPACE" dest="WORKSPACE"/>
+    <linkfile src="device.bazelrc" dest="device.bazelrc"/>
+    <linkfile src="update_symbol_list.sh" dest="update_symbol_list.sh"/>
+    <linkfile src="kleaf/common.BUILD.bazel" dest="common/BUILD.bazel"/>
+  </project>
+  <project name="kernel/devices/google/felix" path="private/devices/google/felix" revision="6bd09fab072cf13dad9cbf3e7e7d4051a9b13146" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="felix,partner">
+    <linkfile src="build_felix.sh" dest="build_felix.sh"/>
+    <linkfile src="device.bazelrc" dest=".d2.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/gs101" path="private/devices/google/gs101" revision="e454cd09e0e79d26dae1b989c455fddbdb829f48" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner">
+    <linkfile src="build_gs101.sh" dest="build_gs101.sh"/>
+    <linkfile src="device.bazelrc" dest=".c1.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/gs201" path="private/devices/google/gs201" revision="606d4345bc0dc66e3bc0a8deaa97cc288bbf53d1" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner">
+    <linkfile src="build_gs201.sh" dest="build_gs201.sh"/>
+    <linkfile src="device.bazelrc" dest=".c2.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/lynx" path="private/devices/google/lynx" revision="2347bbf27aba764d7f93fb8a75df6e9d59eda5be" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="lynx,partner">
+    <linkfile src="build_lynx.sh" dest="build_lynx.sh"/>
+    <linkfile src="device.bazelrc" dest=".d15.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/pantah" path="private/devices/google/pantah" revision="f72c062f05eee1d45a4c43ca1f53ad41116f547f" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="pantah,partner">
+    <linkfile src="build_pantah.sh" dest="build_pantah.sh"/>
+    <linkfile src="device.bazelrc" dest=".d1.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/raviole" path="private/devices/google/raviole" revision="1013981b6f79b90077f7453bad944a27389761a1" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner,raviole">
+    <linkfile src="build_raviole.sh" dest="build_raviole.sh"/>
+    <linkfile src="device.bazelrc" dest=".d13.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/shusky" path="private/devices/google/shusky" revision="a88953f657282d6e52c6c0b3669ca3a890907518" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner,shusky">
+    <linkfile src="build_shusky.sh" dest="build_shusky.sh"/>
+    <linkfile src="device.bazelrc" dest=".d4.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/tangorpro" path="private/devices/google/tangorpro" revision="cd669ce56d32a7577d74c5e2c83b31fb91e85e92" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner,tangorpro">
+    <linkfile src="build_tangorpro.sh" dest="build_tangorpro.sh"/>
+    <linkfile src="device.bazelrc" dest=".d3.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/tegu" path="private/devices/google/tegu" revision="efe0745d8ea9023c3bb57ea9acacd4c2fe91f5eb" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner,tegu">
+    <linkfile src="build_tegu.sh" dest="build_tegu.sh"/>
+    <linkfile src="device.bazelrc" dest=".d9.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/zuma" path="private/devices/google/zuma" revision="eb90f2862e78b4c409ff992e116c44e81f836e9e" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner">
+    <linkfile src="build_zuma.sh" dest="build_zuma.sh"/>
+    <linkfile src="device.bazelrc" dest=".c3.bazelrc"/>
+  </project>
+  <project name="kernel/devices/google/zumapro" path="private/devices/google/zumapro" revision="23fcad2b0bc47b595e2b46b41906c19a110ba3f1" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner">
+    <linkfile src="build_zumapro.sh" dest="build_zumapro.sh"/>
+    <linkfile src="device.bazelrc" dest=".c4.bazelrc"/>
+  </project>
+  <project name="kernel/google-modules/amplifiers" path="private/google-modules/amplifiers" revision="aba0cca145df5e55d1c5c4294a90bc382b0d2ec1" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/aoc" path="private/google-modules/aoc" revision="cda4de7727f019dd432f5ad0748d7e025069e362" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/aoc-ipc" path="private/google-modules/aoc_ipc" revision="13f181684aec31f2329f1ed8806a351b7e0befc1" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/bluetooth/broadcom" path="private/google-modules/bluetooth/broadcom" revision="07ab6e37055eed9f22de68dcb30c87ff65c2f848" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/bluetooth/qcom" path="private/google-modules/bluetooth/qcom" revision="7dfb0647b8e7d92aeb998cc5a791332291738b31" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/bms" path="private/google-modules/bms" revision="0dc346205b6bd3fdc5a963df1ceffb625eae001e" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/display/common" path="private/google-modules/display/common" revision="ef3e3024e35592dc32bf9d63c81b02b08fc908ab" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/display/panels/caimito" path="private/google-modules/display/panels/caimito" revision="88db832cc8bec5fcf17b5a9947e846e23140795b" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/display/panels/tegu" path="private/google-modules/display/panels/tegu" revision="176d16755a84d95e081ab23ae7cd20e67e253587" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/display/samsung" path="private/google-modules/display/samsung" revision="5a7677a080329e38b6cdd4c174bfc97c0fb3c627" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/edgetpu/abrolhos" path="private/google-modules/edgetpu/abrolhos" revision="390b6430f556e93f9f62cad0dda322f4fbb4885c" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/edgetpu/janeiro" path="private/google-modules/edgetpu/janeiro" revision="ae39d756d3a3ae455adbc35b39bf23056ccd4ee0" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/edgetpu/rio" path="private/google-modules/edgetpu/rio" revision="833176f56239154c046a4c3fda0ab65a24230005" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/fingerprint/fpc" path="private/google-modules/fingerprint/fpc" revision="54ca148b1a0360d269abf2308466a93877db7d59" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/fingerprint/goodix" path="private/google-modules/fingerprint/goodix" revision="8d4e93d25498eefa722b497994c7f3e9305000b3" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/fingerprint/qcom/qfs4008" path="private/google-modules/fingerprint/qcom/qfs4008" revision="accfa699079e0c139962c4c25b4402763c0a62d9" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/gps/broadcom/bcm47765" path="private/google-modules/gps/broadcom/bcm47765" revision="0d8344da0cf059ee2a682e49f07a3d27b925f4db" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/gpu" path="private/google-modules/gpu" revision="c009f0a10bf01666ee94f7a3f96e8ad1f122a2ed" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/gxp/gs201" path="private/google-modules/gxp/gs201" revision="283663ce76e563a00414d61804a316b6fd9697a0" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/gxp/zuma" path="private/google-modules/gxp/zuma" revision="bd5802a69fe100b45f3c182614d78da2bf07c9ab" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/hdcp/samsung" path="private/google-modules/hdcp/samsung" revision="63cca3412155a93c59fe24becd83b69c423c125f" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/lwis" path="private/google-modules/lwis" revision="d44129763e045e0e6a5b12ca77f2255d8c372989" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/misc" path="private/google-modules/misc" revision="9eac86cd1621e0fdf7638a0b123bc2e83b0586e6" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/nfc" path="private/google-modules/nfc" revision="b53ac218abc51ffe46537063639f28ac3a3e9a4a" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/perf" path="private/google-modules/perf" revision="7de380977283cc556eb6d00f68acb45f34c37eab" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/power/mitigation" path="private/google-modules/power/mitigation" revision="9283a43dd0b5988531933670cc2bc158565ab6a8" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/power/reset" path="private/google-modules/power/reset" revision="a7bee02c8bcc9aa4fbf373eed1b576b958b55979" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/radio/samsung/s5300" path="private/google-modules/radio/samsung/s5300" revision="232fb16b3dbc3c4126d9ac0b2a0f0f514e1290c8" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/radio/samsung/s5400" path="private/google-modules/radio/samsung/s5400" revision="42c515afbe75b28ee10a756e69b30ff89783b9ff" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/sensors/hall_sensor" path="private/google-modules/sensors/hall_sensor" revision="19dd3dd8a29f7ed7f065dc4fb2c50e7fa86e8765" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/soc/gs" path="private/google-modules/soc/gs" revision="057ab18a9cc0e318538b419eafc565a7fbe1d320" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/touch/common" path="private/google-modules/touch/common" revision="d154476fbdeebd549708cfe03dee5db052f26ca6" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/touch/focaltech_touch" path="private/google-modules/touch/focaltech" revision="fb3df485d8bbf55b6c4adac5b9a341625d8525ba" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/touch/fts_touch" path="private/google-modules/touch/fts" revision="710d3b897ca2a8948f8d7f4639af639da07b9a17" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/touch/goodix_touch" path="private/google-modules/touch/goodix" revision="205de800f71c8510d7d704eb3463268606e162dc" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/touch/novatek_touch" path="private/google-modules/touch/novatek" revision="ab0784a2903c08fb69b06c8fcb54f1a3a28c45b0" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/touch/sec_touch" path="private/google-modules/touch/sec" revision="77f50958ac3ef48fa48895e4a22d05a2d693318b" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/touch/synaptics_touch" path="private/google-modules/touch/synaptics" revision="fe9383677e7a711ad540e080e11df876baa5f3f6" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/trusty" path="private/google-modules/trusty" revision="a246a43b65f94226030655a9c6087addbbb9168e" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/typec" path="private/google-modules/typec" revision="333f14ac78cd2294343ed3edbf917776b13f4c43" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/uwb/qorvo/dw3000" path="private/google-modules/uwb/qorvo/dw3000" revision="11a0813757dbcc9dd4818a807a8d000eb4766916" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/uwb/qorvo/qm35" path="private/google-modules/uwb/qorvo/qm35" revision="b7f7fc30d8d941814343cb393d4a69636bf27b0a" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/video/gchips" path="private/google-modules/video/gchips" revision="0f32128cf4129b967dac3b4d344139e98fed598d" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/wlan/bcmdhd/bcm4383" path="private/google-modules/wlan/bcm4383" revision="31edc3c393666104d2ae62fbccfaeeaaee6adee1" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/wlan/bcmdhd/bcm4389" path="private/google-modules/wlan/bcm4389" revision="1366c40e1c7e70cde31a4c1f1fd91d189a251714" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/wlan/bcmdhd/bcm4390" path="private/google-modules/wlan/bcm4390" revision="60a0ce53c5286f0a8790d455dcd359aa23f5afac" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/wlan/bcmdhd/bcm4398" path="private/google-modules/wlan/bcm4398" revision="85d6c7b2eb4e81fffb3cb349db06c885bfc0005b" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/wlan/qcom/wcn6740/cnss2" path="private/google-modules/wlan/wcn6740/cnss2" revision="de20d6d20e7b58c79871c94e28cd8e74938af257" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/wlan/qcom/wcn6740/wlan" path="private/google-modules/wlan/wcn6740/wlan" revision="05544565496f121bc1ecbf35b55b3b3e1b055022" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/wlan/syna/dhd43752p" path="private/google-modules/wlan/dhd43752p" revision="bc03aa1a48cd6cb12ae0299499f09fca8762c0b1" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/google-modules/wlan/wlan_ptracker" path="private/google-modules/wlan/wlan_ptracker" revision="b5cdb06bd7bbdc304064dd7177e7f7aa372b7ffc" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="kernel/prebuilts/build-tools" path="prebuilts/kernel-build-tools" revision="e905be252a53d20c52bd9e59df3ff8fdd46b9eab" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/build/bazel_common_rules" path="build/bazel_common_rules" revision="5601949bfbbf8e745e6a73948b0be7379aa61b38" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/external/bazel-skylib" path="external/bazel-skylib" revision="f998e5dc13c03f0eae9e373263d3afff0932c738" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/external/python/absl-py" path="external/python/absl-py" revision="2f199605a9875340569e039657f8b4c72d51b84d" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/external/stardoc" path="external/stardoc" revision="e83f522ee95419e55d2c5654aa6e0143beeef595" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/prebuilts/bazel/linux-x86_64" path="prebuilts/bazel/linux-x86_64" revision="7bfbec9e829bbae6816d5f39aba345df76e627c1" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/prebuilts/build-tools" path="prebuilts/build-tools" revision="c181f690fe9b76142b3203c2ab959b6299d4d1fd" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/prebuilts/clang/host/linux-x86" path="prebuilts/clang/host/linux-x86" revision="7775eb113f960bc69a780b621d03a715914d4bca" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8" path="prebuilts/gcc/linux-x86/host/x86_64-linux-glibc2.17-4.8" revision="f6d40532273c8bd628b960ecc0970c7294c8d891" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/prebuilts/jdk/jdk11" path="prebuilts/jdk/jdk11" revision="649eec4416e2ed6298af49a56876772767a0e5ae" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="platform/system/tools/mkbootimg" path="tools/mkbootimg" revision="615a1fced5f8e2755642d30357674d3bfa21b85e" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+  <project name="toolchain/prebuilts/ndk/r23" path="prebuilts/ndk-r23" revision="19ac7e4eded12adb99d4f613490dde6dd0e72664" upstream="android-gs-felix-6.1-android16" dest-branch="android-gs-felix-6.1-android16" groups="partner"/>
+</manifest>

@@ -4,5 +4,7 @@
 !.gitignore
 !_enter
 !packages.txt
+!debian_snapshot
+!kmscon.env
 !overlay
 !overlay/**

@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh battery readout in the login banner
+
+[Timer]
+# First refresh shortly after boot, then once a minute. Battery % changes
+# slowly, so a coarse interval (with slack) is plenty and stays cheap.
+OnBootSec=5s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

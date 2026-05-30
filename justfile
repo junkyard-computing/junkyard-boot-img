@@ -48,6 +48,12 @@ _initramfs_path := join(_sysroot_dir, "boot", "initrd.img-" + _kernel_version)
 # Vendor firmware extraction (Pixel Fold / felix OTA).
 [private]
 _felix_ota_url := "https://dl.google.com/dl/android/aosp/felix-ota-cp1a.260405.005-7a13341e.zip"
+# We can't redistribute the OTA, but we pin it by content hash: sync_vendor_firmware
+# verifies the downloaded zip against this, so a rotated/corrupt OTA fails loudly
+# instead of silently changing the vendor firmware. (The zip's content matches the
+# `-7a13341e` prefix Google embeds in the URL.)
+[private]
+_felix_ota_sha256 := "7a13341eb090a7656e67e1244b832420ffe6c7c0f2530d544ab9e7e23c69ff56"
 [private]
 _vendor_firmware_workdir := join(justfile_directory(), "rootfs", "vendor-firmware")
 [private]
@@ -101,24 +107,56 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootst
         HOSTNAME={{ hostname }} \
         KERNEL_VERSION=$KVER \
         INITRAMFS_PATH={{ _sysroot_dir }}/boot/initrd.img-$KVER
+    # Return blocks freed during the build (apt cache, pruned kernel trees) to
+    # the sparse backing file so boot/rootfs.img doesn't bloat over time.
+    just trim_rootfs
 
 [group('kernel')]
 [working-directory: 'kernel/source']
 clone_kernel_source android_kernel_branch="android-gs-felix-6.1-android16":
     @echo "Cloning Android kernel from branch: {{ android_kernel_branch }}"
-    # `< /dev/null`: repo init's interactive color prompt otherwise writes color.ui
-    # to the global git config — on NixOS (home-manager) that's a read-only
-    # /nix/store symlink, so the write fails with "Read-only file system".
+    # `< /dev/null` on every `repo init`: its interactive color prompt otherwise
+    # writes color.ui to the global git config — on NixOS (home-manager) that's a
+    # read-only /nix/store symlink, so the write fails "Read-only file system".
     # Non-interactive stdin makes repo default the prompt to "no" (no write).
-    {{ _repo }} init \
-      --depth=1 \
-      -u https://android.googlesource.com/kernel/manifest \
-      -b {{ android_kernel_branch }} \
-      < /dev/null
+    #
+    # Reproducibility: if a pinned manifest exists (kernel/kernel-manifest.xml,
+    # produced by `just pin_kernel_source`), select it so sync checks out the exact
+    # recorded per-project SHAs instead of whatever the branch tips are today. The
+    # pinned path is a FULL (non-shallow) init — a --depth=1 clone can only fetch
+    # current branch tips, so it can't reach a pinned SHA once the branch advances.
+    # With no pin, stay shallow for a fast first sync, then run pin_kernel_source.
+    if [ -f {{ justfile_directory() }}/kernel/kernel-manifest.xml ]; then \
+        echo "Pinned manifest found — full sync against recorded SHAs"; \
+        {{ _repo }} init \
+          -u https://android.googlesource.com/kernel/manifest \
+          -b {{ android_kernel_branch }} \
+          < /dev/null; \
+        cp {{ justfile_directory() }}/kernel/kernel-manifest.xml .repo/manifests/; \
+        {{ _repo }} init -m kernel-manifest.xml < /dev/null; \
+    else \
+        echo "No pinned manifest — shallow init (run 'just pin_kernel_source' to lock)"; \
+        {{ _repo }} init \
+          --depth=1 \
+          -u https://android.googlesource.com/kernel/manifest \
+          -b {{ android_kernel_branch }} \
+          < /dev/null; \
+    fi
     {{ _repo }} sync -j {{ num_cpus() }}
     if [ ! -e custom_defconfig_mod ]; then \
         ln -s ../custom_defconfig_mod ./; \
     fi
+
+# Lock the kernel source to its current per-project SHAs by regenerating
+# kernel/kernel-manifest.xml from the synced tree. Commit the result; thereafter
+# clone_kernel_source does a full sync against these exact revisions. Re-run
+# after an intentional kernel branch/version bump, then rebuild kernel + rootfs
+# modules in lockstep.
+[group('kernel')]
+[working-directory: 'kernel/source']
+pin_kernel_source:
+    {{ _repo }} manifest -r -o {{ justfile_directory() }}/kernel/kernel-manifest.xml
+    @echo "Wrote kernel/kernel-manifest.xml — commit it to lock the kernel source."
 
 [group('kernel')]
 [working-directory: 'kernel/source']
@@ -170,6 +208,17 @@ unmount_rootfs:
         || sudo umount -lR {{ _sysroot_dir }}; \
     fi
 
+# Reclaim host disk space without rebuilding: return blocks freed inside the
+# rootfs image back to its sparse backing file. The image is a fixed-size ext4
+# file reused across builds, and neither ext4 nor the loop device hand freed
+# blocks back without an explicit fstrim, so the backing file only ever grows.
+# `just all` runs this automatically at the end; run it standalone any time to
+# shrink boot/rootfs.img on disk.
+[group('rootfs')]
+trim_rootfs: mount_rootfs
+    sudo fstrim -v {{ _sysroot_dir }}
+    just unmount_rootfs
+
 # Delete the rootfs image and associated sentinels.
 [group('rootfs')]
 clean_rootfs: unmount_rootfs
@@ -181,6 +230,16 @@ clean_rootfs: unmount_rootfs
 # so the next `just all` skips the ~1hr kernel build and ~2GB OTA download.
 clean: unmount_rootfs
     {{ _make }} -C {{ justfile_directory() }} clean
+
+# Refresh the snapshot.debian.org pins: the Debian archive timestamp
+# (rootfs/debian_snapshot, read via the Makefile's SNAPSHOT/MIRROR) and the
+# kmscon .deb URL+hash (rootfs/kmscon.env, -include'd by the Makefile). With no
+# args, pins the latest snapshot and refreshes kmscon; pass through tool flags
+# otherwise, e.g. `just update_snapshot --date 2026-05-01`,
+# `just update_snapshot --no-kmscon`, or `just update_snapshot --dry-run`.
+[group('rootfs')]
+update_snapshot *args:
+    {{ justfile_directory() }}/tools/update-snapshot.sh {{ args }}
 
 [group('rootfs')]
 build_rootfs debootstrap_release="trixie" root_password="0000" hostname="fold" size="8100M":
@@ -215,6 +274,10 @@ sync_vendor_firmware:
     # Download the OTA zip once. ~2GB; subsequent runs are cheap.
     [ -f {{ _vendor_firmware_workdir }}/felix-ota.zip ] || \
       {{ _curl }} -L --fail -o {{ _vendor_firmware_workdir }}/felix-ota.zip "{{ _felix_ota_url }}"
+
+    # Verify the OTA against its pinned hash — runs for cached downloads too, so a
+    # stale or tampered zip is caught before we extract vendor firmware from it.
+    echo "{{ _felix_ota_sha256 }}  {{ _vendor_firmware_workdir }}/felix-ota.zip" | sha256sum -c -
 
     # Pull payload.bin out of the zip.
     [ -f {{ _vendor_firmware_workdir }}/payload.bin ] || \
