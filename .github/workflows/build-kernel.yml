@@ -27,12 +27,41 @@ jobs:
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
+      # Reclaim space on the root volume. ubuntu-latest ships only ~14 GB free on
+      # / but a ~70 GB ephemeral disk at /mnt. The AOSP `repo sync` + Bazel build
+      # is tens of GB, and Bazel's output base lives under ~/.cache/bazel (on /),
+      # so a full kernel build exhausts / and the runner dies with
+      # "No space left on device". Drop the preinstalled toolchains we never use
+      # to buy back ~25-30 GB on /.
+      - name: Free up disk space on the root volume
+        run: |
+          echo "Before:"; df -h / /mnt
+          sudo rm -rf \
+            /opt/hostedtoolcache \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          echo "After:"; df -h / /mnt
+
       # Mounts a volatile overlayfs over the working directory to speed up the build.
       # All file writes go to a temporary in-memory layer instead of hitting the disk directly.
+      # The upper/work layers are placed on the large /mnt ephemeral disk (not /),
+      # so the repo checkout and in-tree build outputs don't crowd the small root
+      # volume. (Bazel's own output base still lives under ~/.cache/bazel on /,
+      # which is why the cleanup step above is also required.)
       - name: Mount volatile overlayfs for faster builds
         run: |
-          mkdir a b c
-          sudo mount -t overlay overlay -o lowerdir="$PWD/a",upperdir="$PWD/b",workdir="$PWD/c",volatile "$PWD"
+          mkdir a
+          sudo mkdir -p /mnt/overlay/upper /mnt/overlay/work
+          sudo chown "$(id -u):$(id -g)" /mnt/overlay/upper /mnt/overlay/work
+          sudo mount -t overlay overlay \
+            -o lowerdir="$PWD/a",upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work,volatile \
+            "$PWD"
 
       # Checks out the repository under $GITHUB_WORKSPACE so subsequent steps
       # can access the kernel source, config files, and justfiles.
