@@ -36,6 +36,19 @@ VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 
+# Pre-built aarch64 binary copied into the overlay tree by .build_pixel_devinfo.
+# Source-of-truth lives in the tools/pixel-devinfo submodule
+# (github.com/junkyard-computing/pixel-devinfo). Used by the
+# mark-slot-successful systemd unit to clear the bootloader's slot retry
+# counter so the device doesn't fall into fastboot after a few boots. The
+# flake's default devShell exports CROSS_COMPILE=aarch64-unknown-linux-gnu-,
+# reused below as the cargo linker + strip prefix.
+PIXEL_DEVINFO_DIR ?= tools/pixel-devinfo
+PIXEL_DEVINFO_TARGET ?= aarch64-unknown-linux-gnu
+PIXEL_DEVINFO_BIN ?= $(PIXEL_DEVINFO_DIR)/target/$(PIXEL_DEVINFO_TARGET)/release/pixel-devinfo
+PIXEL_DEVINFO_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-devinfo
+PIXEL_DEVINFO_SOURCES := $(wildcard $(PIXEL_DEVINFO_DIR)/Cargo.toml $(PIXEL_DEVINFO_DIR)/Cargo.lock $(PIXEL_DEVINFO_DIR)/src/*.rs)
+
 # Debian archive pin. rootfs/debian_snapshot holds a snapshot.debian.org
 # timestamp (managed by `just update_snapshot`); pinning the mirror is what
 # makes a given IMAGE_VERSION reproducible. An empty pin leaves MIRROR empty,
@@ -144,7 +157,18 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.install_packages: .debootstrap $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt
+# Cross-compile the pixel-devinfo binary into the overlay tree. Runs in the
+# flake's default devShell (rust toolchain + CROSS_COMPILE both provided there).
+.build_pixel_devinfo: $(PIXEL_DEVINFO_SOURCES)
+	cd $(PIXEL_DEVINFO_DIR) && \
+		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(CROSS_COMPILE)gcc \
+		cargo build --release --target $(PIXEL_DEVINFO_TARGET)
+	$(CROSS_COMPILE)strip $(PIXEL_DEVINFO_BIN)
+	mkdir -p $(dir $(PIXEL_DEVINFO_OVERLAY))
+	install -m 0755 $(PIXEL_DEVINFO_BIN) $(PIXEL_DEVINFO_OVERLAY)
+	touch $@
+
+.install_packages: .debootstrap .build_pixel_devinfo $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt
 	just mount_rootfs
 	# apt tuning for the snapshot.debian.org mirror (all harmless on the live
 	# mirror, so written unconditionally):

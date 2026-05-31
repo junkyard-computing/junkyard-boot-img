@@ -3,12 +3,18 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    # Cross-capable Rust toolchains for building tools/pixel-devinfo to aarch64.
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { self, nixpkgs }:
+  outputs = { self, nixpkgs, rust-overlay }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
-      eachSystem = f: nixpkgs.lib.genAttrs systems (s: f nixpkgs.legacyPackages.${s});
+      eachSystem = f: nixpkgs.lib.genAttrs systems
+        (s: f (import nixpkgs { system = s; overlays = [ rust-overlay.overlays.default ]; }));
 
       # Everything the build host needs, grouped by build stage.
       buildToolsFor = pkgs: with pkgs; [
@@ -78,12 +84,21 @@
           # (the AOSP/Bazel path brings its own hermetic toolchain).
           crossCC = pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc;
           crossPrefix = crossCC.targetPrefix; # "aarch64-unknown-linux-gnu-"
+          # Rust toolchain for cross-building tools/pixel-devinfo to aarch64.
+          # `targets` adds the aarch64 std lib alongside the host std — the host
+          # std is still needed so clap's proc-macro derive compiles for the
+          # build machine while the final binary targets aarch64. The cross
+          # linker is $(CROSS_COMPILE)gcc, wired via CARGO_TARGET_*_LINKER in the
+          # Makefile's .build_pixel_devinfo target.
+          rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
+            targets = [ "aarch64-unknown-linux-gnu" ];
+          };
         in
         {
           # Default: clean shell for the mainline kbuild track, the rootfs
           # stages, image packaging, and flashing.
           default = pkgs.mkShell {
-            packages = buildToolsFor pkgs;
+            packages = buildToolsFor pkgs ++ [ rustToolchain ];
             nativeBuildInputs = [ crossCC ];
             shellHook = ''
               export ARCH=arm64

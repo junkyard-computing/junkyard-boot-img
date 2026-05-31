@@ -1,3 +1,6 @@
 [submodule "tools/mkbootimg"]
 	path = tools/mkbootimg
 	url = https://android.googlesource.com/platform/system/tools/mkbootimg
+[submodule "tools/pixel-devinfo"]
+	path = tools/pixel-devinfo
+	url = https://github.com/junkyard-computing/pixel-devinfo.git
