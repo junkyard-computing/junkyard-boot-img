@@ -178,5 +178,6 @@ tools/payload-dumper-go/
 # sources are tracked).
 tools/memdump/memdump
 
-# USB register capture dumps (local debugging data).
-aosp-vs-mainline/**/*.bin
+# USB register capture sessions (local debugging scratch: *.bin register dumps
+# plus per-capture context.txt notes). Whole tree is throwaway per-capture data.
+aosp-vs-mainline/
