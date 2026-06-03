@@ -36,15 +36,16 @@ VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 
-# Pre-built aarch64 binary copied into the overlay tree by .build_pixel_devinfo.
-# Source-of-truth lives in the tools/pixel-devinfo submodule
-# (github.com/junkyard-computing/pixel-devinfo). Used by the
+# Pre-built static aarch64-musl binary copied into the overlay tree by
+# .build_pixel_devinfo. Source-of-truth lives in the tools/pixel-devinfo
+# submodule (github.com/junkyard-computing/pixel-devinfo). Used by the
 # mark-slot-successful systemd unit to clear the bootloader's slot retry
-# counter so the device doesn't fall into fastboot after a few boots. The
-# flake's default devShell exports CROSS_COMPILE=aarch64-unknown-linux-gnu-,
-# reused below as the cargo linker + strip prefix.
+# counter so the device doesn't fall into fastboot after a few boots.
+# Static musl => no dynamic loader / glibc dependency, so the binary runs
+# unchanged on the Debian rootfs (a glibc cross-build baked a build-host
+# ld-linux path and failed to exec on-device with 203/EXEC).
 PIXEL_DEVINFO_DIR ?= tools/pixel-devinfo
-PIXEL_DEVINFO_TARGET ?= aarch64-unknown-linux-gnu
+PIXEL_DEVINFO_TARGET ?= aarch64-unknown-linux-musl
 PIXEL_DEVINFO_BIN ?= $(PIXEL_DEVINFO_DIR)/target/$(PIXEL_DEVINFO_TARGET)/release/pixel-devinfo
 PIXEL_DEVINFO_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-devinfo
 PIXEL_DEVINFO_SOURCES := $(wildcard $(PIXEL_DEVINFO_DIR)/Cargo.toml $(PIXEL_DEVINFO_DIR)/Cargo.lock $(PIXEL_DEVINFO_DIR)/src/*.rs)
@@ -157,13 +158,16 @@ all:
 	just unmount_rootfs
 	touch $@
 
-# Cross-compile the pixel-devinfo binary into the overlay tree. Runs in the
-# flake's default devShell (rust toolchain + CROSS_COMPILE both provided there).
+# Cross-compile pixel-devinfo to a fully static aarch64-musl binary and copy it
+# into the overlay tree. Links with the Rust toolchain's bundled rust-lld and
+# strips via rustc (-C strip), so no external aarch64 gcc/strip is needed — the
+# same recipe works in the flake's devShell and on any non-Nix host that has
+# rustup's aarch64-unknown-linux-musl target installed. Static => no dynamic
+# loader, so it runs unchanged on the Debian rootfs.
 .build_pixel_devinfo: $(PIXEL_DEVINFO_SOURCES)
 	cd $(PIXEL_DEVINFO_DIR) && \
-		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(CROSS_COMPILE)gcc \
+		RUSTFLAGS="-C linker=rust-lld -C strip=symbols" \
 		cargo build --release --target $(PIXEL_DEVINFO_TARGET)
-	$(CROSS_COMPILE)strip $(PIXEL_DEVINFO_BIN)
 	mkdir -p $(dir $(PIXEL_DEVINFO_OVERLAY))
 	install -m 0755 $(PIXEL_DEVINFO_BIN) $(PIXEL_DEVINFO_OVERLAY)
 	touch $@

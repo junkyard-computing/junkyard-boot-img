@@ -84,14 +84,19 @@
           # (the AOSP/Bazel path brings its own hermetic toolchain).
           crossCC = pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc;
           crossPrefix = crossCC.targetPrefix; # "aarch64-unknown-linux-gnu-"
-          # Rust toolchain for cross-building tools/pixel-devinfo to aarch64.
-          # `targets` adds the aarch64 std lib alongside the host std — the host
-          # std is still needed so clap's proc-macro derive compiles for the
-          # build machine while the final binary targets aarch64. The cross
-          # linker is $(CROSS_COMPILE)gcc, wired via CARGO_TARGET_*_LINKER in the
-          # Makefile's .build_pixel_devinfo target.
+          # Rust toolchain for cross-building tools/pixel-devinfo to a fully
+          # static aarch64-musl binary. Static musl means zero runtime deps, so
+          # the binary runs unchanged on the Debian rootfs regardless of its
+          # glibc/loader (an earlier glibc cross-build baked a Nix-store
+          # ld-linux path and failed to exec on-device with 203/EXEC).
+          # `targets` adds the aarch64-musl std lib alongside the host std — the
+          # host std is still needed so clap's proc-macro derive compiles for the
+          # build machine. No external C cross-linker is required: the Makefile's
+          # .build_pixel_devinfo target links via the toolchain's bundled
+          # rust-lld, so the same `cargo build` line also works on non-Nix hosts
+          # that have rustup's aarch64-unknown-linux-musl target installed.
           rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
-            targets = [ "aarch64-unknown-linux-gnu" ];
+            targets = [ "aarch64-unknown-linux-musl" ];
           };
         in
         {
