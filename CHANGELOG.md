@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.1.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.0.0...v1.1.0) (2026-06-04)
+
+
+### Features
+
+* **rootfs:** truthful kernel-bound image version + dongle MAC on login ([afb9e10](https://github.com/junkyard-computing/junkyard-boot-img/commit/afb9e10c6cc0eab02609e832ac6cafadf17a5b1d))
+* **rootfs:** truthful kernel-bound image version + dongle MAC on login ([db70af2](https://github.com/junkyard-computing/junkyard-boot-img/commit/db70af2cebb76390cb4ba0ce0596ac5659893d9a))
+
 ## 1.0.0 (2026-06-03)
 
 
