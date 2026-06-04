@@ -1,4 +1,4 @@
-.PHONY: all clean clean_image
+.PHONY: all clean clean_image stamp_version
 
 # This Makefile is driven by the justfile; most variables come in via env.
 # Targets with a leading "." are sentinel files that track whether a stage has
@@ -62,10 +62,21 @@ MIRROR ?= $(if $(SNAPSHOT),https://snapshot.debian.org/archive/debian/$(SNAPSHOT
 # the human-bumped number (managed by release-please); the git short hash (and
 # -dirty marker) pin it to a build. BUILD_DATE is informational — the snapshot
 # pin above is the actual reproducibility anchor, not the build date.
+#
+# The kernel version is folded in (+k<ver>) because experiments here vary the
+# KERNEL, and the stamp's whole job is to let two phones be told apart by what
+# they actually run. A commit-only stamp can't distinguish two kernel variants
+# built from the same tree state; binding the kernel string closes that.
+#
+# Provenance is RECOMPUTED, NEVER CACHED: the stamp is a *description of the
+# result*, not a build stage. It is written by the PHONY `stamp_version` target
+# (no sentinel; `just all` runs it after .build_boot) so it re-runs on every
+# build and can never go stale relative to the kernel/commit/tree — the failure
+# that previously let kernel changes ship under an old version string.
 IMAGE_BASE_VERSION := $(shell cat version.txt 2>/dev/null || echo 0.0.0)
 GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 GIT_DIRTY := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo -dirty)
-IMAGE_VERSION ?= $(IMAGE_BASE_VERSION)-g$(GIT_REV)$(GIT_DIRTY)
+IMAGE_VERSION ?= $(IMAGE_BASE_VERSION)-g$(GIT_REV)$(GIT_DIRTY)$(if $(KERNEL_VERSION),+k$(KERNEL_VERSION),)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%d)
 
 # Wrap nspawn invocations through tools/nspawn-wrap.sh so each one starts
@@ -239,18 +250,10 @@ all:
 	$(NSPAWN) -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/default_connection.nmconnection
 	# Apply tracked overlay (usb_gadget, blacklist.conf, custom service, ...).
 	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
-	# Stamp the image version: os-release fields are read by agetty's \S{}
-	# escape in /etc/issue (login banner); /etc/image-version is a standalone
-	# discoverable copy. Must run inside nspawn — /etc/os-release is a symlink
-	# into /usr/lib, which only resolves correctly within the container.
-	# Strip any prior IMAGE_* lines before appending so re-running this stage on
-	# an existing image doesn't accumulate duplicates. --follow-symlinks edits
-	# the symlink target in place, keeping /etc/os-release a symlink.
-	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
-		"sed -i --follow-symlinks '/^IMAGE_VERSION=/d; /^IMAGE_BUILD_DATE=/d' /etc/os-release; \
-		echo 'IMAGE_VERSION=\"$(IMAGE_VERSION)\"' >> /etc/os-release; \
-		echo 'IMAGE_BUILD_DATE=\"$(BUILD_DATE)\"' >> /etc/os-release; \
-		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version"
+	# NOTE: the image-version stamp used to live here — moved to the PHONY
+	# `stamp_version` target (run by `just all` after .build_boot) so it is
+	# recomputed every build and reflects the actual kernel, not whatever was
+	# stamped the first time this (sentinel-gated) stage ran. See IMAGE_VERSION.
 	just unmount_rootfs
 	touch $@
 
@@ -339,6 +342,23 @@ all:
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
 	just unmount_rootfs
 	touch $@
+
+# Always-run provenance stamp (PHONY, no sentinel) — see IMAGE_VERSION comment.
+# Writes /etc/os-release IMAGE_VERSION/IMAGE_BUILD_DATE + /etc/image-version into
+# the (already-built) rootfs. Runs inside nspawn because /etc/os-release is a
+# symlink into /usr/lib that only resolves in the container. Idempotent: strips
+# prior IMAGE_* lines before re-appending, so re-stamping never accumulates.
+# Depends only on the rootfs existing (.install_packages), but is itself PHONY so
+# it re-executes on every build regardless of sentinels.
+stamp_version: .install_packages
+	just mount_rootfs
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+		"sed -i --follow-symlinks '/^IMAGE_VERSION=/d; /^IMAGE_BUILD_DATE=/d' /etc/os-release; \
+		echo 'IMAGE_VERSION=\"$(IMAGE_VERSION)\"' >> /etc/os-release; \
+		echo 'IMAGE_BUILD_DATE=\"$(BUILD_DATE)\"' >> /etc/os-release; \
+		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version"
+	just unmount_rootfs
+	@echo "stamped IMAGE_VERSION=$(IMAGE_VERSION)"
 
 .build_boot: .install_initramfs .install_vendor_firmware
 	$(MKBOOTIMG) \
