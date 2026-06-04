@@ -107,6 +107,12 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootst
         HOSTNAME={{ hostname }} \
         KERNEL_VERSION=$KVER \
         INITRAMFS_PATH={{ _sysroot_dir }}/boot/initrd.img-$KVER
+    # Always-run provenance stamp (PHONY, recomputed every build) — writes the
+    # kernel-bound IMAGE_VERSION into the rootfs so two phones can be told apart
+    # by what they actually run. KERNEL_VERSION must be passed so the +k<ver>
+    # suffix reflects this build's kernel, not a stale one.
+    KVER=$(cat {{ justfile_directory() }}/kernel/kernel_version); \
+    {{ _make }} -C {{ justfile_directory() }} stamp_version KERNEL_VERSION=$KVER
     # Return blocks freed during the build (apt cache, pruned kernel trees) to
     # the sparse backing file so boot/rootfs.img doesn't bloat over time.
     just trim_rootfs

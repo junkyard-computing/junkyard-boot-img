@@ -1,0 +1,20 @@
+[Unit]
+Description=Write USB-Ethernet dongle MAC into the login banner (issue.d)
+# Must finish BEFORE any getty draws its prompt: agetty reads the issue file
+# once, at prompt-draw time, so the drop-in has to exist first. Order ahead of
+# both the kmscon VT consoles and the serial getty (felix's two login paths),
+# and ahead of getty.target generally. After udev so dongle ifaces exist.
+After=systemd-udev-settle.service network-pre.target
+Wants=systemd-udev-settle.service
+Before=getty.target serial-getty@ttySAC0.service kmsconvt@tty1.service kmscon@tty1.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/dongle-mac-issue
+# Refresh on dongle hotplug too (paired udev rule re-triggers this unit).
+
+[Install]
+# Pulled in early (sysinit-adjacent) so it's ordered before getty.target, which
+# multi-user.target reaches only after this completes.
+WantedBy=multi-user.target
