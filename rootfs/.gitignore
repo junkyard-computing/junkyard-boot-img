@@ -8,7 +8,7 @@
 !kmscon.env
 !overlay
 !overlay/**
-# ...but not the cross-compiled pixel-devinfo binary the .build_pixel_devinfo
+# ...but not the cross-compiled pixel-bootctl binary the .build_pixel_bootctl
 # Make target drops in (re-ignore it; source-of-truth is the
-# tools/pixel-devinfo submodule). Must come after !overlay/** to win.
-overlay/usr/local/bin/pixel-devinfo
+# tools/pixel-bootctl submodule). Must come after !overlay/** to win.
+overlay/usr/local/bin/pixel-bootctl

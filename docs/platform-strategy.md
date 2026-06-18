@@ -146,7 +146,7 @@ corrects two things I got wrong.** Summary + how it lands against this doc:
     kicks us off and **we are beholden to it regardless of which kernel rides in
     boot.img.** So mainline does NOT free us from the A/B/partition substrate.
     What *may* still differ on mainline is the *userspace* slot-marking path
-    (Android `bootctl`/Keymaster HAL vs `pixel-devinfo`→`devinfo` direct), but the
+    (Android `bootctl`/Keymaster HAL vs `pixel-bootctl`→`devinfo` direct), but the
     bootloader-imposed structure persists either way.
   - ⇒ **Mainline does NOT, on its own, strengthen the anti-Android-boot arguments
     or the Nix case.** The boot.img-in-a-slot, atomic-A/B, opaque-image model is

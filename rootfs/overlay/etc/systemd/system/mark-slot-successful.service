@@ -5,12 +5,14 @@ After=multi-user.target
 [Service]
 Type=oneshot
 RemainAfterExit=yes
-# Read-modify-write the active slot in the devinfo partition: mark it
-# successful, max retries, clear unbootable. Stops the bootloader's retry
-# counter from exhausting after a few boots and forcing fastboot mode.
-# Source: github.com/junkyard-computing/pixel-devinfo (vendored at
-# tools/pixel-devinfo and cross-compiled to aarch64 by the build).
-ExecStart=/usr/local/bin/pixel-devinfo /dev/disk/by-partlabel/devinfo /dev/disk/by-partlabel/devinfo --successful true --unbootable false --retries 7 --quiet
+# Mark the running slot (from androidboot.slot_suffix) successful in the devinfo
+# partition: successful, max retries, clear unbootable. Stops the bootloader's
+# retry counter from exhausting after a few boots and forcing fastboot mode.
+# devinfo-ONLY (does NOT touch the UFS boot LUN), so the retry reset keeps
+# working even if the boot-LUN sysfs node can't be located.
+# Source: github.com/junkyard-computing/pixel-bootctl (vendored at
+# tools/pixel-bootctl and cross-compiled to aarch64 by the build).
+ExecStart=/usr/local/bin/pixel-bootctl mark-successful
 StandardOutput=journal+console
 StandardError=journal+console
 

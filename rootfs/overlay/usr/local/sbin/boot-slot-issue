@@ -1,0 +1,87 @@
+#!/bin/sh
+# Write the A/B boot slot into the login banner via an issue.d drop-in, so you
+# can tell at a glance (or in a screenshot) which boot chain a phone is on.
+#
+# Two slots are shown:
+#   - running:  the slot the bootloader actually booted, from
+#               androidboot.slot_suffix in /proc/bootconfig|cmdline. Always known.
+#   - next:     the slot configured active in devinfo (what the bootloader will
+#               pick next), read via `pixel-bootctl status`. Best-effort.
+# Steady state they match and we print one slot; after a staged OTA they differ
+# and we flag the pending switch:
+#   Boot:   slot A
+#   Boot:   slot A (next boot: B)
+#
+# issue.d, not /etc/issue: agetty reads /etc/issue.d/*.issue IN ADDITION to
+# /etc/issue, but /run/issue.d ONLY when /etc/issue is absent — and our overlay
+# ships a non-empty /etc/issue. The drop-in is named 10-boot-slot.issue so it
+# sorts BEFORE 20-dongle-mac.issue; dongle-mac owns the trailing blank line
+# before the prompt, so this file emits its line only (no extra blank). Layout:
+#   IPv4:   ...
+#   Boot:   ...
+#   Dongle: ...        (if a dongle is present)
+#   <blank>
+#   <login prompt>
+set -eu
+
+ISSUE_DIR=/etc/issue.d
+OUT="$ISSUE_DIR/10-boot-slot.issue"
+BOOTCTL=/usr/local/bin/pixel-bootctl
+mkdir -p "$ISSUE_DIR"
+
+# Running slot: the bootloader exports androidboot.slot_suffix=_a / = "_a".
+# Anchor on the literal key (which itself contains '_'), then take the first
+# _a / _b token after it — mirrors pixel-bootctl's own slot_suffix parser.
+running=""
+for f in /proc/bootconfig /proc/cmdline; do
+	[ -r "$f" ] || continue
+	s=$(sed -n 's/.*slot_suffix[^_]*_\([ab]\).*/\1/p' "$f" 2>/dev/null | head -n1) || true
+	if [ -n "$s" ]; then
+		running=$(printf '%s' "$s" | tr 'ab' 'AB')
+		break
+	fi
+done
+
+# Configured/next slot: the devinfo `active` flag, surfaced by pixel-bootctl
+# status. Best-effort — needs the devinfo by-partlabel symlink and root; if it's
+# unreadable we just show the running slot.
+next=""
+if [ -x "$BOOTCTL" ]; then
+	next=$("$BOOTCTL" status 2>/dev/null | awk '
+		/^slot:/                 { s = $2 }
+		/active:[[:space:]]*true/ { print s; exit }') || true
+fi
+
+line=""
+if [ -n "$running" ] && [ -n "$next" ]; then
+	if [ "$running" = "$next" ]; then
+		line="Boot:   slot $running"
+	else
+		line="Boot:   slot $running (next boot: $next)"
+	fi
+elif [ -n "$running" ]; then
+	line="Boot:   slot $running"
+elif [ -n "$next" ]; then
+	line="Boot:   slot $next (configured)"
+fi
+
+old=""
+[ -f "$OUT" ] && old=$(cat "$OUT" 2>/dev/null) || true
+
+if [ -n "$line" ]; then
+	printf '%s\n' "$line" > "$OUT"
+else
+	# Nothing determinable — drop any stale line rather than show a wrong one.
+	rm -f "$OUT" 2>/dev/null || true
+fi
+
+new=""
+[ -f "$OUT" ] && new=$(cat "$OUT" 2>/dev/null) || true
+
+# Nudge already-drawn prompts to redraw if the line changed. This unit is
+# ordered before getty so the common path draws the banner correctly the first
+# time; the HUP only matters if a re-run (e.g. devinfo became readable) changes
+# the text. agetty re-reads the issue when it (re)starts on SIGHUP.
+if [ "$old" != "$new" ]; then
+	pkill -HUP -x agetty 2>/dev/null || true
+fi

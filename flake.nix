@@ -3,7 +3,7 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    # Cross-capable Rust toolchains for building tools/pixel-devinfo to aarch64.
+    # Cross-capable Rust toolchains for building tools/pixel-bootctl to aarch64.
     rust-overlay = {
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "nixpkgs";
@@ -84,7 +84,7 @@
           # (the AOSP/Bazel path brings its own hermetic toolchain).
           crossCC = pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc;
           crossPrefix = crossCC.targetPrefix; # "aarch64-unknown-linux-gnu-"
-          # Rust toolchain for cross-building tools/pixel-devinfo to a fully
+          # Rust toolchain for cross-building tools/pixel-bootctl to a fully
           # static aarch64-musl binary. Static musl means zero runtime deps, so
           # the binary runs unchanged on the Debian rootfs regardless of its
           # glibc/loader (an earlier glibc cross-build baked a Nix-store
@@ -92,7 +92,7 @@
           # `targets` adds the aarch64-musl std lib alongside the host std — the
           # host std is still needed so clap's proc-macro derive compiles for the
           # build machine. No external C cross-linker is required: the Makefile's
-          # .build_pixel_devinfo target links via the toolchain's bundled
+          # .build_pixel_bootctl target links via the toolchain's bundled
           # rust-lld, so the same `cargo build` line also works on non-Nix hosts
           # that have rustup's aarch64-unknown-linux-musl target installed.
           rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
