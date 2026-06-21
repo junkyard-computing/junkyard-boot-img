@@ -25,6 +25,10 @@ _unzip := require("unzip")
 [private]
 _make := require("make")
 [private]
+_age := require("age")
+[private]
+_arm_blobs_script := join(justfile_directory(), "tools", "arm-blobs.sh")
+[private]
 _extract_fs := join(justfile_directory(), "tools", "extract-partition-fs.sh")
 [private]
 _mkbootimg := join(justfile_directory(), "tools", "mkbootimg", "mkbootimg.py")
@@ -113,6 +117,10 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootst
     # suffix reflects this build's kernel, not a stale one.
     KVER=$(cat {{ justfile_directory() }}/kernel/kernel_version); \
     {{ _make }} -C {{ justfile_directory() }} stamp_version KERNEL_VERSION=$KVER
+    # Decrypt + install the ARM NDA GPU blobs (Mali Vulkan/OpenCL). PHONY, so it
+    # runs every build; warns and skips (never fails) if this builder can't
+    # decrypt the blob. See secrets/README.md.
+    {{ _make }} -C {{ justfile_directory() }} install_arm_blobs
     # Return blocks freed during the build (apt cache, pruned kernel trees) to
     # the sparse backing file so boot/rootfs.img doesn't bloat over time.
     just trim_rootfs
@@ -246,6 +254,26 @@ clean: unmount_rootfs
 [group('rootfs')]
 update_snapshot *args:
     {{ justfile_directory() }}/tools/update-snapshot.sh {{ args }}
+
+# --- ARM NDA GPU blobs (Mali Vulkan/OpenCL) -------------------------------
+# These libs ship under an ARM NDA; the repo carries only an age-encrypted
+# tarball, encrypted to every pubkey in secrets/recipients.txt. Each builder
+# decrypts with their OWN SSH private key — no private key is ever shared. A
+# builder who isn't a recipient gets a warning + skipped GPU drivers, not a
+# build failure. See secrets/README.md.
+
+# Encrypt a rootfs-rooted tree of blobs into secrets/arm-mali-blobs.tar.age,
+# readable by every recipient in secrets/recipients.txt. srcdir must mirror the
+# on-device layout (e.g. src/usr/lib/aarch64-linux-gnu/...).
+[group('rootfs')]
+pack_arm_blobs srcdir:
+    {{ _arm_blobs_script }} pack {{ srcdir }}
+
+# Decrypt + install the blobs into the mounted rootfs (warn-only; never fails).
+# Normally runs automatically as part of `just all` via the Makefile.
+[group('rootfs')]
+install_arm_blobs:
+    {{ _make }} -C {{ justfile_directory() }} install_arm_blobs
 
 [group('rootfs')]
 build_rootfs debootstrap_release="trixie" root_password="0000" hostname="fold" size="8100M":

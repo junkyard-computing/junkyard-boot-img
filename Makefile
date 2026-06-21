@@ -1,4 +1,4 @@
-.PHONY: all clean clean_image stamp_version
+.PHONY: all clean clean_image stamp_version install_arm_blobs
 
 # This Makefile is driven by the justfile; most variables come in via env.
 # Targets with a leading "." are sentinel files that track whether a stage has
@@ -33,6 +33,18 @@ MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
 BAZEL ?= kernel/source/tools/bazel
 OVERLAY_DIR ?= rootfs/overlay
 VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
+
+# ARM NDA GPU userland blobs (Mali Vulkan + OpenCL). Committed only as an
+# age-encrypted, rootfs-rooted overlay tarball, encrypted to every pubkey in
+# $(ARM_RECIPIENTS); tools/arm-blobs.sh decrypts (with the builder's own SSH
+# key) and installs it. Not a recipient / no key / blob absent => warning, not a
+# build failure. See secrets/README.md. ARM_NDA_KEY optionally pins a specific
+# identity (private key) file; empty => fall back to the builder's ~/.ssh keys.
+SECRETS_DIR ?= secrets
+ARM_BLOBS_ENC ?= $(SECRETS_DIR)/arm-mali-blobs.tar.age
+ARM_RECIPIENTS ?= $(SECRETS_DIR)/recipients.txt
+ARM_NDA_KEY ?=
+ARM_BLOBS_SCRIPT ?= tools/arm-blobs.sh
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 
@@ -360,6 +372,23 @@ stamp_version: .install_packages
 		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version"
 	just unmount_rootfs
 	@echo "stamped IMAGE_VERSION=$(IMAGE_VERSION)"
+
+# Decrypt + install the ARM NDA GPU userland blobs into the rootfs. PHONY (no
+# sentinel), like stamp_version: it re-runs every build so a builder who fixes
+# their key (or gets added as a recipient + re-pulls the blob) picks the drivers
+# up on the next `just all` with nothing to remember. tools/arm-blobs.sh exits 0
+# when the blob/key is absent or the builder isn't a recipient, so this NEVER
+# fails the build — it just warns and skips. Decoupled from .build_boot because
+# the blobs land in rootfs.img (flashed to super), not in boot/vendor_boot.img;
+# `just all` runs this after .build_boot. ldconfig refreshes the loader cache so
+# a freshly-installed .so is found at runtime.
+install_arm_blobs: .install_packages
+	just mount_rootfs
+	SECRETS_DIR=$(SECRETS_DIR) ARM_BLOBS_ENC=$(ARM_BLOBS_ENC) \
+		ARM_RECIPIENTS=$(ARM_RECIPIENTS) ARM_NDA_KEY=$(ARM_NDA_KEY) \
+		$(ARM_BLOBS_SCRIPT) install $(SYSROOT_DIR)
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) ldconfig || true
+	just unmount_rootfs
 
 .build_boot: .install_initramfs .install_vendor_firmware
 	$(MKBOOTIMG) \

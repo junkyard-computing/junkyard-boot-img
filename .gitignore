@@ -30,6 +30,15 @@ render.experimental.xml
 *.jks
 *.keystore
 
+# ARM NDA blobs: builders decrypt with their own ~/.ssh key, so no private key
+# should ever live in the repo. The encrypted blob (secrets/*.age) and the
+# public recipients list (secrets/recipients.txt) ARE tracked. This guard just
+# stops a stray private key under secrets/ from being committed by accident.
+secrets/*.key
+# Scratch tree where the RAW (decrypted) NDA blobs are staged before `just
+# pack_arm_blobs` encrypts them. Never commit the cleartext libs.
+secrets/staging/
+
 # Google Services (e.g. APIs or Firebase)
 google-services.json
 
