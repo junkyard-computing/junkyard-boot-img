@@ -337,7 +337,7 @@ all:
 		--lz4 \
 		--show-modules \
 		--force \
-		--add "rescue bash" \
+		--add "rescue bash rootfs-flash" \
 		--install /vendor/firmware/aoc.bin \
 		--kernel-cmdline "rd.shell" \
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
