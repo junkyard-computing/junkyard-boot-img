@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.3.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.2.0...v1.3.0) (2026-06-21)
+
+
+### Features
+
+* **gpu:** add encrypted ARM NDA Mali Vulkan/OpenCL blobs ([768745f](https://github.com/junkyard-computing/junkyard-boot-img/commit/768745f7a9694932bc9521d7e92f9213d7c07b2d))
+* **gpu:** ARM NDA blob encryption pipeline + Mali Vulkan/OpenCL loaders ([236968f](https://github.com/junkyard-computing/junkyard-boot-img/commit/236968fd0ea5c320eb41893bf6fe0e83fd6e59aa))
+
 ## [1.2.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.1.0...v1.2.0) (2026-06-21)
 
 
