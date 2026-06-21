@@ -1,0 +1,140 @@
+diff --git a/drivers/soc/google/cal-if/Kbuild b/drivers/soc/google/cal-if/Kbuild
+index 0a405ad..0a51fa7 100644
+--- a/drivers/soc/google/cal-if/Kbuild
++++ b/drivers/soc/google/cal-if/Kbuild
+@@ -16,3 +16,8 @@ cmupmucal-$(CONFIG_ACPM_DVFS)		+= acpm_dvfs.o fvmap.o
+ cmupmucal-$(CONFIG_CP_PMUCAL)		+= pmucal_cp.o
+ obj-$(CONFIG_CMU_EWF)			+= cmu_ewf.o
+ 
++# Standalone module: exposes the GPU (G3D/G3DL2) ACPM DVFS domains as common-clk
++# clocks so the open Panthor driver can bind them. Depends on cmupmucal for the
++# exported cal_dfs_* symbols (resolved at module load via symbol dependency).
++obj-$(CONFIG_CAL_IF)			+= clk-acpm-gpu.o
++
+diff --git a/drivers/soc/google/cal-if/clk-acpm-gpu.c b/drivers/soc/google/cal-if/clk-acpm-gpu.c
+new file mode 100644
+index 0000000..8739ee4
+--- /dev/null
++++ b/drivers/soc/google/cal-if/clk-acpm-gpu.c
+@@ -0,0 +1,121 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * gs201 GPU (G3D + G3DL2) ACPM/cal-if DVFS clock provider.
++ *
++ * On the android-gs vendor kernel the GPU shader (G3D) and L2/bus (G3DL2)
++ * clocks are NOT exposed to the common clk framework — the closed mali_kbase
++ * driver drives them directly via cal_dfs_set_rate(ACPM_DVFS_G3D). The open
++ * Panthor driver expects a standard "clocks" phandle, so this small provider
++ * wraps the two cal-if DVFS domains as clk_hw clocks.
++ *
++ * Modeled on mainline drivers/clk/samsung/clk-acpm.c, with the backend swapped
++ * from the upstream exynos-acpm protocol to the vendor cal_dfs_* API. cal-if
++ * works in kHz; the clk framework works in Hz.
++ */
++#include <linux/clk-provider.h>
++#include <linux/module.h>
++#include <linux/of.h>
++#include <linux/platform_device.h>
++#include <linux/slab.h>
++
++#include <soc/google/cal-if.h>
++#include <dt-bindings/clock/gs201.h>
++
++struct acpm_gpu_clk {
++	struct clk_hw hw;
++	unsigned int cal_id;
++};
++
++#define to_acpm_gpu_clk(_hw) container_of(_hw, struct acpm_gpu_clk, hw)
++
++static unsigned long acpm_gpu_recalc_rate(struct clk_hw *hw,
++					  unsigned long parent_rate)
++{
++	/* cal-if reports kHz; the clk framework expects Hz. */
++	return cal_dfs_get_rate(to_acpm_gpu_clk(hw)->cal_id) * 1000UL;
++}
++
++static int acpm_gpu_determine_rate(struct clk_hw *hw,
++				   struct clk_rate_request *req)
++{
++	/*
++	 * ACPM snaps to the nearest supported OPP; we can't predict it here,
++	 * so accept the request. recalc_rate() reflects the real rate after
++	 * the set completes.
++	 */
++	return 0;
++}
++
++static int acpm_gpu_set_rate(struct clk_hw *hw, unsigned long rate,
++			     unsigned long parent_rate)
++{
++	return cal_dfs_set_rate(to_acpm_gpu_clk(hw)->cal_id, rate / 1000UL);
++}
++
++static const struct clk_ops acpm_gpu_clk_ops = {
++	.recalc_rate	= acpm_gpu_recalc_rate,
++	.determine_rate	= acpm_gpu_determine_rate,
++	.set_rate	= acpm_gpu_set_rate,
++};
++
++static const struct {
++	const char *name;
++	unsigned int cal_id;
++} acpm_gpu_clks[] = {
++	{ "g3d",   ACPM_DVFS_G3D   },	/* cell 0 — shader-core clock ("core")  */
++	{ "g3dl2", ACPM_DVFS_G3DL2 },	/* cell 1 — L2/bus clock ("stacks")     */
++};
++
++static int acpm_gpu_clk_probe(struct platform_device *pdev)
++{
++	struct device *dev = &pdev->dev;
++	struct clk_hw_onecell_data *data;
++	int i, ret;
++
++	data = devm_kzalloc(dev, struct_size(data, hws, ARRAY_SIZE(acpm_gpu_clks)),
++			    GFP_KERNEL);
++	if (!data)
++		return -ENOMEM;
++	data->num = ARRAY_SIZE(acpm_gpu_clks);
++
++	for (i = 0; i < ARRAY_SIZE(acpm_gpu_clks); i++) {
++		struct clk_init_data init = {};
++		struct acpm_gpu_clk *gclk;
++
++		gclk = devm_kzalloc(dev, sizeof(*gclk), GFP_KERNEL);
++		if (!gclk)
++			return -ENOMEM;
++
++		init.name = acpm_gpu_clks[i].name;
++		init.ops = &acpm_gpu_clk_ops;
++		/* Rate is owned by ACPM/DVFS; never cache it. */
++		init.flags = CLK_GET_RATE_NOCACHE;
++		gclk->hw.init = &init;
++		gclk->cal_id = acpm_gpu_clks[i].cal_id;
++
++		ret = devm_clk_hw_register(dev, &gclk->hw);
++		if (ret)
++			return ret;
++		data->hws[i] = &gclk->hw;
++	}
++
++	return devm_of_clk_add_hw_provider(dev, of_clk_hw_onecell_get, data);
++}
++
++static const struct of_device_id acpm_gpu_clk_match[] = {
++	{ .compatible = "google,gs201-acpm-gpu-clk" },
++	{ }
++};
++MODULE_DEVICE_TABLE(of, acpm_gpu_clk_match);
++
++static struct platform_driver acpm_gpu_clk_driver = {
++	.driver = {
++		.name		= "gs201-acpm-gpu-clk",
++		.of_match_table	= acpm_gpu_clk_match,
++	},
++	.probe = acpm_gpu_clk_probe,
++};
++module_platform_driver(acpm_gpu_clk_driver);
++
++MODULE_DESCRIPTION("gs201 GPU (G3D/G3DL2) ACPM DVFS clock provider");
++MODULE_LICENSE("GPL v2");

@@ -1,0 +1,33 @@
+diff --git a/BUILD.bazel b/BUILD.bazel
+index 7cb6a23..764d0b7 100644
+--- a/BUILD.bazel
++++ b/BUILD.bazel
+@@ -181,6 +181,7 @@ kernel_module(
+         "drivers/soc/google/acpm/power_stats.ko",
+         "drivers/soc/google/bcm_dbg.ko",
+         "drivers/soc/google/cal-if/cmupmucal.ko",
++        "drivers/soc/google/cal-if/clk-acpm-gpu.ko",
+         "drivers/soc/google/dbgcore-dump.ko",
+         "drivers/soc/google/debug/debug-snapshot-debug-kinfo.ko",
+         "drivers/soc/google/debug/dss.ko",
+diff --git a/dts/gs201-gpu.dtsi b/dts/gs201-gpu.dtsi
+index 040dd67..ba591f6 100644
+--- a/dts/gs201-gpu.dtsi
++++ b/dts/gs201-gpu.dtsi
+@@ -7,6 +7,16 @@
+  */
+ 
+ / {
++	/* ACPM/cal-if DVFS clocks for the GPU (G3D shader + G3DL2), exposed to
++	 * the common clk framework so the open Panthor driver can bind them via
++	 * clocks = <&gpu_clk 0>, <&gpu_clk 1>. Driver: clk-acpm-gpu.c. Kbase
++	 * does not use these (it calls cal_dfs_* directly), so this is inert
++	 * until a clk consumer references it. */
++	gpu_clk: gpu-clock-controller {
++		compatible = "google,gs201-acpm-gpu-clk";
++		#clock-cells = <1>;
++	};
++
+ 	mali_mgm: physical-memory-group-manager {
+ 		compatible = "arm,physical-memory-group-manager";
+ 

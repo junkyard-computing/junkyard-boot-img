@@ -160,6 +160,24 @@ clone_kernel_source android_kernel_branch="android-gs-felix-6.1-android16":
     if [ ! -e custom_defconfig_mod ]; then \
         ln -s ../custom_defconfig_mod ./; \
     fi
+    # Apply local kernel-source patches (kernel/patches/*.patch) onto the synced
+    # tree. These carry our changes to repo-managed projects (which this repo
+    # does NOT track) reproducibly. Idempotent: `repo sync` preserves a dirty
+    # tree, so a re-run would re-apply and fail — we skip patches already applied
+    # (detected via a clean reverse-apply). A newly-applied patch removes
+    # .build_kernel so the kernel rebuilds (that sentinel doesn't track source).
+    PATCHDIR={{ justfile_directory() }}/kernel/patches; \
+    apply_patch() { \
+      if git -C "$1" apply -R --check "$PATCHDIR/$2" 2>/dev/null; then \
+        echo "  kpatch $2: already applied"; \
+      elif git -C "$1" apply --check "$PATCHDIR/$2" 2>/dev/null; then \
+        git -C "$1" apply "$PATCHDIR/$2" && rm -f {{ justfile_directory() }}/.build_kernel && echo "  kpatch $2: applied (kernel will rebuild)"; \
+      else \
+        echo "  kpatch $2: FAILED to apply (conflict)" >&2; return 1; \
+      fi; \
+    }; \
+    apply_patch private/google-modules/soc/gs 0001-gpu-clk-provider-soc-gs.patch && \
+    apply_patch private/devices/google/gs201 0002-gpu-clk-node-gs201.patch
 
 # Lock the kernel source to its current per-project SHAs by regenerating
 # kernel/kernel-manifest.xml from the synced tree. Commit the result; thereafter
