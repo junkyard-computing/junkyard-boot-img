@@ -116,7 +116,7 @@
               echo "NOTE — system-level prerequisites a flake CANNOT provide (set in your NixOS host / krg-nixos-flakes):"
               echo "  • binfmt for foreign-arch debootstrap:  boot.binfmt.emulatedSystems = [ \"aarch64-linux\" ];"
               echo "  • passwordless sudo for mount_rootfs / systemd-nspawn stages"
-              echo "  • udev/plugdev access for fastboot (flash.sh)"
+              echo "  • udev/plugdev access for fastboot (flash-fastboot.sh)"
             '';
           };
 

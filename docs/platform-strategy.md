@@ -309,7 +309,7 @@ Android-bootloader is already trodden here.
 ### RECOMMENDATION: decide by spike, not by argument
 
 The decision is load-bearing + near-term; the experiment is days. **Spike: build a
-minimal NixOS image, flash it to a felix A/B slot via the existing `flash.sh`
+minimal NixOS image, flash it to a felix A/B slot via the existing `flash-fastboot.sh`
 path, measure (a) does it boot, (b) closure size ×2 vs UFS.** Converts the two
 deciding unknowns into evidence *before* September's architecture is committed. If
 it boots and fits, the flake.lock property is yours and the remaining objections
