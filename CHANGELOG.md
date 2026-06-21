@@ -1,5 +1,21 @@
 # Changelog
 
+## [1.2.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.1.0...v1.2.0) (2026-06-21)
+
+
+### Features
+
+* add flash-ssh.sh in-place OTA path; rename flash.sh -&gt; flash-fastboot.sh ([e239aac](https://github.com/junkyard-computing/junkyard-boot-img/commit/e239aacd45072aedf53858c26169f223b16188c4))
+* **rootfs:** add 90rootfs-flash dracut module for in-place super reflash ([31c3bbb](https://github.com/junkyard-computing/junkyard-boot-img/commit/31c3bbb0e360c41c810ff0441d61ad02edb3b7ce))
+* **rootfs:** replace pixel-devinfo with pixel-bootctl + pixel-ota; show boot slot on login ([b0998c0](https://github.com/junkyard-computing/junkyard-boot-img/commit/b0998c0f9b2e47667c39df0ffc9f9bff6fb60748))
+
+
+### Documentation
+
+* plan for kube + ceph cluster roles ([425d965](https://github.com/junkyard-computing/junkyard-boot-img/commit/425d9656502259bdf3883bfc2ba031ac19a722f3))
+* plan for kube + garage cluster roles ([5c46510](https://github.com/junkyard-computing/junkyard-boot-img/commit/5c4651020ab4fb268108695b3705341c3bc62c05))
+* switch cluster storage role from ceph to garage ([2ba9ae1](https://github.com/junkyard-computing/junkyard-boot-img/commit/2ba9ae1fe6638df5b92bcc4c8fec0bbf36baffb3))
+
 ## [1.1.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.0.0...v1.1.0) (2026-06-04)
 
 
