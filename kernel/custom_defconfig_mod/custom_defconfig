@@ -20,6 +20,10 @@ CONFIG_HW_CONSOLE=y
 CONFIG_VT_HW_CONSOLE_BINDING=y
 CONFIG_DEVMEM=y
 
+# Panthor open-GPU port — DRM core infra (driver itself stays off: DRM_PANTHOR unset)
+CONFIG_DRM_EXEC=y
+CONFIG_DRM_GPUVM=y
+
 # k8s/k3s — process & resource isolation
 CONFIG_PID_NS=y
 CONFIG_CGROUP_PIDS=y

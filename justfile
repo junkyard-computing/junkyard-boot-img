@@ -177,7 +177,12 @@ clone_kernel_source android_kernel_branch="android-gs-felix-6.1-android16":
       fi; \
     }; \
     apply_patch private/google-modules/soc/gs 0001-gpu-clk-provider-soc-gs.patch && \
-    apply_patch private/devices/google/gs201 0002-gpu-clk-node-gs201.patch
+    apply_patch private/devices/google/gs201 0002-gpu-clk-node-gs201.patch && \
+    : "Panthor open-GPU port: drop the additive (new-file) sources into the GKI" \
+    : "tree (kernel/panthor-port/ mirrors aosp/ layout), then apply the gpuva +" \
+    : "build-wiring delta. See kernel/patches/PANTHOR-PORT-PLAN.md." && \
+    rsync -a {{ justfile_directory() }}/kernel/panthor-port/drivers {{ justfile_directory() }}/kernel/panthor-port/include aosp/ && \
+    apply_patch aosp 0003-drm-core-gpuva-and-build-wiring.patch
 
 # Lock the kernel source to its current per-project SHAs by regenerating
 # kernel/kernel-manifest.xml from the synced tree. Commit the result; thereafter
