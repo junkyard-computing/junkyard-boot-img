@@ -593,12 +593,7 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 		 * AS_MEMATTR_AARCH64_SHARED memory, so we can take benefit
 		 * of IO-coherent systems.
 		 */
-		/* SPIKE: on IO-coherent felix, keep CACHED_COHERENT firmware sections
-		 * (the global interface lives here) cacheable so the CPU sees the
-		 * MCU's coherent writes; otherwise the CPU reads stale (version=0). */
-		if (cache_mode != CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED &&
-		    !(ptdev->coherent &&
-		      cache_mode == CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED_COHERENT))
+		if (cache_mode != CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED)
 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED;
 
 		section->mem = panthor_kernel_bo_create(ptdev, panthor_fw_vm(ptdev),
@@ -607,6 +602,17 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 							vm_map_flags, va);
 		if (IS_ERR(section->mem))
 			return PTR_ERR(section->mem);
+
+		/* Keep the CPU mapping consistent with the GPU one: a firmware
+		 * section mapped non-cacheable on the GPU must be write-combine on
+		 * the CPU too -- even on IO-coherent systems, where kernel BOs
+		 * default to cacheable (map_wc = !coherent). Otherwise the CPU reads
+		 * the shared section (which the MCU writes through its uncached GPU
+		 * mapping) stale: e.g. the global interface version reads 0 and FW
+		 * init fails with -EINVAL. Must be set before the vmap below.
+		 */
+		to_panthor_bo(section->mem->obj)->base.map_wc =
+			!!(vm_map_flags & DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED);
 
 		if (drm_WARN_ON(&ptdev->base, section->mem->va_node.start != hdr.va.start))
 			return -EINVAL;

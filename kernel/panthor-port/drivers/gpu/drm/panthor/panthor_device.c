@@ -155,11 +155,7 @@ int panthor_device_init(struct panthor_device *ptdev)
 	struct page *p;
 	int ret;
 
-	/* SPIKE: felix/gs201 G710 is IO-coherent (ACE-lite to the SLC) but the DT
-	 * mali node lacks `dma-coherent`, so this read returns non-coherent and the
-	 * MCU reads stale firmware (PTW not Outer-Shareable) -> boot status=FATAL.
-	 * Force coherent to test; real fix is `dma-coherent;` in the DT node. */
-	ptdev->coherent = true;
+	ptdev->coherent = device_get_dma_attr(ptdev->base.dev) == DEV_DMA_COHERENT;
 
 	init_completion(&ptdev->unplug.done);
 	ret = drmm_mutex_init(&ptdev->base, &ptdev->unplug.lock);

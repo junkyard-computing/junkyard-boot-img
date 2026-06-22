@@ -1,0 +1,54 @@
+diff --git a/dts/gs201-gpu.dtsi b/dts/gs201-gpu.dtsi
+index 040dd67..a9e83d7 100644
+--- a/dts/gs201-gpu.dtsi
++++ b/dts/gs201-gpu.dtsi
+@@ -7,6 +7,16 @@
+  */
+ 
+ / {
++	/* ACPM/cal-if DVFS clocks for the GPU (G3D shader + G3DL2), exposed to
++	 * the common clk framework so the open Panthor driver can bind them via
++	 * clocks = <&gpu_clk 0>, <&gpu_clk 1>. Driver: clk-acpm-gpu.c. Kbase
++	 * does not use these (it calls cal_dfs_* directly), so this is inert
++	 * until a clk consumer references it. */
++	gpu_clk: gpu-clock-controller {
++		compatible = "google,gs201-acpm-gpu-clk";
++		#clock-cells = <1>;
++	};
++
+ 	mali_mgm: physical-memory-group-manager {
+ 		compatible = "arm,physical-memory-group-manager";
+ 
+@@ -48,17 +58,28 @@
+ 	};
+ 
+ 	mali: mali@28000000 {
+-		compatible = "arm,malit6xx";
++		/* Panthor open GPU driver. valhall-csf compatible; lowercase IRQ
++		 * names for platform_get_irq_byname; core clock via gpu_clk; LEAF
++		 * cores power domain pd_embedded_g3d (genpd powers its parent pd_g3d
++		 * too). kbase lives on the other A/B slot. */
++		compatible = "arm,mali-valhall-csf";
+ 		reg = <0x0 0x28000000 0x480000>;
+ 		interrupts =
+ 			<GIC_SPI IRQ_G3D_IRQJOB_G3D IRQ_TYPE_LEVEL_HIGH>,
+ 			<GIC_SPI IRQ_G3D_IRQMMU_G3D IRQ_TYPE_LEVEL_HIGH>,
+ 			<GIC_SPI IRQ_G3D_IRQGPU_G3D IRQ_TYPE_LEVEL_HIGH>;
+-		interrupt-names = "JOB", "MMU", "GPU";
++		interrupt-names = "job", "mmu", "gpu";
++
++		clocks = <&gpu_clk 0>;
++
++		/* The G710 is IO-coherent (ACE-lite to the SLC). Without this,
++		 * panthor sets ptdev->coherent=false, the GPU MMU page-table walks
++		 * aren't Outer-Shareable, and the CSF MCU reads stale firmware ->
++		 * "Failed to boot MCU (status=fatal)". */
++		dma-coherent;
+ 
+ 		/* Power */
+-		power-domains = <&pd_g3d>, <&pd_embedded_g3d>;
+-		power-domain-names = "top", "cores";
++		power-domains = <&pd_embedded_g3d>;
+ 		g3d_genpd_name = "pd-embedded_g3d";
+ 		gpu_pmu_status_reg_offset = <0x2004>;
+ 		gpu_pmu_status_local_pwr_mask = <0x1>; /*0x1 << 0*/
