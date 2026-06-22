@@ -66,6 +66,16 @@ Only risk is compile-time API drift against GKI 6.1 (each is written for ~6.10).
 | `drivers/iommu/io-pgtable.c` + `io-pgtable-arm.c` + `include/linux/io-pgtable.h` | 23+39/16+31 | **custom page-table allocator hook** (Brezillon) — panthor_mmu passes `cfg.alloc/free`. `ARM_MALI_LPAE` + `ARM_OUTER_WBWA` already present; only the alloc/free hook + `io_pgtable_caps` is new |
 | `drivers/gpu/drm/Kconfig` + `Makefile` | 15+4 | wires `DRM_GPUVM`/`DRM_EXEC`/`DRM_PANTHOR` |
 
+**Static dep-check done (2026-06-21), sources staged in `kernel/panthor-port/`:**
+- `drm_exec.c` — all 7 `dma_resv_*` it needs are present in our tree → **compiles
+  standalone**, no prereq.
+- `drm_gpuvm.c` — uses **rbtree + interval_tree** (not maple_tree) → no maple API
+  risk in 6.1. BUT references `obj->gpuva.list` + `drm_gem_gpuva_assert_lock_held`,
+  which require the **`drm_gem_object.gpuva` field** (drm_gem.h `+82`, drm_gem.c
+  `+28`). That part of the gem change is **pure-additive** and is a **Tier-1
+  prerequisite of gpuvm** — pull it in with Tier 1, *not* with the risky gem_shmem
+  rework. (The gem_shmem rework stays Tier 2.)
+
 ## Tier 2 — semantic reconcile (medium→high risk; merge by content, not patch)
 
 These exist in our tree with different content; the PR both adds and deletes.
