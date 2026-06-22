@@ -140,6 +140,17 @@ int panthor_devfreq_init(struct panthor_device *ptdev)
 
 	ret = devm_pm_opp_set_regulators(dev, reg_names);
 	if (ret) {
+		/* felix/gs201 powers the G3D rail via ACPM, not a Linux "mali"
+		 * regulator, so there's no mali-supply in DT. Without it the OPP
+		 * layer can't manage voltage: skip devfreq and run at the fixed
+		 * clk the cal-if/bootloader programmed. The devfreq accessors all
+		 * no-op while pdevfreq->devfreq stays NULL. */
+		if (ret == -ENODEV) {
+			drm_info(&ptdev->base,
+				 "no mali regulator; devfreq disabled (fixed clock)\n");
+			return 0;
+		}
+
 		if (ret != -EPROBE_DEFER)
 			DRM_DEV_ERROR(dev, "Couldn't set OPP regulators\n");
 
