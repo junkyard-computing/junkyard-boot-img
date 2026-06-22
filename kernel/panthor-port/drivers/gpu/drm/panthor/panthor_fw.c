@@ -593,7 +593,12 @@ static int panthor_fw_load_section_entry(struct panthor_device *ptdev,
 		 * AS_MEMATTR_AARCH64_SHARED memory, so we can take benefit
 		 * of IO-coherent systems.
 		 */
-		if (cache_mode != CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED)
+		/* SPIKE: on IO-coherent felix, keep CACHED_COHERENT firmware sections
+		 * (the global interface lives here) cacheable so the CPU sees the
+		 * MCU's coherent writes; otherwise the CPU reads stale (version=0). */
+		if (cache_mode != CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED &&
+		    !(ptdev->coherent &&
+		      cache_mode == CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED_COHERENT))
 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED;
 
 		section->mem = panthor_kernel_bo_create(ptdev, panthor_fw_vm(ptdev),
