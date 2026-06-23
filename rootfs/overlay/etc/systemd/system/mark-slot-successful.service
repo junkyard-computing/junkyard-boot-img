@@ -6,13 +6,21 @@ After=multi-user.target
 Type=oneshot
 RemainAfterExit=yes
 # Mark the running slot (from androidboot.slot_suffix) successful in the devinfo
-# partition: successful, max retries, clear unbootable. Stops the bootloader's
-# retry counter from exhausting after a few boots and forcing fastboot mode.
-# devinfo-ONLY (does NOT touch the UFS boot LUN), so the retry reset keeps
-# working even if the boot-LUN sysfs node can't be located.
+# partition: successful, max retries, clear unbootable. devinfo-ONLY (does NOT
+# touch the UFS boot LUN), so the retry reset keeps working even if the boot-LUN
+# sysfs node can't be located.
+#
+# This is the COMMIT half of rollback-safe A/B: `pixel-ota update` /
+# `pixel-bootctl set-active-slot` now mark a freshly-switched slot active but NOT
+# successful, so a slot that fails to boot burns its retry budget and the
+# bootloader rolls back. Reaching here means userspace booted, so we commit the
+# slot. Gate: wait for startup to settle, then commit only if the system came up
+# (running or degraded) — never mid-startup or in a maintenance/stopping state.
+# Lenient on "degraded" on purpose: a cosmetic unit failure must not trigger a
+# rollback of an otherwise-good boot.
 # Source: github.com/junkyard-computing/pixel-bootctl (vendored at
 # tools/pixel-bootctl and cross-compiled to aarch64 by the build).
-ExecStart=/usr/local/bin/pixel-bootctl mark-successful
+ExecStart=/bin/sh -c 'systemctl is-system-running --wait >/dev/null 2>&1; s=$(systemctl is-system-running); case "$s" in running|degraded) exec /usr/local/bin/pixel-bootctl mark-successful;; *) echo "boot state=$s; leaving slot unconfirmed (bootloader will roll back on next reboot)" >&2; exit 1;; esac'
 StandardOutput=journal+console
 StandardError=journal+console
 
