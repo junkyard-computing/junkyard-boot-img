@@ -1,0 +1,179 @@
+--- kernel/panthor-port/drivers/gpu/drm/panthor/panthor_fw.c	2026-06-22 15:48:20.694471324 -0700
++++ kernel/source/aosp/drivers/gpu/drm/panthor/panthor_fw.c	2026-06-23 08:14:39.220925966 -0700
+@@ -6,6 +6,7 @@
+ #endif
+ 
+ #include <linux/clk.h>
++#include <linux/delay.h>
+ #include <linux/dma-mapping.h>
+ #include <linux/firmware.h>
+ #include <linux/iopoll.h>
+@@ -586,13 +587,11 @@
+ 		if (!(hdr.flags & CSF_FW_BINARY_IFACE_ENTRY_RD_EX))
+ 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC;
+ 
+-		/* TODO: CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_*_COHERENT are mapped to
+-		 * non-cacheable for now. We might want to introduce a new
+-		 * IOMMU_xxx flag (or abuse IOMMU_MMIO, which maps to device
+-		 * memory and is currently not used by our driver) for
+-		 * AS_MEMATTR_AARCH64_SHARED memory, so we can take benefit
+-		 * of IO-coherent systems.
+-		 */
++		/* The *_COHERENT cache modes are mapped non-cacheable (the upstream
++		 * "for now" workaround). The uncached/WC CPU access of the shared
++		 * interface races the MCU still populating the per-CSG/CS control
++		 * blocks, so the interface readers below poll each control block
++		 * until the MCU has published its LAST field before consuming it. */
+ 		if (cache_mode != CSF_FW_BINARY_IFACE_ENTRY_RD_CACHE_MODE_CACHED)
+ 			vm_map_flags |= DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED;
+ 
+@@ -803,9 +802,34 @@
+ 
+ 	spin_lock_init(&cs_iface->lock);
+ 	cs_iface->control = ptdev->fw->shared_section->mem->kmap + iface_offset;
++
++	/* The MCU publishes the per-CS interface control block in the shared
++	 * section slightly after it signals boot-complete. On felix the
++	 * IO-coherent snoop that makes those writes visible to this CPU mapping
++	 * can land a few microseconds late, so a read here may transiently
++	 * return 0 (observed: input_va valid but output_va == 0). Wait for the
++	 * MCU to publish the block before consuming it. */
++	{
++		unsigned int tries = 0;
++
++		while (!READ_ONCE(cs_iface->control->output_va) &&
++		       ++tries < 1000000)
++			cpu_relax();
++	}
++
+ 	cs_iface->input = iface_fw_to_cpu_addr(ptdev, cs_iface->control->input_va);
+ 	cs_iface->output = iface_fw_to_cpu_addr(ptdev, cs_iface->control->output_va);
+ 
++	drm_info(&ptdev->base,
++		 "DBG cs[%u][%u]: off=%#x in_va=%#x out_va=%#x shared=[%#llx..%#llx) gstride=%#x sstride=%#x feat=%#x",
++		 csg_idx, cs_idx, iface_offset,
++		 cs_iface->control->input_va, cs_iface->control->output_va,
++		 panthor_kernel_bo_gpuva(ptdev->fw->shared_section->mem),
++		 panthor_kernel_bo_gpuva(ptdev->fw->shared_section->mem) +
++			 panthor_kernel_bo_size(ptdev->fw->shared_section->mem),
++		 glb_iface->control->group_stride, csg_iface->control->stream_stride,
++		 cs_iface->control->features);
++
+ 	if (!cs_iface->input || !cs_iface->output) {
+ 		drm_err(&ptdev->base, "Invalid stream control interface input/output VA");
+ 		return -EINVAL;
+@@ -854,9 +878,33 @@
+ 
+ 	spin_lock_init(&csg_iface->lock);
+ 	csg_iface->control = ptdev->fw->shared_section->mem->kmap + iface_offset;
++
++	/* The shared interface is mapped uncached, so the CPU can observe this
++	 * CSG control block while the MCU is still populating it. Wait for the
++	 * MCU to publish its LAST field (stream_stride) before reading any of
++	 * the block: that guarantees all earlier fields the code below consumes
++	 * (input/output_va, features, suspend_size, stream_num -- the latter
++	 * compared in compare_csg()) are already written. Otherwise FW init
++	 * fails non-deterministically ("Invalid stream control interface",
++	 * "Expecting identical CSG slots"). */
++	{
++		unsigned int tries = 0;
++
++		while (!READ_ONCE(csg_iface->control->stream_stride) &&
++		       ++tries < 1000000)
++			cpu_relax();
++	}
++
+ 	csg_iface->input = iface_fw_to_cpu_addr(ptdev, csg_iface->control->input_va);
+ 	csg_iface->output = iface_fw_to_cpu_addr(ptdev, csg_iface->control->output_va);
+ 
++	drm_info(&ptdev->base,
++		 "DBG csg[%u]: off=%#x in_va=%#x out_va=%#x feat=%#x stream_num=%u susp=%#x protm=%#x",
++		 csg_idx, iface_offset,
++		 csg_iface->control->input_va, csg_iface->control->output_va,
++		 csg_iface->control->features, csg_iface->control->stream_num,
++		 csg_iface->control->suspend_size, csg_iface->control->protm_suspend_size);
++
+ 	if (csg_iface->control->stream_num < MIN_CS_PER_CSG ||
+ 	    csg_iface->control->stream_num > MAX_CS_PER_CSG)
+ 		return -EINVAL;
+@@ -907,6 +955,20 @@
+ 	spin_lock_init(&glb_iface->lock);
+ 	glb_iface->control = ptdev->fw->shared_section->mem->kmap;
+ 
++	/* The shared interface is mapped uncached and the MCU populates the
++	 * global control block field-by-field after it reports boot-complete.
++	 * Wait for the MCU to publish group_stride -- the last global field the
++	 * code below consumes (version, group_num and the per-CSG strides are
++	 * all written before it) -- so we don't intermittently read a stale 0
++	 * ("Firmware version is 0") or a half-written group layout. */
++	{
++		unsigned int tries = 0;
++
++		while (!READ_ONCE(glb_iface->control->group_stride) &&
++		       ++tries < 1000000)
++			cpu_relax();
++	}
++
+ 	if (!glb_iface->control->version) {
+ 		drm_err(&ptdev->base, "Firmware version is 0. Firmware may have failed to boot");
+ 		return -EINVAL;
+@@ -919,6 +981,11 @@
+ 		return -EINVAL;
+ 	}
+ 
++	drm_info(&ptdev->base,
++		 "DBG glb: group_num=%u group_stride=%#x glb_in_va=%#x glb_out_va=%#x",
++		 glb_iface->control->group_num, glb_iface->control->group_stride,
++		 glb_iface->control->input_va, glb_iface->control->output_va);
++
+ 	if (glb_iface->control->group_num > MAX_CSGS ||
+ 	    glb_iface->control->group_num < MIN_CSGS) {
+ 		drm_err(&ptdev->base, "Invalid number of control groups");
+@@ -995,7 +1062,10 @@
+ 
+ 	ptdev->fw->booted = false;
+ 	panthor_job_irq_resume(&ptdev->fw->irq, ~0);
++	drm_info(&ptdev->base, "DIAG fw_start: writing MCU_CONTROL=AUTO");
+ 	gpu_write(ptdev, MCU_CONTROL, MCU_CONTROL_AUTO);
++	drm_info(&ptdev->base, "DIAG fw_start: MCU_CONTROL written, waiting for boot (status=%#x)",
++		 gpu_read(ptdev, MCU_STATUS));
+ 
+ 	if (!wait_event_timeout(ptdev->fw->req_waitqueue,
+ 				ptdev->fw->booted,
+@@ -1332,10 +1402,12 @@
+ 		return ret;
+ 	}
+ 
++	drm_info(&ptdev->base, "DIAG phase 1: l2_power_on");
+ 	ret = panthor_gpu_l2_power_on(ptdev);
+ 	if (ret)
+ 		return ret;
+ 
++	drm_info(&ptdev->base, "DIAG phase 2: vm_create (MCU VM)");
+ 	fw->vm = panthor_vm_create(ptdev, true,
+ 				   0, SZ_4G,
+ 				   CSF_MCU_SHARED_REGION_START,
+@@ -1346,18 +1418,23 @@
+ 		goto err_unplug_fw;
+ 	}
+ 
++	drm_info(&ptdev->base, "DIAG phase 3: fw_load");
+ 	ret = panthor_fw_load(ptdev);
+ 	if (ret)
+ 		goto err_unplug_fw;
+ 
++	drm_info(&ptdev->base, "DIAG phase 4: vm_active (program MCU AS)");
+ 	ret = panthor_vm_active(fw->vm);
+ 	if (ret)
+ 		goto err_unplug_fw;
+ 
++	drm_info(&ptdev->base, "DIAG phase 5: fw_start (MCU boot)");
+ 	ret = panthor_fw_start(ptdev);
+ 	if (ret)
+ 		goto err_unplug_fw;
+ 
++	drm_info(&ptdev->base, "DIAG phase 6: fw_start returned, init_ifaces next");
++
+ 	ret = panthor_fw_init_ifaces(ptdev);
+ 	if (ret)
+ 		goto err_unplug_fw;

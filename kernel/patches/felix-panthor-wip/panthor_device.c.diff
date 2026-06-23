@@ -1,0 +1,17 @@
+--- kernel/panthor-port/drivers/gpu/drm/panthor/panthor_device.c	2026-06-22 15:48:20.693471325 -0700
++++ kernel/source/aosp/drivers/gpu/drm/panthor/panthor_device.c	2026-06-23 08:21:20.365903208 -0700
+@@ -156,6 +156,14 @@
+ 	int ret;
+ 
+ 	ptdev->coherent = device_get_dma_attr(ptdev->base.dev) == DEV_DMA_COHERENT;
++	/* DIAG: full kbase non-coherent (COHERENCY_NONE) model -- force BOTH the
++	 * panthor coherent flag (non-shareable PTW + WC mappings) AND the struct
++	 * device dma-coherent bit false, so dma_sync actually flushes the
++	 * firmware/page-tables to DRAM (otherwise the MCU reads stale memory and
++	 * hangs the instant it starts executing). */
++	ptdev->coherent = false;
++	ptdev->base.dev->dma_coherent = false;
++	drm_info(&ptdev->base, "DIAG coherent=false + dev->dma_coherent=false (full NONE model)");
+ 
+ 	init_completion(&ptdev->unplug.done);
+ 	ret = drmm_mutex_init(&ptdev->base, &ptdev->unplug.lock);

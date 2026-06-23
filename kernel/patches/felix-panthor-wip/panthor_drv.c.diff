@@ -1,0 +1,28 @@
+--- kernel/panthor-port/drivers/gpu/drm/panthor/panthor_drv.c	2026-06-21 17:02:14.568811927 -0700
++++ kernel/source/aosp/drivers/gpu/drm/panthor/panthor_drv.c	2026-06-22 22:20:35.053233763 -0700
+@@ -1012,6 +1012,13 @@
+ 		return ret;
+ 
+ 	ret = panthor_group_create(pfile, args, queue_args);
++	drm_info(ddev,
++		 "DBG group_create: queues=%u prio=%u pad=%#x max_c=%u max_f=%u max_t=%u cmask=%#llx fmask=%#llx tmask=%#llx vm=%u -> ret=%d",
++		 args->queues.count, args->priority, args->pad,
++		 args->max_compute_cores, args->max_fragment_cores,
++		 args->max_tiler_cores, args->compute_core_mask,
++		 args->fragment_core_mask, args->tiler_core_mask,
++		 args->vm_id, ret);
+ 	if (ret >= 0) {
+ 		args->group_handle = ret;
+ 		ret = 0;
+@@ -1191,6 +1198,11 @@
+ 
+ 	for (u32 i = 0; i < args->ops.count; i++) {
+ 		ret = panthor_vm_bind_exec_sync_op(file, vm, &jobs_args[i]);
++		drm_info(ddev,
++			 "DBG vm_bind_sync op[%u]: flags=%#x bo=%u bo_off=%#llx va=%#llx size=%#llx -> ret=%d",
++			 i, jobs_args[i].flags, jobs_args[i].bo_handle,
++			 jobs_args[i].bo_offset, jobs_args[i].va,
++			 jobs_args[i].size, ret);
+ 		if (ret) {
+ 			/* Update ops.count so the user knows where things failed. */
+ 			args->ops.count = i;

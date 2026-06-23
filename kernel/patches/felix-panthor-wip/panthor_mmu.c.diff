@@ -1,0 +1,90 @@
+--- kernel/panthor-port/drivers/gpu/drm/panthor/panthor_mmu.c	2026-06-21 17:02:18.624759951 -0700
++++ kernel/source/aosp/drivers/gpu/drm/panthor/panthor_mmu.c	2026-06-23 08:15:21.207221045 -0700
+@@ -775,7 +775,13 @@
+ 		gpu_write(ptdev, MMU_INT_MASK, ~ptdev->mmu->as.faulty_mask);
+ 	}
+ 
++	if (vm->for_mcu)
++		drm_info(&ptdev->base,
++			 "DIAG mmu: enabling MCU AS%d transcfg=%#llx memattr=%#llx (coherent=%d)",
++			 vm->as.id, transcfg, vm->memattr, ptdev->coherent);
+ 	ret = panthor_mmu_as_enable(vm->ptdev, vm->as.id, transtab, transcfg, vm->memattr);
++	if (vm->for_mcu)
++		drm_info(&ptdev->base, "DIAG mmu: MCU AS enable returned %d", ret);
+ 
+ out_make_active:
+ 	if (!ret) {
+@@ -1182,12 +1188,26 @@
+ 	if (!bo)
+ 		return -EINVAL;
+ 
++	/* The GPU MMU maps at page granularity, but userspace (Mesa 25.2.x)
++	 * may request a sub-page bind size -- e.g. a 0x600-byte private BO that
++	 * BO_CREATE already rounded up to a full page. The original 1.0 driver
++	 * rejected the unaligned range in the io-pgtable map (-EINVAL); newer
++	 * panthor tolerates it. Round the size up to a page so the map covers
++	 * the whole BO page instead of failing. va/offset are already page
++	 * aligned by the caller (Mesa's auto-VA allocator). */
++	size = ALIGN(size, PAGE_SIZE);
++
+ 	if ((flags & ~PANTHOR_VM_BIND_OP_MAP_FLAGS) ||
+ 	    (flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) != DRM_PANTHOR_VM_BIND_OP_TYPE_MAP)
+ 		return -EINVAL;
+ 
+-	/* Make sure the VA and size are aligned and in-bounds. */
+-	if (size > bo->base.base.size || offset > bo->base.base.size - size)
++	/* Make sure the VA and size are aligned and in-bounds. Compare against
++	 * the page-aligned BO size: Mesa may create a sub-page GEM object (e.g.
++	 * 0x600 bytes) whose shmem backing is still a full page, and we round
++	 * the bind size up to a page above, so the bounds check must use the
++	 * allocation-granular (page-aligned) size or it spuriously -EINVALs. */
++	if (size > ALIGN(bo->base.base.size, PAGE_SIZE) ||
++	    offset > ALIGN(bo->base.base.size, PAGE_SIZE) - size)
+ 		return -EINVAL;
+ 
+ 	/* If the BO has an exclusive VM attached, it can't be mapped to other VMs. */
+@@ -1441,6 +1461,10 @@
+ 	/* Pick a kernel VA range that's a power of two, to have a clear split. */
+ 	*kernel_va_range = rounddown_pow_of_two(full_va_range - user_va_range);
+ 	*kernel_va_start = full_va_range - *kernel_va_range;
++	drm_info(&ptdev->base,
++		 "DBG vm_create: va_bits=%u full=%#llx req_user=%#llx user_va=[0,%#llx) kern=[%#llx,+%#llx)",
++		 va_bits, full_va_range, args->user_va_range, user_va_range,
++		 *kernel_va_start, *kernel_va_range);
+ 	return 0;
+ }
+ 
+@@ -2338,8 +2362,12 @@
+ 	struct drm_gem_object *gem;
+ 	int ret;
+ 
+-	/* Aligned on page size. */
+-	if ((op->va | op->size) & ~PAGE_MASK)
++	/* The VA must be page-aligned. The size is rounded up to a page in the
++	 * map/unmap handlers below: Mesa 25.2.x may bind/unbind a sub-page BO
++	 * (e.g. 0x600 bytes) whose shmem backing is a full page, and the GPU MMU
++	 * maps at page granularity. The original 1.0 driver rejected the
++	 * unaligned size here with -EINVAL. */
++	if (op->va & ~PAGE_MASK)
+ 		return -EINVAL;
+ 
+ 	switch (op->flags & DRM_PANTHOR_VM_BIND_OP_TYPE_MASK) {
+@@ -2348,7 +2376,7 @@
+ 		ret = panthor_vm_prepare_map_op_ctx(op_ctx, vm,
+ 						    gem ? to_panthor_bo(gem) : NULL,
+ 						    op->bo_offset,
+-						    op->size,
++						    ALIGN(op->size, PAGE_SIZE),
+ 						    op->va,
+ 						    op->flags);
+ 		drm_gem_object_put(gem);
+@@ -2361,7 +2389,8 @@
+ 		if (op->bo_handle || op->bo_offset)
+ 			return -EINVAL;
+ 
+-		return panthor_vm_prepare_unmap_op_ctx(op_ctx, vm, op->va, op->size);
++		return panthor_vm_prepare_unmap_op_ctx(op_ctx, vm, op->va,
++						       ALIGN(op->size, PAGE_SIZE));
+ 
+ 	case DRM_PANTHOR_VM_BIND_OP_TYPE_SYNC_ONLY:
+ 		if (op->flags & ~DRM_PANTHOR_VM_BIND_OP_TYPE_MASK)
