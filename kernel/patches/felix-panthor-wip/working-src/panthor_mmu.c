@@ -1997,6 +1997,15 @@ static void panthor_vma_init(struct panthor_vma *vma, u32 flags)
 	 DRM_PANTHOR_VM_BIND_OP_MAP_NOEXEC | \
 	 DRM_PANTHOR_VM_BIND_OP_MAP_UNCACHED)
 
+/* FELIX: when true (default), map user data BOs uncached on the GPU on a
+ * non-coherent system (the reliable rusticl path). Set to false to map data
+ * cacheable (needed for GPU atomics, e.g. PanVK cross-subqueue sync) — only
+ * coherent if cache maintenance is handled elsewhere. Toggle for bring-up:
+ *   insmod panthor.ko uncached_data=0
+ */
+static bool panthor_uncached_data = true;
+module_param_named(uncached_data, panthor_uncached_data, bool, 0644);
+
 static int panthor_gpuva_sm_step_map(struct drm_gpuva_op *op, void *priv)
 {
 	struct panthor_vm *vm = priv;
@@ -2030,7 +2039,7 @@ static int panthor_gpuva_sm_step_map(struct drm_gpuva_op *op, void *priv)
 	 * instruction fetch to hit DRAM and cripple compute throughput, so we
 	 * only uncache the NOEXEC data mappings (descriptors / args / buffers).
 	 */
-	if (!vm->ptdev->coherent && (prot & IOMMU_NOEXEC))
+	if (!vm->ptdev->coherent && panthor_uncached_data && (prot & IOMMU_NOEXEC))
 		prot &= ~IOMMU_CACHE;
 
 	ret = panthor_vm_map_pages(vm, op->map.va.addr, prot,
