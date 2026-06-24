@@ -25,7 +25,7 @@ Open,Panthor + rusticl,OpenCL,Launch latency,623.7,us,no,Mali-G710 r0p0,800,2026
 Open,Panthor + rusticl,OpenCL,FP32 sustained,75.3,GFLOPS,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,12.8s sustained; flake-built Mesa 26.2.0-devel
 Open,Panthor + rusticl,OpenCL,GPU power (FP32),0.233,W,no,Mali-G710 r0p0,800,2026-06-24,Android 6.1,ODPM CH4 S2S_VDD_G3D+CH7 S8S_VDD_G3D_L2; idle 0.009W; low draw tracks low GPU util
 Open,Panthor + rusticl,OpenCL,FP32 efficiency,322.0,GFLOPS/W,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,75.3/0.233 (3 runs 321-323); ~par/better than proprietary 276 despite 8x lower throughput
-Open,Panthor + PanVK,Vulkan,llama pp512 (prefill),,tok/s,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED: PanVK enumerates G710 (uma/fp16/int-dot) but first compute vkQueueSubmit -> vk::DeviceLostError; kernel clean (no CS fault/reset). Separate PanVK submit-path bring-up needed
+Open,Panthor + PanVK,Vulkan,llama pp512 (prefill),,tok/s,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED layer2: GROUP_SUBMIT EINVAL FIXED (empty obj_array stride=0); submit now reaches GPU but compute hits CS_INHERIT_FAULT across 3 subqueues -> likely cross-queue atomics on uncached-GPU-data; needs kbase cached-data+dma_sync
 Open,Panthor + PanVK,Vulkan,llama tg128 (decode),,tok/s,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED: see pp512 (PanVK ErrorDeviceLost)
 Open,Panthor + PanVK,Vulkan,llama tg power,,W,no,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED: see pp512
 Open,Panthor + PanVK,Vulkan,llama tg efficiency,,tok/s/W,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED: see pp512
