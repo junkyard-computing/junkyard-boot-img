@@ -1,11 +1,24 @@
 Subject: [PATCH] panfrost: add Mali-G710 (felix / Tensor G2) model entry
 
-Mesa 25.2.8. felix reports gpu_id 0xa862; masked with the Valhall
-0xff0f0000 mask that is 0xa8020000 -> prod_id 0xa802, variant 0. Without
-this entry Mesa rejects the GPU ("Unknown GPU ID"). Add a VALHALL_MODEL
-row immediately after the G610 entry in src/panfrost/lib/pan_props.c.
+felix reports gpu_id 0xa862; masked with the Valhall 0xff0f0000 mask that
+is 0xa8020000 -> prod_id 0xa802 (Valhall arch 10.8, prod 2), variant 0.
+Without a model entry Mesa rejects the GPU ("Unknown GPU ID"). G710 is
+architecturally G610 with more cores, so reuse the G610 model params.
 
---- a/src/panfrost/lib/pan_props.c
-+++ b/src/panfrost/lib/pan_props.c
-@@ (after the G610 VALHALL_MODEL entry)
-+   VALHALL_MODEL(0xa802, 0, "G710", "TVIx", MODEL_ANISO(ALL), MODEL_TB_SIZES(32768, 16384), MODEL_RATES(4, 8, 64)),
+NOTE — the model table location and prod-id encoding differ by Mesa version:
+
+ * Mesa 25.2.x: src/panfrost/lib/pan_props.c, raw hex prod id. Add after the
+   G610 (0xa807) VALHALL_MODEL row:
+     VALHALL_MODEL(0xa802, 0, "G710", "TVIx", MODEL_ANISO(ALL),
+                   MODEL_TB_SIZES(32768, 16384), MODEL_RATES(4, 8, 64)),
+
+ * Mesa main (>= the pan_model split): src/panfrost/model/pan_model.c, using
+   the PAN_PROD_ID(arch_major, arch_minor, prod_major) macro. 0xa802 becomes
+   PAN_PROD_ID(10, 8, 2) (G610 is PAN_PROD_ID(10, 8, 7)). Add after the G610
+   row:
+     VALHALL_MODEL(PAN_PROD_ID(10, 8, 2), 0, "G710", "TVIx", MODEL_ANISO(ALL),
+                   MODEL_TB_SIZES(32768, 16384), MODEL_RATES(4, 8, 64)),
+
+This is the change carried on the `felix-g710` branch of
+github.com/junkyard-computing/mesa (committed against Mesa main), built for
+the device via `nix run .#build-mesa`.

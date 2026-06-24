@@ -112,6 +112,7 @@
               echo
               echo "Full build on NixOS, one command (external sudo-capable terminal):  nix run .#build"
               echo "Kernel build alone (kleaf needs the FHS env):  nix run .#bazel-fhs -- -c 'just build_kernel'"
+              echo "Open-GPU Mesa (felix-g710 fork, arm64 trixie container):  nix run .#build-mesa"
               echo
               echo "NOTE — system-level prerequisites a flake CANNOT provide (set in your NixOS host / krg-nixos-flakes):"
               echo "  • binfmt for foreign-arch debootstrap:  boot.binfmt.emulatedSystems = [ \"aarch64-linux\" ];"
@@ -158,11 +159,53 @@
               just all
             '';
           };
+
+          # Build the junkyard-computing/mesa `felix-g710` fork (Panfrost +
+          # rusticl OpenCL + PanVK, with the Mali-G710 model entry) for the
+          # device. The build runs in an arm64 Debian *trixie* container so the
+          # libs link against the same glibc/LLVM-19 as the felix rootfs — a
+          # pure-nix cross build would bake /nix/store paths the Debian rootfs
+          # can't resolve. Needs system docker + the aarch64-linux binfmt the
+          # NixOS host registers (boot.binfmt.emulatedSystems).
+          build-mesa = pkgs.writeShellApplication {
+            name = "build-mesa-g710";
+            runtimeInputs = [ pkgs.git pkgs.docker-client pkgs.gnutar pkgs.coreutils ];
+            text = ''
+              REPO="$PWD"
+              FORK="''${MESA_FORK_URL:-https://github.com/junkyard-computing/mesa.git}"
+              BRANCH="''${MESA_FORK_BRANCH:-felix-g710}"
+              WORK="$REPO/build/mesa"; SRC="$WORK/src"; OUT="$WORK/out"
+              mkdir -p "$WORK/build" "$OUT"
+              echo "[build-mesa] fork=$FORK branch=$BRANCH -> $WORK"
+              if [ -d "$SRC/.git" ]; then
+                git -C "$SRC" fetch --depth 1 origin "$BRANCH"
+                git -C "$SRC" checkout -B "$BRANCH" FETCH_HEAD
+              else
+                rm -rf "$SRC"; git clone --depth 1 --branch "$BRANCH" "$FORK" "$SRC"
+              fi
+              echo "[build-mesa] building in arm64 trixie container (slow under qemu)…"
+              docker run --rm --platform linux/arm64 \
+                -v /nix/store:/nix/store:ro \
+                -v "$SRC":/src/mesa \
+                -v "$WORK/build":/src/build \
+                -v "$OUT":/src/out \
+                -v "$REPO/tools/build-mesa/build-in-container.sh":/build.sh:ro \
+                arm64v8/debian:trixie-slim bash /build.sh
+              tar -C "$OUT" -czf "$WORK/mesa-g710-libs.tgz" .
+              echo "[build-mesa] done -> $WORK/mesa-g710-libs.tgz"; ls -la "$OUT"
+              echo "[build-mesa] deploy: untar the tgz into /opt/mesa-g710/lib on the device;"
+              echo "             ICD /opt/mesa-g710/rusticl-g710.icd -> libRusticlOpenCL.so.1"
+            '';
+          };
         in
         {
           build = {
             type = "app";
             program = "${felix-build}/bin/felix-build";
+          };
+          build-mesa = {
+            type = "app";
+            program = "${build-mesa}/bin/build-mesa-g710";
           };
         });
 
