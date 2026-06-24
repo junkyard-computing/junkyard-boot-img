@@ -14,18 +14,18 @@ Proprietary,ARM Vulkan blob,Vulkan,llama pp512 (prefill),162.8,tok/s,yes,Mali-G7
 Proprietary,ARM Vulkan blob,Vulkan,llama tg128 (decode),31.2,tok/s,yes,Mali-G710 r0p0,848,2026-06-21,Android 6.1,Qwen2.5-0.5B Q4_K_M
 Proprietary,ARM Vulkan blob,Vulkan,llama tg power,1.52,W,no,Mali-G710 r0p0,848,2026-06-21,Android 6.1,ODPM; tg1024
 Proprietary,ARM Vulkan blob,Vulkan,llama tg efficiency,18.5,tok/s/W,yes,Mali-G710 r0p0,848,2026-06-21,Android 6.1,28.2 tok/s / 1.52W
-Open,Panthor + rusticl,OpenCL,FP32 compute,76.2,GFLOPS,yes,Mali-G710 r0p0,800,2026-06-23,Android 6.1,gov 800MHz; non-coherent felix (uncached GPU BO map); Mesa 25.2.8+G710 patch
-Open,Panthor + rusticl,OpenCL,FP16 compute,89.0,GFLOPS,yes,Mali-G710 r0p0,800,2026-06-23,Android 6.1,scalar half; uncached GPU BO map
-Open,Panthor + rusticl,OpenCL,INT32 mad,33.1,GIOPS,yes,Mali-G710 r0p0,800,2026-06-23,Android 6.1,uncached GPU BO map
-Open,Panthor + rusticl,OpenCL,INT8 dot,,TOPS,yes,Mali-G710 r0p0,800,2026-06-23,Android 6.1,SKIPPED: arm_dot_acc unavailable in rusticl
-Open,Panthor + rusticl,OpenCL,Memory triad BW,5.5,GB/s,yes,Mali-G710 r0p0,800,2026-06-23,Android 6.1,best of runs (3.6-5.5 var); heavy uncached-BO penalty
-Open,Panthor + rusticl,OpenCL,H2D transfer,12.0,GB/s,yes,Mali-G710 r0p0,800,2026-06-23,Android 6.1,CPU-side; par with proprietary
-Open,Panthor + rusticl,OpenCL,D2H transfer,1.6,GB/s,yes,Mali-G710 r0p0,800,2026-06-23,Android 6.1,uncached GPU read penalty
-Open,Panthor + rusticl,OpenCL,Launch latency,623.7,us,no,Mali-G710 r0p0,800,2026-06-23,Android 6.1,submit+finish; per-job dual FLUSH_CACHE2
-Open,Panthor + rusticl,OpenCL,FP32 sustained,76.2,GFLOPS,yes,Mali-G710 r0p0,800,2026-06-23,Android 6.1,best-of-5 stable (0.9013s identical)
-Open,Panthor + rusticl,OpenCL,GPU power (FP32),,W,no,Mali-G710 r0p0,800,,Android 6.1,PENDING: ODPM rail capture
-Open,Panthor + rusticl,OpenCL,FP32 efficiency,,GFLOPS/W,yes,Mali-G710 r0p0,800,,Android 6.1,PENDING: needs power
-Open,Panthor + PanVK,Vulkan,llama pp512 (prefill),,tok/s,yes,Mali-G710 r0p0,848,,mainline graft,PENDING
-Open,Panthor + PanVK,Vulkan,llama tg128 (decode),,tok/s,yes,Mali-G710 r0p0,848,,mainline graft,PENDING
-Open,Panthor + PanVK,Vulkan,llama tg power,,W,no,Mali-G710 r0p0,848,,mainline graft,PENDING
-Open,Panthor + PanVK,Vulkan,llama tg efficiency,,tok/s/W,yes,Mali-G710 r0p0,848,,mainline graft,PENDING
+Open,Panthor + rusticl,OpenCL,FP32 compute,75.3,GFLOPS,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,gov 800MHz; non-coherent felix (uncached GPU data BO); flake-built Mesa 26.2.0-devel +G710 patch
+Open,Panthor + rusticl,OpenCL,FP16 compute,88.9,GFLOPS,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,scalar half; uncached GPU data BO
+Open,Panthor + rusticl,OpenCL,INT32 mad,33.1,GIOPS,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,uncached GPU data BO
+Open,Panthor + rusticl,OpenCL,INT8 dot,,TOPS,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,SKIPPED: arm_dot_acc unavailable in rusticl
+Open,Panthor + rusticl,OpenCL,Memory triad BW,5.5,GB/s,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,best of runs (3.6-5.5 var); heavy uncached-BO penalty
+Open,Panthor + rusticl,OpenCL,H2D transfer,12.0,GB/s,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,CPU-side; par with proprietary
+Open,Panthor + rusticl,OpenCL,D2H transfer,1.6,GB/s,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,uncached GPU read penalty
+Open,Panthor + rusticl,OpenCL,Launch latency,623.7,us,no,Mali-G710 r0p0,800,2026-06-24,Android 6.1,submit+finish; per-job dual FLUSH_CACHE2
+Open,Panthor + rusticl,OpenCL,FP32 sustained,75.3,GFLOPS,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,12.8s sustained; flake-built Mesa 26.2.0-devel
+Open,Panthor + rusticl,OpenCL,GPU power (FP32),0.233,W,no,Mali-G710 r0p0,800,2026-06-24,Android 6.1,ODPM CH4 S2S_VDD_G3D+CH7 S8S_VDD_G3D_L2; idle 0.009W; low draw tracks low GPU util
+Open,Panthor + rusticl,OpenCL,FP32 efficiency,322.0,GFLOPS/W,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,75.3/0.233 (3 runs 321-323); ~par/better than proprietary 276 despite 8x lower throughput
+Open,Panthor + PanVK,Vulkan,llama pp512 (prefill),,tok/s,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED: PanVK enumerates G710 (uma/fp16/int-dot) but first compute vkQueueSubmit -> vk::DeviceLostError; kernel clean (no CS fault/reset). Separate PanVK submit-path bring-up needed
+Open,Panthor + PanVK,Vulkan,llama tg128 (decode),,tok/s,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED: see pp512 (PanVK ErrorDeviceLost)
+Open,Panthor + PanVK,Vulkan,llama tg power,,W,no,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED: see pp512
+Open,Panthor + PanVK,Vulkan,llama tg efficiency,,tok/s/W,yes,Mali-G710 r0p0,800,2026-06-24,Android 6.1,BLOCKED: see pp512
