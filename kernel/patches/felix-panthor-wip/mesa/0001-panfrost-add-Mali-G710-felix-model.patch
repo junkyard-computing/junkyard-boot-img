@@ -1,0 +1,11 @@
+Subject: [PATCH] panfrost: add Mali-G710 (felix / Tensor G2) model entry
+
+Mesa 25.2.8. felix reports gpu_id 0xa862; masked with the Valhall
+0xff0f0000 mask that is 0xa8020000 -> prod_id 0xa802, variant 0. Without
+this entry Mesa rejects the GPU ("Unknown GPU ID"). Add a VALHALL_MODEL
+row immediately after the G610 entry in src/panfrost/lib/pan_props.c.
+
+--- a/src/panfrost/lib/pan_props.c
++++ b/src/panfrost/lib/pan_props.c
+@@ (after the G610 VALHALL_MODEL entry)
++   VALHALL_MODEL(0xa802, 0, "G710", "TVIx", MODEL_ANISO(ALL), MODEL_TB_SIZES(32768, 16384), MODEL_RATES(4, 8, 64)),
