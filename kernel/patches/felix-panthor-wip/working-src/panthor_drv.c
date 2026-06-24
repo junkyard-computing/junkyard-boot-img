@@ -86,14 +86,19 @@ panthor_get_uobj_array(const struct drm_panthor_obj_array *in, u32 min_stride,
 	int ret = 0;
 	void *out_alloc;
 
+	/* An empty array carries no data, so the stride is irrelevant. Check the
+	 * count before the stride: userspace (e.g. PanVK) leaves the stride at 0
+	 * for an empty drm_panthor_obj_array, and rejecting that on the stride
+	 * check would spuriously fail GROUP_SUBMIT for jobs that have no sync ops.
+	 */
+	if (!in->count)
+		return NULL;
+
 	/* User stride must be at least the minimum object size, otherwise it might
 	 * lack useful information.
 	 */
 	if (in->stride < min_stride)
 		return ERR_PTR(-EINVAL);
-
-	if (!in->count)
-		return NULL;
 
 	out_alloc = kvmalloc_array(in->count, obj_size, GFP_KERNEL);
 	if (!out_alloc)
