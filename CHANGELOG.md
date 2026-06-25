@@ -1,5 +1,17 @@
 # Changelog
 
+## [1.4.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.3.0...v1.4.0) (2026-06-25)
+
+
+### Features
+
+* **tools:** build & ship pixel-ota in the rootfs; bump pixel tools to rollback-safe slot switch ([94a88d6](https://github.com/junkyard-computing/junkyard-boot-img/commit/94a88d6f3ed0757d740fc5d268c757470ac067f8))
+
+
+### Build System
+
+* containerized rootfs/boot build env for the android track (no host sudo) ([61ac69a](https://github.com/junkyard-computing/junkyard-boot-img/commit/61ac69a72eb7da64023304d13d1a4b6f54946920))
+
 ## [1.3.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.2.0...v1.3.0) (2026-06-21)
 
 
