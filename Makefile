@@ -63,6 +63,17 @@ PIXEL_BOOTCTL_BIN ?= $(PIXEL_BOOTCTL_DIR)/target/$(PIXEL_BOOTCTL_TARGET)/release
 PIXEL_BOOTCTL_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-bootctl
 PIXEL_BOOTCTL_SOURCES := $(wildcard $(PIXEL_BOOTCTL_DIR)/Cargo.toml $(PIXEL_BOOTCTL_DIR)/Cargo.lock $(PIXEL_BOOTCTL_DIR)/src/*.rs)
 
+# pixel-ota: same static aarch64-musl cross-build as pixel-bootctl (shares
+# PIXEL_BOOTCTL_TARGET), installed into the overlay so every built image ships
+# it. It used to be source-only — flash-ssh.sh required a manual cross-build —
+# but it is an on-device tool (`pixel-ota update` / `flash-rootfs` run over SSH),
+# so baking it into the rootfs is the same treatment pixel-bootctl gets. Source-
+# of-truth is the tools/pixel-ota submodule.
+PIXEL_OTA_DIR ?= tools/pixel-ota
+PIXEL_OTA_BIN ?= $(PIXEL_OTA_DIR)/target/$(PIXEL_BOOTCTL_TARGET)/release/pixel-ota
+PIXEL_OTA_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-ota
+PIXEL_OTA_SOURCES := $(wildcard $(PIXEL_OTA_DIR)/Cargo.toml $(PIXEL_OTA_DIR)/Cargo.lock $(PIXEL_OTA_DIR)/src/*.rs)
+
 # Debian archive pin. rootfs/debian_snapshot holds a snapshot.debian.org
 # timestamp (managed by `just update_snapshot`); pinning the mirror is what
 # makes a given IMAGE_VERSION reproducible. An empty pin leaves MIRROR empty,
@@ -196,7 +207,17 @@ all:
 	install -m 0755 $(PIXEL_BOOTCTL_BIN) $(PIXEL_BOOTCTL_OVERLAY)
 	touch $@
 
-.install_packages: .debootstrap .build_pixel_bootctl $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt
+# pixel-ota: identical cross-build recipe to pixel-bootctl (see the comment
+# above .build_pixel_bootctl for the static-musl rationale).
+.build_pixel_ota: $(PIXEL_OTA_SOURCES)
+	cd $(PIXEL_OTA_DIR) && \
+		RUSTFLAGS="-C linker=rust-lld -C strip=symbols" \
+		cargo build --release --target $(PIXEL_BOOTCTL_TARGET)
+	mkdir -p $(dir $(PIXEL_OTA_OVERLAY))
+	install -m 0755 $(PIXEL_OTA_BIN) $(PIXEL_OTA_OVERLAY)
+	touch $@
+
+.install_packages: .debootstrap .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt
 	just mount_rootfs
 	# apt tuning for the snapshot.debian.org mirror (all harmless on the live
 	# mirror, so written unconditionally):

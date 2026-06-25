@@ -42,15 +42,16 @@ HOST="${1:-}"
 
 here="$(cd "$(dirname "$0")" && pwd)"
 # Build outputs (same images flash-fastboot.sh flashes) + the static aarch64
-# binaries. pixel-bootctl is built into the overlay by the Makefile; pixel-ota
-# is source-only here, so it must be cross-built first (see the error below).
+# binaries. Both pixel-bootctl and pixel-ota are cross-built into the overlay by
+# the Makefile (.build_pixel_bootctl / .build_pixel_ota), so we read them from
+# there.
 BOOT_IMG="${BOOT_IMG:-$here/boot/boot.img}"
 VENDOR_BOOT_IMG="${VENDOR_BOOT_IMG:-$here/boot/vendor_boot.img}"
 # Note: `-` not `:-` so an explicit empty DTBO_IMG= skips dtbo (unset = default).
 DTBO_IMG="${DTBO_IMG-$here/kernel/source/out/felix/dist/dtbo.img}"
 ROOTFS_IMG="${ROOTFS_IMG:-$here/boot/rootfs.img}"
 PIXEL_BOOTCTL_BIN="${PIXEL_BOOTCTL_BIN:-$here/rootfs/overlay/usr/local/bin/pixel-bootctl}"
-PIXEL_OTA_BIN="${PIXEL_OTA_BIN:-$here/tools/pixel-ota/target/aarch64-unknown-linux-musl/release/pixel-ota}"
+PIXEL_OTA_BIN="${PIXEL_OTA_BIN:-$here/rootfs/overlay/usr/local/bin/pixel-ota}"
 
 SSH_OPTS="${SSH_OPTS:-}"
 # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split.
@@ -70,9 +71,7 @@ if [ -n "$DTBO_IMG" ] && [ ! -f "$DTBO_IMG" ]; then
 	die "DTBO_IMG set but not found: $DTBO_IMG (set DTBO_IMG= to flash without dtbo)"
 fi
 [ -f "$PIXEL_OTA_BIN" ] || die "pixel-ota not built: $PIXEL_OTA_BIN
-  build it: nix develop -c bash -c 'cd tools/pixel-ota && \\
-    RUSTFLAGS=\"-C linker=rust-lld -C strip=symbols\" \\
-    cargo build --release --target aarch64-unknown-linux-musl'"
+  build it: nix develop -c make .build_pixel_ota   (or build the rootfs)"
 img_size=$(stat -c %s "$ROOTFS_IMG")
 
 # 2) Device preflight — query state, make NO changes -------------------------
