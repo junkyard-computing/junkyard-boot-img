@@ -59,6 +59,19 @@ umount -lR "$sysroot/dev" 2>/dev/null || true
 rm -rf "$sysroot/dev"
 mkdir -p "$sysroot/dev"
 
+# The Debian-trixie debootstrap used inside tools/dockershell leaves
+# sysroot/proc as an ABSOLUTE symlink `proc -> /proc` instead of a real
+# directory (the Nix host's debootstrap makes it a dir, so this only bites the
+# container build). systemd-nspawn chases /proc within the new root; the
+# absolute symlink re-prefixes to sysroot/proc -> /proc -> ... and the
+# resolution loops, aborting nspawn with "Failed to resolve /proc: Too many
+# levels of symbolic links". Replace any such symlink with an empty dir so
+# nspawn can mount a fresh procfs there. No-op when /proc is already a dir.
+if [ -L "$sysroot/proc" ]; then
+    rm -f "$sysroot/proc"
+    mkdir -p "$sysroot/proc"
+fi
+
 # On NixOS, /run/binfmt/aarch64-linux is a /nix/store-pathed wrapper around
 # the real qemu-aarch64 (also under /nix/store). The F flag pre-opens the
 # wrapper so it runs, but its own execve() of the real qemu fails inside
@@ -77,9 +90,23 @@ fi
 # non-Nix hosts (just a redundant explicit override).
 container_path="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# Run nspawn in a private mount namespace so its tmpfs/bind setup at
-# /dev does not leak back into the host's view of sysroot. nspawn will
-# still mark its switched-root MS_SHARED internally — that's fine, the
-# new peer groups it creates only live inside this unshared NS.
-exec unshare -m --propagation private \
-    systemd-nspawn $extra_binds --setenv="PATH=$container_path" "$@"
+# --register=no + --keep-unit let nspawn run inside a container that has no
+# systemd-machined / unit manager (e.g. tools/dockershell). They're harmless
+# on a host that does have them, so pass them unconditionally.
+nspawn_compat="--register=no --keep-unit"
+
+# On a real host, wrap nspawn in a private mount namespace so its /dev tmpfs +
+# /nix/store bind don't leak back into the host's shared sysroot view. Inside
+# the build container (detected via /.dockerenv) call nspawn directly — the
+# extra `unshare -m` trips "Failed to resolve /proc: Too many levels of
+# symbolic links" under docker's nested namespaces, and the /dev-leak it guards
+# against can't happen in an ephemeral container anyway. Gate on /.dockerenv,
+# NOT /nix/store: the store is bind-mounted into the container too (so the
+# binfmt qemu wrapper resolves), so its presence no longer distinguishes the
+# two environments.
+if [ -f /.dockerenv ]; then
+    exec systemd-nspawn $nspawn_compat $extra_binds --setenv="PATH=$container_path" "$@"
+else
+    exec unshare -m --propagation private \
+        systemd-nspawn $nspawn_compat $extra_binds --setenv="PATH=$container_path" "$@"
+fi
