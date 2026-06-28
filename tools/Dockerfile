@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl unzip xxd git python3 \
         erofs-utils android-sdk-libsparse-utils \
         build-essential bc bison flex libssl-dev libelf-dev \
+        gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
         lz4 cpio kmod zstd \
         fastboot tio \
     && rm -rf /var/lib/apt/lists/*
@@ -32,7 +33,11 @@ RUN curl -fsSL https://storage.googleapis.com/git-repo-downloads/repo \
 
 ARG USER_UID=1000
 ARG USER_GID=1000
-RUN groupadd -g $USER_GID builder \
+# Reuse a pre-existing group if $USER_GID is already taken (e.g. host GID 100 =
+# Debian's built-in 'users' group), and make sure the supplementary groups exist
+# before adding the user to them — keeps the build working across host uid/gids.
+RUN for g in dialout plugdev; do getent group "$g" >/dev/null || groupadd "$g"; done \
+ && (getent group "$USER_GID" >/dev/null || groupadd -g "$USER_GID" builder) \
  && useradd -m -u $USER_UID -g $USER_GID -G dialout,plugdev -s /bin/bash builder \
  && echo 'builder ALL=(ALL) NOPASSWD: ALL' > /etc/sudoers.d/99-builder \
  && chmod 0440 /etc/sudoers.d/99-builder

@@ -54,7 +54,11 @@ PIXEL_DEVINFO_SOURCES := $(wildcard $(PIXEL_DEVINFO_DIR)/Cargo.toml $(PIXEL_DEVI
 # systemd-machined / a unit manager (e.g. tools/dockershell), and are harmless
 # on a host with full systemd. dbus must be reachable; tools/dockershell starts
 # a system dbus on container entry.
-NSPAWN := sudo systemd-nspawn --register=no --keep-unit --resolv-conf=bind-host
+# Wrap nspawn through tools/nspawn-wrap.sh: cleans stale sysroot/dev, fixes the
+# debootstrap /proc absolute-symlink ELOOP, binds /nix/store for the binfmt qemu,
+# and calls nspawn directly under /.dockerenv. Required for the dockershell build.
+NSPAWN_WRAP := sudo tools/nspawn-wrap.sh $(SYSROOT_DIR) --
+NSPAWN := $(NSPAWN_WRAP) --resolv-conf=bind-host
 
 # Running `make` directly bypasses the env vars set by the justfile (notably
 # KERNEL_VERSION, which is read from kernel/kernel_version). Always go through
@@ -72,10 +76,10 @@ all:
 .debootstrap: .create_image
 	just mount_rootfs
 	sudo debootstrap --variant=minbase --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR)
-	$(NSPAWN) -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
-	$(NSPAWN) -D $(SYSROOT_DIR) symlinks -cr .
-	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
-	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) symlinks -cr .
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
+	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
 	just unmount_rootfs
 	touch $@
 
