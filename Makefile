@@ -217,21 +217,31 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.install_initramfs: .install_kernel .install_packages .install_vendor_firmware
+.install_initramfs: .install_kernel .install_packages
 	just mount_rootfs
-	# Bundle aoc.bin into the initramfs at the path firmware_class.path
-	# (/vendor/firmware, set by the dtb's /chosen/bootargs) points at.
-	# Without it, the AOC coprocessor retry-loops in dracut and starves
-	# UART RX, so emergency-shell keystrokes are dropped.
+	# Mainline gs201: the storage stack needed to mount /super is all built into
+	# the kernel (CONFIG_SCSI_UFSHCD/UFS_EXYNOS, PHY_SAMSUNG_UFS, PINCTRL_EXYNOS,
+	# EXT4_FS all =y), so the initramfs needs NO vendor modules to reach root.
+	# AOC is dormant on the mainline port (no firmware_class retry-loop that
+	# starves UART), so aoc.bin is omitted as well.
+	#
+	# The previous recipe force-loaded every installed module (~1650) plus each
+	# one's firmware and bundled the 21M aoc.bin. That ballooned the vendor
+	# ramdisk to ~62M, which overflows the bootloader's ramdisk copy buffer:
+	#   [AND] vendor ramdisk copy size: 0x3b8e438 (62448696)
+	#   [E] [AND] Ramdisk copy error no memory left
+	#   [E] [PXL] failed to boot android -5
+	# (the pixel A/B loader then decrements the slot retry and rolls back).
+	# A stock-content dracut leaves only what's needed to pivot to the built-in
+	# UFS root, keeping the ramdisk small enough to load. Per-subsystem modules
+	# load normally from /lib/modules once the real rootfs is up.
 	$(NSPAWN) -D $(SYSROOT_DIR) dracut \
 		--kver $(KERNEL_VERSION) \
 		--lz4 \
 		--show-modules \
 		--force \
 		--add "rescue bash" \
-		--install /vendor/firmware/aoc.bin \
-		--kernel-cmdline "rd.shell" \
-		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
+		--kernel-cmdline "rd.shell"
 	just unmount_rootfs
 	touch $@
 
