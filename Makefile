@@ -288,7 +288,7 @@ all:
 	# bisect pending).
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 keep_bootcon root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=8 ignore_loglevel clk_ignore_unused" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=4 clk_ignore_unused" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
