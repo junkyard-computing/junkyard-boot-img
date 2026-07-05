@@ -1,0 +1,5 @@
+# Refresh the login-banner dongle-MAC line when a USB-Ethernet dongle is
+# plugged or unplugged, so the banner tracks hotplug, not just boot-time state.
+# Restart (not start) is harmless for a RemainAfterExit oneshot and re-runs it.
+ACTION=="add|remove", SUBSYSTEM=="net", ENV{ID_BUS}=="usb", \
+  RUN+="/bin/systemctl --no-block restart dongle-mac-issue.service"

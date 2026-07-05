@@ -34,16 +34,21 @@ KMAKE := $(MAKE) -C $(KERNEL_SOURCE_DIR) ARCH=arm64 CROSS_COMPILE=$(KERNEL_CROSS
 
 OVERLAY_FILES := $(shell find $(OVERLAY_DIR) -type f 2>/dev/null)
 
-# Pre-built aarch64 binary copied into the overlay tree by .build_pixel_devinfo.
-# Source-of-truth lives in the tools/pixel-devinfo submodule
-# (github.com/junkyard-computing/pixel-devinfo). Used by the
-# mark-slot-successful systemd unit to clear the bootloader's slot retry
-# counter so the device doesn't fall into fastboot after a few boots.
-PIXEL_DEVINFO_DIR ?= tools/pixel-devinfo
-PIXEL_DEVINFO_TARGET ?= aarch64-unknown-linux-gnu
-PIXEL_DEVINFO_BIN ?= $(PIXEL_DEVINFO_DIR)/target/$(PIXEL_DEVINFO_TARGET)/release/pixel-devinfo
-PIXEL_DEVINFO_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-devinfo
-PIXEL_DEVINFO_SOURCES := $(wildcard $(PIXEL_DEVINFO_DIR)/Cargo.toml $(PIXEL_DEVINFO_DIR)/Cargo.lock $(PIXEL_DEVINFO_DIR)/src/*.rs)
+# Static aarch64-musl binaries cross-compiled from the tools/pixel-bootctl and
+# tools/pixel-ota submodules and copied into the overlay tree (replacing the old
+# pixel-devinfo). pixel-bootctl does the ufs-bsg/devinfo A/B slot switch +
+# mark-successful; pixel-ota does the in-place rootfs OTA. Static musl => no
+# glibc/ld dependency, so the binaries run unchanged on the Debian rootfs.
+PIXEL_BOOTCTL_DIR ?= tools/pixel-bootctl
+PIXEL_BOOTCTL_TARGET ?= aarch64-unknown-linux-musl
+PIXEL_BOOTCTL_BIN ?= $(PIXEL_BOOTCTL_DIR)/target/$(PIXEL_BOOTCTL_TARGET)/release/pixel-bootctl
+PIXEL_BOOTCTL_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-bootctl
+PIXEL_BOOTCTL_SOURCES := $(wildcard $(PIXEL_BOOTCTL_DIR)/Cargo.toml $(PIXEL_BOOTCTL_DIR)/Cargo.lock $(PIXEL_BOOTCTL_DIR)/src/*.rs)
+
+PIXEL_OTA_DIR ?= tools/pixel-ota
+PIXEL_OTA_BIN ?= $(PIXEL_OTA_DIR)/target/$(PIXEL_BOOTCTL_TARGET)/release/pixel-ota
+PIXEL_OTA_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-ota
+PIXEL_OTA_SOURCES := $(wildcard $(PIXEL_OTA_DIR)/Cargo.toml $(PIXEL_OTA_DIR)/Cargo.lock $(PIXEL_OTA_DIR)/src/*.rs)
 
 # --resolv-conf=bind-host overrides the container's /etc/resolv.conf for the
 # lifetime of the nspawn session. Packages.txt installs systemd-resolved,
@@ -121,16 +126,27 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.build_pixel_devinfo: $(PIXEL_DEVINFO_SOURCES)
-	cd $(PIXEL_DEVINFO_DIR) && \
-		CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=$(KERNEL_CROSS_COMPILE)gcc \
-		cargo build --release --target $(PIXEL_DEVINFO_TARGET)
-	$(KERNEL_CROSS_COMPILE)strip $(PIXEL_DEVINFO_BIN)
-	mkdir -p $(dir $(PIXEL_DEVINFO_OVERLAY))
-	install -m 0755 $(PIXEL_DEVINFO_BIN) $(PIXEL_DEVINFO_OVERLAY)
+# Static aarch64-musl cross-build via the Rust toolchain's bundled rust-lld
+# (-C strip), so no external aarch64 gcc/strip is needed; works in the flake
+# devShell or any host with the aarch64-unknown-linux-musl rustup target.
+.build_pixel_bootctl: $(PIXEL_BOOTCTL_SOURCES)
+	cd $(PIXEL_BOOTCTL_DIR) && \
+		RUSTFLAGS="-C linker=rust-lld -C strip=symbols" \
+		cargo build --release --target $(PIXEL_BOOTCTL_TARGET)
+	mkdir -p $(dir $(PIXEL_BOOTCTL_OVERLAY))
+	install -m 0755 $(PIXEL_BOOTCTL_BIN) $(PIXEL_BOOTCTL_OVERLAY)
 	touch $@
 
-.install_packages: .debootstrap .build_pixel_devinfo $(APT_PACKAGES_FILE) $(OVERLAY_FILES)
+# pixel-ota: identical cross-build recipe to pixel-bootctl.
+.build_pixel_ota: $(PIXEL_OTA_SOURCES)
+	cd $(PIXEL_OTA_DIR) && \
+		RUSTFLAGS="-C linker=rust-lld -C strip=symbols" \
+		cargo build --release --target $(PIXEL_BOOTCTL_TARGET)
+	mkdir -p $(dir $(PIXEL_OTA_OVERLAY))
+	install -m 0755 $(PIXEL_OTA_BIN) $(PIXEL_OTA_OVERLAY)
+	touch $@
+
+.install_packages: .debootstrap .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES)
 	just mount_rootfs
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "apt-get update"
 	# Locale setup.

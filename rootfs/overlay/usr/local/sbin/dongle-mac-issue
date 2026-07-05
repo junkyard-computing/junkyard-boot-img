@@ -1,0 +1,77 @@
+#!/bin/sh
+# Write the USB-Ethernet dongle's MAC into the login banner via an issue.d
+# drop-in.
+#
+# IMPORTANT — directory choice: agetty reads /etc/issue.d/*.issue IN ADDITION to
+# /etc/issue, but reads /run/issue.d ONLY when /etc/issue does NOT exist. Our
+# overlay ships a non-empty /etc/issue, so /run/issue.d would be ignored — the
+# drop-in MUST live in /etc/issue.d. (Works because the rootfs is writable at
+# runtime; if/when the rootfs goes read-only, make /etc/issue.d/20-dongle-mac
+# .issue a symlink to a /run path and write there instead.)
+#
+# Why this exists: on the 40-phone test bench, the dongle MAC is the per-device
+# identity (it maps to a physical slot, mapped externally). Putting it on the
+# login screen lets you tell which phone you're on at a glance, manually or in a
+# screenshot. Only emitted when a dongle is actually present, so a phone with no
+# dongle shows no (misleading) MAC line.
+#
+# "Dongle" = a non-virtual ethernet iface whose sysfs device path traverses USB.
+# Onboard/virtual ifaces (lo, veth, docker, etc.) are skipped: their device
+# symlink does not resolve under a .../usb.../ path.
+set -eu
+
+ISSUE_DIR=/etc/issue.d
+OUT="$ISSUE_DIR/20-dongle-mac.issue"
+mkdir -p "$ISSUE_DIR"
+
+emit=""
+for ifpath in /sys/class/net/*; do
+	[ -e "$ifpath" ] || continue
+	iface=$(basename "$ifpath")
+	[ "$iface" = "lo" ] && continue
+	# Resolve the backing device; USB net devices live under a usb* path.
+	devlink=$(readlink -f "$ifpath/device" 2>/dev/null) || continue
+	case "$devlink" in
+		*/usb*) ;;            # USB-backed — this is our dongle
+		*) continue ;;
+	esac
+	mac=$(cat "$ifpath/address" 2>/dev/null) || continue
+	[ -n "$mac" ] || continue
+	emit="${emit}Dongle: $iface  $mac\n"
+done
+
+old=""
+[ -f "$OUT" ] && old=$(cat "$OUT" 2>/dev/null)
+
+# This drop-in is printed by agetty immediately after /etc/issue (which now ends
+# at the "IPv4:" line, no trailing blank). It owns the spacing before the login
+# prompt: a trailing blank line goes BELOW the dongle line(s), so the layout is
+#   IPv4: ...
+#   Dongle: ...
+#   <blank>
+#   <login prompt>
+# with no blank between IPv4 and the dongle line. The blank is emitted even with
+# no dongle, so a dongle-less console still has a gap before the prompt (just no
+# MAC line).
+if [ -n "$emit" ]; then
+	# \n in $emit is a real newline (printf), one Dongle line per dongle; the
+	# extra trailing \n is the gap before the prompt.
+	printf "%b\n" "$emit" > "$OUT"
+else
+	# No dongle: spacing only — a single blank line, no (misleading) MAC.
+	printf "\n" > "$OUT"
+fi
+new=$(cat "$OUT" 2>/dev/null)
+
+# Force already-drawn login prompts to redraw. CRITICAL on felix: the USB-Eth
+# dongle (r8152) can take ~130s to enumerate — long after agetty has drawn the
+# login banner, which it reads only once per prompt. Without a nudge the MAC
+# never appears until the next manual login. agetty re-reads the issue when it
+# (re)starts, and kmscon/serial-getty respawn agetty on SIGHUP, so HUPing the
+# agettys makes the banner redraw with the freshly written drop-in. Only act on
+# an actual change to avoid redraw loops.
+if [ "$old" != "$new" ]; then
+	# kmscon supervises its agetty; serial-getty runs agetty directly. SIGHUP to
+	# all agetty processes makes each redraw/respawn and re-read the issue.
+	pkill -HUP -x agetty 2>/dev/null || true
+fi

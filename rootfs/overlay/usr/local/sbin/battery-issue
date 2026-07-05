@@ -1,0 +1,48 @@
+#!/bin/sh
+# Refresh the "Battery:" line in /etc/issue so the kmscon login banner shows the
+# current charge, the same way "IPv4: \4" shows the address. agetty re-renders
+# /etc/issue each time it draws the login prompt; battery-issue.timer reruns this
+# so the value stays current. Reads the kernel fuel gauge under
+# /sys/class/power_supply directly — no Android userspace needed.
+set -u
+
+ISSUE=/etc/issue
+PSDIR=/sys/class/power_supply
+
+# Prefer the aggregated "battery" supply (google_battery exposes one on felix);
+# otherwise take the first power supply whose type is Battery.
+bat=""
+if [ -r "$PSDIR/battery/capacity" ]; then
+    bat="$PSDIR/battery"
+else
+    for d in "$PSDIR"/*; do
+        [ -r "$d/type" ] || continue
+        [ "$(cat "$d/type" 2>/dev/null)" = "Battery" ] || continue
+        bat="$d"
+        break
+    done
+fi
+
+if [ -n "$bat" ] && [ -r "$bat/capacity" ]; then
+    cap="$(cat "$bat/capacity" 2>/dev/null)"
+    status="$(cat "$bat/status" 2>/dev/null)"
+    case "$status" in
+        Charging)       state="charging" ;;
+        Discharging)    state="on battery" ;;
+        Full)           state="full" ;;
+        "Not charging") state="not charging" ;;
+        "")             state="" ;;
+        *)              state="$status" ;;
+    esac
+    if [ -n "$state" ]; then
+        line="Battery: ${cap}% (${state})"
+    else
+        line="Battery: ${cap}%"
+    fi
+else
+    line="Battery: n/a"
+fi
+
+# Replace the Battery line in place. GNU sed -i writes a temp file and renames,
+# so agetty never reads a half-written banner. No-op if the line is absent.
+sed -i "s|^Battery:.*|$line|" "$ISSUE"

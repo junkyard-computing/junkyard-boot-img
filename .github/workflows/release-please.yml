@@ -1,0 +1,51 @@
+# Automates releases from Conventional Commits using release-please.
+#
+# On every push to main, release-please maintains a "release PR" that bumps
+# version.txt and updates CHANGELOG.md based on the feat:/fix:/... commits since
+# the last release. Merging that PR tags the release (vX.Y.Z) and publishes a
+# GitHub Release. version.txt is the same file the Makefile reads to stamp
+# IMAGE_VERSION into the image, so a release and the on-device version stay in
+# sync. Config lives in release-please-config.json + .release-please-manifest.json.
+
+name: release-please
+
+on:
+  # Re-evaluate the pending release on every push to the default branch.
+  push:
+    branches:
+      - main
+  # Allow kicking it manually from the Actions tab.
+  workflow_dispatch:
+
+# The action opens/updates the release PR and creates releases/tags on merge.
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      # Token selection: prefer a user/App PAT (secret RELEASE_PLEASE_TOKEN) if
+      # one is configured, otherwise fall back to the default GITHUB_TOKEN.
+      #
+      # Why a PAT may be needed: opening the release PR with GITHUB_TOKEN requires
+      # the repo/org setting "Allow GitHub Actions to create and approve pull
+      # requests" (Settings -> Actions -> General -> Workflow permissions) to be
+      # ON. With it OFF the action fails with "GitHub Actions is not permitted to
+      # create or approve pull requests" regardless of the pull-requests: write
+      # grant below. A PAT is a user token and is not subject to that toggle, so
+      # it sidesteps the restriction. It also makes the release PR trigger other
+      # workflows (e.g. build-kernel) — commits made with GITHUB_TOKEN do not.
+      #
+      # So this is only fully fixed once EITHER that org/repo toggle is enabled,
+      # OR a RELEASE_PLEASE_TOKEN secret is added. This expression makes the
+      # workflow use the PAT automatically as soon as the secret exists.
+      #
+      # FORCE_JAVASCRIPT_ACTIONS_TO_NODE24 clears the Node 20 deprecation warning
+      # by opting the action into the Node 24 runtime ahead of the default switch.
+      - uses: googleapis/release-please-action@v4
+        env:
+          FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}

@@ -30,6 +30,15 @@ render.experimental.xml
 *.jks
 *.keystore
 
+# ARM NDA blobs: builders decrypt with their own ~/.ssh key, so no private key
+# should ever live in the repo. The encrypted blob (secrets/*.age) and the
+# public recipients list (secrets/recipients.txt) ARE tracked. This guard just
+# stops a stray private key under secrets/ from being committed by accident.
+secrets/*.key
+# Scratch tree where the RAW (decrypted) NDA blobs are staged before `just
+# pack_arm_blobs` encrypts them. Never commit the cleartext libs.
+secrets/staging/
+
 # Google Services (e.g. APIs or Firebase)
 google-services.json
 
@@ -149,8 +158,6 @@ Cargo.lock
 
 kernel_version
 kernel/kernel_version
-kernel/source.aosp-backup/
-kernel/source/out/
 rootfs/module_order.txt
 rootfs/sysroot/
 rootfs/unpack/
@@ -172,21 +179,23 @@ boot/vendor_boot.img
 # Downloaded at build time by `just sync_vendor_firmware`
 tools/payload-dumper-go/
 
-# Uart logs
-uart-logs/
+# Build sentinels for the cross-compiled pixel tools. (The binaries themselves
+# are re-ignored in rootfs/.gitignore, after that file's !overlay/** allowlist.)
+.build_pixel_bootctl
+.build_pixel_ota
 
-# Stock OTA boot images extracted for the AOSP-kernel sanity test
-# (see flash-aosp-sanity.sh) — large binary blobs, regenerable from the OTA.
-aosp-sanity/
+# Compiled memdump tool (build output of tools/memdump/Makefile; the .c/.py/.sh
+# sources are tracked).
+tools/memdump/memdump
 
-# Earlier ABL dump
+# USB register capture sessions (local debugging scratch: *.bin register dumps
+# plus per-capture context.txt notes). Whole tree is throwaway per-capture data.
+aosp-vs-mainline/
+
+# --- mainline-track-only ignores (merged from feature/linux-kernel) ---
 abl-dump/
-
-# Misc unpacked-image scratch directory used during boot-image debugging
+aosp-sanity/
+kernel/source.aosp-backup/
+kernel/source/out/
 out/
-# Pre-built aarch64 binary copied from tools/pixel-devinfo by the Makefile
-# (see .build_pixel_devinfo target). The source-of-truth lives in the
-# tools/pixel-devinfo submodule; this is just a staged artifact for overlay
-# rsync.
-rootfs/overlay/usr/local/bin/pixel-devinfo
-.build_pixel_devinfo
+uart-logs/

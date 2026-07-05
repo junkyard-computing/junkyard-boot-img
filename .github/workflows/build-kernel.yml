@@ -1,0 +1,110 @@
+# This workflow builds a Linux kernel and uploads the compiled artifacts.
+# It is triggered automatically when kernel configuration or source files change,
+# ensuring the kernel artifact stays in sync with the latest committed kernel changes.
+
+# Adapted from: https://github.com/ebeutz/junkyard-slurm/blob/main/.github/workflows/kernel.yml
+
+name: build-kernel
+
+# Controls when the workflow will run
+on:
+  # Triggers the workflow on push events, but only when files under the kernel/ directory are modified.
+  push:
+    paths:
+      - "kernel/**"
+    branches:
+      - "main"
+
+  # Allows you to run this workflow manually from the Actions tab.
+  workflow_dispatch:
+
+# A workflow run is made up of one or more jobs that can run sequentially or in parallel
+jobs:
+  # This workflow contains a single job called "build"
+  build:
+    # Run the job on the latest available Ubuntu GitHub-hosted runner
+    runs-on: ubuntu-latest
+
+    # Steps represent a sequence of tasks that will be executed as part of the job
+    steps:
+      # Reclaim space on the root volume. ubuntu-latest ships only ~14 GB free on
+      # / but a ~70 GB ephemeral disk at /mnt. The AOSP `repo sync` + Bazel build
+      # is tens of GB, and Bazel's output base lives under ~/.cache/bazel (on /),
+      # so a full kernel build exhausts / and the runner dies with
+      # "No space left on device". Drop the preinstalled toolchains we never use
+      # to buy back ~25-30 GB on /.
+      - name: Free up disk space on the root volume
+        run: |
+          echo "Before:"; df -h / /mnt
+          sudo rm -rf \
+            /opt/hostedtoolcache \
+            /usr/local/lib/android \
+            /usr/share/dotnet \
+            /usr/local/.ghcup \
+            /opt/ghc \
+            /usr/local/share/boost \
+            "${AGENT_TOOLSDIRECTORY:-/opt/hostedtoolcache}" || true
+          sudo docker image prune --all --force || true
+          sudo apt-get clean || true
+          echo "After:"; df -h / /mnt
+
+      # Mounts a volatile overlayfs over the working directory to speed up the build.
+      # All file writes go to a temporary in-memory layer instead of hitting the disk directly.
+      # The upper/work layers are placed on the large /mnt ephemeral disk (not /),
+      # so the repo checkout and in-tree build outputs don't crowd the small root
+      # volume. (Bazel's own output base still lives under ~/.cache/bazel on /,
+      # which is why the cleanup step above is also required.)
+      - name: Mount volatile overlayfs for faster builds
+        run: |
+          mkdir a
+          sudo mkdir -p /mnt/overlay/upper /mnt/overlay/work
+          sudo chown "$(id -u):$(id -g)" /mnt/overlay/upper /mnt/overlay/work
+          sudo mount -t overlay overlay \
+            -o lowerdir="$PWD/a",upperdir=/mnt/overlay/upper,workdir=/mnt/overlay/work,volatile \
+            "$PWD"
+
+      # Checks out the repository under $GITHUB_WORKSPACE so subsequent steps
+      # can access the kernel source, config files, and justfiles.
+      - uses: actions/checkout@v5
+
+      # Downloads and installs the `just` command runner binary directly from upstream.
+      - name: Install just
+        run: curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | sudo bash -s -- --to /usr/bin
+
+      # Installs required build dependencies via apt.
+      # - `repo`: Google's tool for managing multi-repo projects (used for kernel source)
+      # - `kmod`: utilities for loading/managing Linux kernel modules
+      # - `debootstrap`: bootstraps a Debian/Ubuntu root filesystem, required by the justfile
+      # `eatmydata` is used throughout to disable fsync/fdatasync calls, which speeds up
+      # apt operations significantly in a throwaway CI environment where data durability
+      # is not a concern.
+      - name: Install dependencies
+        run: |
+          sudo rm -f /var/lib/man-db/auto-update
+          sudo apt update
+          sudo eatmydata apt install -y repo kmod debootstrap systemd-container qemu-user-static
+          
+
+      # Compiles the kernel and prepares the module tree and source artifacts using
+      # the `just` command runner. Two targets are invoked:
+      # - `build_kernel`: compiles the kernel image from source
+      # - `update_kernel_modules_and_source`: installs kernel modules and packages
+      #   the kernel source/headers needed for out-of-tree module builds
+      - name: Compile Kernel
+        run: |
+          eatmydata just build_kernel
+          eatmydata just update_kernel_modules_and_source
+
+      # Uploads the compiled kernel tarball as a GitHub Actions artifact.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: kernel
+          path: kernel/kernel.tar
+
+      # Uploads the full kernel build output directory as a separate artifact.
+      # This includes intermediate build files, Module.symvers, and other outputs
+      # that may be needed for debugging or building external kernel modules.
+      - uses: actions/upload-artifact@v5
+        with:
+          name: kernel-build-out
+          path: kernel/out/

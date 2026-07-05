@@ -57,10 +57,12 @@ Individual stages are also exposed: `just build_kernel`, `just build_rootfs`, `j
 ```shell
 fastboot oem disable-verity
 fastboot oem disable-verification
-./flash.sh
+./flash-fastboot.sh
 ```
 
-`flash.sh` wraps flashing `boot.img` + `vendor_boot.img` + `rootfs.img` (to the `super` slot).
+`flash-fastboot.sh` wraps flashing `boot.img` + `vendor_boot.img` + `rootfs.img` (to the `super` slot) over fastboot, with the device in the bootloader on USB.
+
+For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then reflashes the rootfs via the systemd shutdown initramfs. It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and requires a persistent staging partition mounted at `/userdata` (the rootfs reflash is destructive and rollback-free).
 
 ## TODO
 

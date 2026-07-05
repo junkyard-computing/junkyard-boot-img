@@ -4,5 +4,12 @@
 !.gitignore
 !_enter
 !packages.txt
+!debian_snapshot
+!kmscon.env
 !overlay
 !overlay/**
+# ...but not the cross-compiled tool binaries the .build_pixel_* Make targets
+# drop in (re-ignore them; source-of-truth is each tools/pixel-* submodule).
+# Must come after !overlay/** to win.
+overlay/usr/local/bin/pixel-bootctl
+overlay/usr/local/bin/pixel-ota

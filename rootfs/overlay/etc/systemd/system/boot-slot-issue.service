@@ -1,0 +1,21 @@
+[Unit]
+Description=Write the A/B boot slot into the login banner (issue.d)
+# Must finish BEFORE any getty draws its prompt: agetty reads the issue (and its
+# issue.d drop-ins) once, at prompt-draw time. Order ahead of felix's two login
+# paths (the kmscon VTs and the UART serial getty) and getty.target generally.
+# After udev settles so the devinfo by-partlabel symlink exists for
+# `pixel-bootctl status`; the script falls back to the running slot (from the
+# kernel cmdline) when devinfo isn't readable.
+After=systemd-udev-settle.service
+Wants=systemd-udev-settle.service
+Before=getty.target serial-getty@ttySAC0.service kmsconvt@tty1.service kmscon@tty1.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/boot-slot-issue
+
+[Install]
+# Pulled in early (sysinit-adjacent) so it is ordered before getty.target, which
+# multi-user.target reaches only after this completes.
+WantedBy=multi-user.target

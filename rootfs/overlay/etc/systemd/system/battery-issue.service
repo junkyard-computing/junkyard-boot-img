@@ -1,0 +1,7 @@
+[Unit]
+Description=Update battery readout in the login banner (/etc/issue)
+ConditionPathExists=/etc/issue
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/battery-issue
