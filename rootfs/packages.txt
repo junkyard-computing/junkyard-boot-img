@@ -22,3 +22,6 @@ libvulkan1
 ocl-icd-libopencl1
 vulkan-tools
 clinfo
+libclc-19
+libclang-cpp19
+libllvmspirvlib19.1

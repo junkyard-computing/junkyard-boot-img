@@ -50,6 +50,21 @@ PIXEL_OTA_BIN ?= $(PIXEL_OTA_DIR)/target/$(PIXEL_BOOTCTL_TARGET)/release/pixel-o
 PIXEL_OTA_OVERLAY ?= $(OVERLAY_DIR)/usr/local/bin/pixel-ota
 PIXEL_OTA_SOURCES := $(wildcard $(PIXEL_OTA_DIR)/Cargo.toml $(PIXEL_OTA_DIR)/Cargo.lock $(PIXEL_OTA_DIR)/src/*.rs)
 
+# Open-GPU userland: the junkyard-computing/mesa `felix-g710` fork (Panfrost
+# gallium + rusticl OpenCL + PanVK Vulkan, with the Mali-G710 model entry).
+# `.build_mesa` clones the fork host-side and builds it in the nspawn sysroot
+# (tools/build-mesa/build-in-sysroot.sh), caching the .so's + ICDs to
+# $(MESA_OUT). `.install_mesa` bakes them into /opt/mesa-g710 in the image.
+# The build is expensive (~1hr first time under qemu) but the cache dir and its
+# sentinel are PRESERVED across `clean_rootfs` (ninja resumes), like the kernel.
+MESA_FORK_URL ?= https://github.com/junkyard-computing/mesa.git
+MESA_FORK_BRANCH ?= felix-g710
+MESA_DIR ?= build/mesa
+MESA_SRC ?= $(MESA_DIR)/src
+MESA_OUT ?= $(MESA_DIR)/out
+MESA_PREFIX ?= /opt/mesa-g710
+MESA_BUILD_SCRIPT ?= tools/build-mesa/build-in-sysroot.sh
+
 # --resolv-conf=bind-host overrides the container's /etc/resolv.conf for the
 # lifetime of the nspawn session. Packages.txt installs systemd-resolved,
 # whose postinst points /etc/resolv.conf at a stub that only resolves when
@@ -146,6 +161,51 @@ all:
 	install -m 0755 $(PIXEL_OTA_BIN) $(PIXEL_OTA_OVERLAY)
 	touch $@
 
+# Build the open-GPU Mesa userland (rusticl OpenCL + PanVK Vulkan + Panfrost)
+# in the nspawn sysroot and cache the result to $(MESA_OUT). Depends on
+# .install_packages so apt + the base image are ready; the fork is cloned
+# host-side (fast) and bind-mounted at /mesa. Expensive first run (~1hr under
+# qemu); ninja resumes from the persisted $(MESA_DIR)/build tree on reruns, so
+# even after a `clean_rootfs` (which preserves this sentinel) the re-run only
+# reinstalls build deps + relinks, not a full rebuild.
+.build_mesa: .install_packages $(MESA_BUILD_SCRIPT)
+	mkdir -p $(MESA_SRC) $(MESA_DIR)/build $(MESA_OUT)
+	# Clone or update the fork host-side (native git, not under qemu).
+	if [ -d $(MESA_SRC)/.git ]; then \
+		git -C $(MESA_SRC) fetch --depth 1 origin $(MESA_FORK_BRANCH) && \
+		git -C $(MESA_SRC) checkout -B $(MESA_FORK_BRANCH) FETCH_HEAD; \
+	else \
+		rm -rf $(MESA_SRC) && \
+		git clone --depth 1 --branch $(MESA_FORK_BRANCH) $(MESA_FORK_URL) $(MESA_SRC); \
+	fi
+	just mount_rootfs
+	# Bind the host mesa work dir into the sysroot at /mesa and run the build.
+	$(NSPAWN) --bind="$(CURDIR)/$(MESA_DIR):/mesa" \
+		--bind-ro="$(CURDIR)/$(MESA_BUILD_SCRIPT):/build-mesa.sh" \
+		-D $(SYSROOT_DIR) bash /build-mesa.sh
+	just unmount_rootfs
+	test -f $(MESA_OUT)/libRusticlOpenCL.so.1 || \
+		{ echo "ERROR: mesa build produced no libRusticlOpenCL.so.1"; exit 1; }
+	touch $@
+
+# Bake the cached Mesa libs into the image at $(MESA_PREFIX), register the
+# rusticl + PanVK ICDs system-wide, and wire the loader + RUSTICL_ENABLE so the
+# open GPU works out of the box (no LD_LIBRARY_PATH / env needed on-device).
+.install_mesa: .build_mesa .install_packages
+	just mount_rootfs
+	sudo mkdir -p $(SYSROOT_DIR)$(MESA_PREFIX)/lib
+	sudo rsync -a $(MESA_OUT)/ $(SYSROOT_DIR)$(MESA_PREFIX)/lib/
+	# ICD manifests in the standard search dirs so clinfo/vulkaninfo find them.
+	sudo mkdir -p $(SYSROOT_DIR)/etc/OpenCL/vendors $(SYSROOT_DIR)/usr/share/vulkan/icd.d
+	sudo cp $(MESA_OUT)/rusticl-g710.icd $(SYSROOT_DIR)/etc/OpenCL/vendors/rusticl-g710.icd
+	sudo cp $(MESA_OUT)/panvk-g710.json $(SYSROOT_DIR)/usr/share/vulkan/icd.d/panvk-g710.json
+	# Loader path + rusticl driver selection, system-wide.
+	echo "$(MESA_PREFIX)/lib" | sudo tee $(SYSROOT_DIR)/etc/ld.so.conf.d/mesa-g710.conf >/dev/null
+	echo "RUSTICL_ENABLE=panfrost" | sudo tee -a $(SYSROOT_DIR)/etc/environment >/dev/null
+	$(NSPAWN) -D $(SYSROOT_DIR) ldconfig
+	just unmount_rootfs
+	touch $@
+
 .install_packages: .debootstrap .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES)
 	just mount_rootfs
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "apt-get update"
@@ -165,8 +225,13 @@ all:
 		"DEBIAN_FRONTEND=noninteractive apt-get -y install $(APT_PACKAGES) /var/cache/apt/archives/kmscon.deb"
 	# Unprivileged user with passwordless sudo. Paired with the autologin
 	# override in rootfs/overlay/etc/systemd/system/kmsconvt@.service.d/.
+	# render,video: access /dev/dri/renderD129 (panthor) + card nodes for the
+	# open-GPU stack (rusticl/PanVK) without sudo. The usermod runs
+	# unconditionally so the groups are correct even on an incremental rebuild
+	# where the user already exists (useradd -G only applies at create time).
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
-		"id -u $(USER_LOGIN) >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo $(USER_LOGIN)"
+		"id -u $(USER_LOGIN) >/dev/null 2>&1 || useradd -m -s /bin/bash -G sudo,render,video $(USER_LOGIN)"
+	$(NSPAWN) -D $(SYSROOT_DIR) usermod -aG sudo,render,video $(USER_LOGIN)
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"echo $(USER_LOGIN):$(USER_PW) | chpasswd"
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
@@ -261,7 +326,7 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.build_boot: .install_initramfs .install_vendor_firmware
+.build_boot: .install_initramfs .install_vendor_firmware .install_mesa
 	# Kernel cmdline.
 	#   earlycon=exynos4210,mmio32,0x10A00000  UART0 output using the bootloader's
 	#                                          divider setup (polled, no reprogramming)
@@ -326,8 +391,15 @@ all:
 clean_image:
 	just unmount_rootfs
 	rm -f $(ROOTFS_IMG)
-	rm -f .create_image .debootstrap .install_vendor_firmware .install_packages .install_kernel .install_initramfs .build_boot
+	# .install_mesa is a cheap sysroot re-copy → drop it so it re-runs. .build_mesa
+	# (the ~1hr build cache) is deliberately PRESERVED here, like .build_kernel.
+	rm -f .create_image .debootstrap .install_vendor_firmware .install_packages .install_kernel .install_initramfs .install_mesa .build_boot
 
 clean: clean_image
 	rm -f boot/boot.img boot/vendor_boot.img
 	sudo rm -rf rootfs/unpack
+
+# Drop the cached open-GPU Mesa build (forces a full rebuild next `just all`).
+clean_mesa:
+	rm -rf $(MESA_DIR)
+	rm -f .build_mesa .install_mesa

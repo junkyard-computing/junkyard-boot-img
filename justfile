@@ -173,6 +173,26 @@ install_apt_packages user_login="kalm" user_password="0000":
         USER_LOGIN={{ user_login }} \
         USER_PW={{ user_password }}
 
+# Build the open-GPU Mesa userland (rusticl OpenCL + PanVK Vulkan + Panfrost,
+# felix-g710 fork) in the nspawn sysroot and cache it. `just all` runs this
+# automatically (.build_boot depends on it); this target forces just the build.
+# Expensive first run (~1hr under qemu); ninja resumes on reruns.
+[group('gpu')]
+build_mesa:
+    {{ _make }} -C {{ justfile_directory() }} .build_mesa
+
+# Bake the cached Mesa libs + ICDs into the mounted rootfs image (also part of
+# `just all`). Runs the build first if not yet cached.
+[group('gpu')]
+install_mesa:
+    {{ _make }} -C {{ justfile_directory() }} .install_mesa
+
+# Drop the cached Mesa build so the next `just all` / `just build_mesa` rebuilds
+# from scratch (the felix-g710 fork moved, or a clean slate is wanted).
+[group('gpu')]
+clean_mesa:
+    {{ _make }} -C {{ justfile_directory() }} clean_mesa
+
 # Pull /vendor/firmware out of the Pixel Fold (felix) factory OTA and stage it
 # under rootfs/vendor-firmware/extracted/. The Makefile's
 # .install_vendor_firmware step rsyncs this into /vendor/firmware/ on the
