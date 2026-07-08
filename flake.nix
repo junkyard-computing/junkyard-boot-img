@@ -71,15 +71,20 @@
           crossPrefix = crossCC.targetPrefix; # "aarch64-unknown-linux-gnu-"
           # Static aarch64-musl Rust for the on-device pixel-bootctl / pixel-ota
           # binaries (musl = zero runtime deps; runs unchanged on the Debian rootfs).
+          # `rust-src` is also needed by the kernel's Rust support (it rebuilds
+          # `core`/`alloc` for the kernel target) when CONFIG_RUST=y.
           rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
             targets = [ "aarch64-unknown-linux-musl" ];
+            extensions = [ "rust-src" ];
           };
         in
         {
           # Default: mainline kbuild, rootfs stages, image packaging, flashing.
           #   nix develop   then   just build_kernel   /   just all
           default = pkgs.mkShell {
-            packages = buildToolsFor pkgs ++ [ rustToolchain ];
+            # rust-bindgen (+ its libclang) is required by the kernel's Rust
+            # support to generate the C FFI bindings when CONFIG_RUST=y.
+            packages = buildToolsFor pkgs ++ [ rustToolchain pkgs.rust-bindgen ];
             nativeBuildInputs = [ crossCC ];
             shellHook = ''
               export ARCH=arm64
