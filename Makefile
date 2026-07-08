@@ -266,6 +266,12 @@ all:
 	# it — our beacon is the single owner of /sys/fs/pstore consumption.
 	$(NSPAWN) -D $(SYSROOT_DIR) systemctl enable pstore-beacon.service
 	$(NSPAWN) -D $(SYSROOT_DIR) systemctl mask systemd-pstore.service
+	# serial-getty@ttyGS0: nothing provides a peripheral-mode /dev/ttyGS0 in the
+	# default (host-mode) cable setup, so an enabled instance just blocks boot
+	# ~90s waiting on dev-ttyGS0.device (BoundBy=serial-getty@ttyGS0.service).
+	# Mask it so a stray manual enable — or a future gadget ACM function — can't
+	# reintroduce that wait; UART/kmscon/SSH are the real login paths.
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl mask serial-getty@ttyGS0.service
 	just unmount_rootfs
 	touch $@
 
