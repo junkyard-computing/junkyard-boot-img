@@ -202,6 +202,11 @@ all:
 	# Loader path + rusticl driver selection, system-wide.
 	echo "$(MESA_PREFIX)/lib" | sudo tee $(SYSROOT_DIR)/etc/ld.so.conf.d/mesa-g710.conf >/dev/null
 	echo "RUSTICL_ENABLE=panfrost" | sudo tee -a $(SYSROOT_DIR)/etc/environment >/dev/null
+	# Register-pressure-aware loop unrolling (mesa fork felix-g710 c00a209f): stops
+	# PanVK from blindly obeying SPIR-V [[unroll]] hints that spill-storm on Valhall's
+	# 64-reg file (llama.cpp mul_mm 1252->0 spills, ~2x prefill, kills the wide-batch
+	# job-timeout hang). Drop this line once the pass is made unconditional upstream.
+	echo "PAN_PRESSURE_UNROLL=1" | sudo tee -a $(SYSROOT_DIR)/etc/environment >/dev/null
 	$(NSPAWN) -D $(SYSROOT_DIR) ldconfig
 	just unmount_rootfs
 	touch $@
