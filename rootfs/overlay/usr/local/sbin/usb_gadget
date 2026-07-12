@@ -12,3 +12,6 @@ mkdir -p /sys/kernel/config/usb_gadget/g1/configs/c.1/strings/0x409
 echo "USB network" > /sys/kernel/config/usb_gadget/g1/configs/c.1/strings/0x409/configuration
 ln -s /sys/kernel/config/usb_gadget/g1/functions/ncm.usb0 /sys/kernel/config/usb_gadget/g1/configs/c.1/
 echo 11210000.dwc3 > /sys/kernel/config/usb_gadget/g1/UDC
+
+#Bring ip link interface up for macOS
+ip link set usb0 up
