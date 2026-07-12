@@ -75,6 +75,9 @@ jobs:
       # - `repo`: Google's tool for managing multi-repo projects (used for kernel source)
       # - `kmod`: utilities for loading/managing Linux kernel modules
       # - `debootstrap`: bootstraps a Debian/Ubuntu root filesystem, required by the justfile
+      # - `age`: file encryption/decryption tool required by the justfile (justfile:28
+      #   does `_age := require("age")` before any recipe runs, to decrypt a secret
+      #   used during the build)
       # `eatmydata` is used throughout to disable fsync/fdatasync calls, which speeds up
       # apt operations significantly in a throwaway CI environment where data durability
       # is not a concern.
@@ -82,7 +85,7 @@ jobs:
         run: |
           sudo rm -f /var/lib/man-db/auto-update
           sudo apt update
-          sudo eatmydata apt install -y repo kmod debootstrap systemd-container qemu-user-static
+          sudo eatmydata apt install -y repo kmod debootstrap systemd-container qemu-user-static age
           
 
       # Compiles the kernel and prepares the module tree and source artifacts using
