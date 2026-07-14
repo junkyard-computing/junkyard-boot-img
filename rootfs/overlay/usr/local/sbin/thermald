@@ -1,0 +1,21 @@
+#!/bin/sh
+# gs201 userspace thermal throttle: cap each CPU cluster's cpufreq to hold a
+# target junction temp. Interim measure — the in-kernel step_wise governor
+# under-ramps on gs201 (cooling stalls at ~1-2/20, temps run to ~108C), and
+# IPA/power_allocator can't bind because cpufreq-dt's Energy Model registration
+# fails (gs201 OPP tables carry no opp-microvolt/microwatt — voltage is ACPM's).
+# Bang-bang with hysteresis; restores full freq on exit.
+TARGET=${TARGET:-92000}; HYST=${HYST:-4000}; POLL=${POLL:-1}
+PAIRS="6:0 4:1 0:2"   # cpu(policy):thermal_zone  (big/mid/little)
+restore() { for p in 6 4 0; do cat /sys/devices/system/cpu/cpu$p/cpufreq/cpuinfo_max_freq > /sys/devices/system/cpu/cpu$p/cpufreq/scaling_max_freq 2>/dev/null; done; }
+trap 'restore; exit 0' TERM INT
+for p in 6 4 0; do eval "F$p=\"\$(cat /sys/devices/system/cpu/cpu$p/cpufreq/scaling_available_frequencies | tr ' ' '\n' | grep -v '^$' | sort -n | tr '\n' ' ')\""; done
+while :; do
+  for pair in $PAIRS; do
+    cpu=${pair%:*}; zone=${pair#*:}; C=/sys/devices/system/cpu/cpu$cpu/cpufreq
+    temp=$(cat /sys/class/thermal/thermal_zone$zone/temp); cur=$(cat $C/scaling_max_freq); eval "freqs=\$F$cpu"
+    if [ "$temp" -gt "$TARGET" ]; then next=""; for f in $freqs; do [ "$f" -lt "$cur" ] && next=$f; done; [ -n "$next" ] && echo "$next" > $C/scaling_max_freq 2>/dev/null
+    elif [ "$temp" -lt "$((TARGET-HYST))" ]; then next=""; for f in $freqs; do if [ "$f" -gt "$cur" ]; then next=$f; break; fi; done; [ -n "$next" ] && echo "$next" > $C/scaling_max_freq 2>/dev/null; fi
+  done
+  sleep "$POLL"
+done

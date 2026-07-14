@@ -1,0 +1,13 @@
+[Unit]
+Description=gs201 userspace thermal throttle (interim, pre-IPA)
+After=multi-user.target
+
+[Service]
+Type=simple
+Environment=TARGET=92000
+ExecStart=/usr/local/sbin/thermald
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
