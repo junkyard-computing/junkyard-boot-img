@@ -1,0 +1,9 @@
+[Unit]
+Description=Select power_allocator (IPA) thermal governor for CPU zones
+After=sysinit.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ipa-thermal
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target

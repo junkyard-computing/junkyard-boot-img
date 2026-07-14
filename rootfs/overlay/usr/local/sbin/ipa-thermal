@@ -1,0 +1,11 @@
+#!/bin/sh
+# Select the power_allocator (IPA) thermal governor for the CPU zones. IPA needs
+# the Energy Model (unblocked by opp-microvolt on the CPU OPPs in gs201.dtsi) and
+# per-zone sustainable-power (also in the DT). Falls back silently to the zone's
+# default (step_wise) if a zone can't bind.
+for z in /sys/class/thermal/thermal_zone*; do
+  t=$(cat "$z/type" 2>/dev/null)
+  case "$t" in big-thermal|mid-thermal|little-thermal)
+    echo power_allocator > "$z/policy" 2>/dev/null ;;
+  esac
+done
