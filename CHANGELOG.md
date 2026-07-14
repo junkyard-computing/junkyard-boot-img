@@ -1,5 +1,22 @@
 # Changelog
 
+## [1.5.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.4.0...v1.5.0) (2026-07-14)
+
+
+### Features
+
+* **thermal:** on-device thermal-thresholds knob for AOSP kernel ([faead6a](https://github.com/junkyard-computing/junkyard-boot-img/commit/faead6a17bd82b69ea26d602c132f4036d3cc058))
+
+
+### Bug Fixes
+
+* **boot:** drop deprecated udev-settle from banner units ([60b81ae](https://github.com/junkyard-computing/junkyard-boot-img/commit/60b81ae97dc87333f0d412a7734e7b2b65038e04))
+
+
+### Documentation
+
+* **claude:** refresh CLAUDE.md — transports, sibling repos, on-device tools ([c8c931a](https://github.com/junkyard-computing/junkyard-boot-img/commit/c8c931a43237f7f08e45695a5096168ba572b3d9))
+
 ## [1.4.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.3.0...v1.4.0) (2026-06-25)
 
 
