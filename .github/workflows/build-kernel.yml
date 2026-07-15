@@ -38,6 +38,23 @@ jobs:
 
     # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
+      # Self-hosted runners persist their workspace and any background
+      # processes across job runs (unlike GitHub-hosted, which starts every
+      # job on a fresh VM). If a previous run was cancelled mid-build, Bazel's
+      # background server process can be left running and holding file locks,
+      # and stale git/repo lock files can block the next sync. Clear all of
+      # that out before doing anything else. GitHub-hosted runners have no
+      # leftover state to clean, so this is skipped there entirely.
+      - name: Clean up leftover state from a previous cancelled run
+        if: runner.environment == 'self-hosted'
+        run: |
+          KERNEL_DIR="$GITHUB_WORKSPACE/kernel/source"
+          if [ -d "$KERNEL_DIR" ]; then
+            (cd "$KERNEL_DIR" && bazel shutdown) || true
+          fi
+          pkill -f bazel || true
+          find "$GITHUB_WORKSPACE" -name "*.lock" -delete || true
+
       # Reclaim space on the root volume. ubuntu-latest ships only ~14 GB free on
       # / but a ~70 GB ephemeral disk at /mnt. The AOSP `repo sync` + Bazel build
       # is tens of GB, and Bazel's output base lives under ~/.cache/bazel (on /),
