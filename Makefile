@@ -378,9 +378,27 @@ all:
 	# until we have a working serial-getty story (tentative attempt with a 200 MHz
 	# fixed-clock stub for clk_uart_baud0 produced an APC-early-watchdog bootloop;
 	# bisect pending).
+	#
+	#   reboot=warm                            REQUIRED for `reboot bootloader` to
+	#                                          reach fastboot. reboot-mode (see the
+	#                                          pmu_alive node in gs201.dtsi) writes
+	#                                          the reason 0xfc to PMU SYSIP_DAT0, but
+	#                                          the PMU_ALIVE block is cleared by a
+	#                                          COLD reset (PSCI SYSTEM_RESET) — the
+	#                                          bootloader then reads "Normal Boot".
+	#                                          reboot=warm makes psci_sys_reset use
+	#                                          SYSTEM_RESET2 (warm), which preserves
+	#                                          SYSIP_DAT0 so the bootloader sees 0xfc
+	#                                          and enters fastboot. The gs101
+	#                                          google,gs101-reboot PMU-SWRESET path
+	#                                          can't be used on gs201: BL31 rejects
+	#                                          an SMC write to SYSTEM_CONFIGURATION
+	#                                          (0x3a00) with -EINVAL. Verified on
+	#                                          .138: warm reset → "[PXL] fastboot
+	#                                          enter reason: reboot bootloader".
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=4 clk_ignore_unused" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=4 clk_ignore_unused reboot=warm" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
