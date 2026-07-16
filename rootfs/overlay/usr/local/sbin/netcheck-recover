@@ -1,0 +1,47 @@
+#!/bin/sh
+# Self-healing A/B network recovery (runs on the shared 'super' rootfs).
+# Wait up to DEADLINE for a real DHCP IP. If up -> mark THIS slot successful.
+# If not -> if the inactive slot is a good fallback, mark THIS slot unbootable
+# and reboot (immediate A/B rollback); else plain reboot (retry, never strand).
+#
+# NOTE: the mainline kernel cmdline has no androidboot.slot_suffix (it's
+# bootconfig-based), so pixel-bootctl can't self-detect the running slot -- we
+# derive it from devinfo (`status`) and pass --slot explicitly. AOSP tolerates
+# --slot too, so this works under both kernels.
+set -u
+DEADLINE=90
+BOOTCTL=/usr/local/bin/pixel-bootctl
+
+cur_slot() {
+    "$BOOTCTL" status 2>/dev/null | awk '
+        tolower($1)=="slot:" {s=tolower($2)}
+        $1=="active:" && $2=="true" {print s; exit}'
+}
+
+i=0
+while [ "$i" -lt "$DEADLINE" ]; do
+    if ip -4 addr show scope global 2>/dev/null | grep -qE 'inet 192\.168\.'; then
+        s=$(cur_slot)
+        "$BOOTCTL" mark-successful ${s:+--slot "$s"} 2>/dev/null || true
+        logger -t netcheck-recover "network up; slot ${s:-?} marked successful"
+        exit 0
+    fi
+    i=$((i+1)); sleep 1
+done
+
+logger -t netcheck-recover "no IP after ${DEADLINE}s; evaluating A/B fallback"
+other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
+    tolower($1)=="slot:" {s=$2}
+    $1=="active:"     {a[s]=$2}
+    $1=="successful:" {ok[s]=$2}
+    $1=="unbootable:" {ub[s]=$2}
+    END { for (x in a) if (a[x]=="false" && ok[x]=="true" && ub[x]=="false") print "yes" }')
+s=$(cur_slot)
+if [ "$other_ok" = "yes" ]; then
+    logger -t netcheck-recover "inactive slot good; marking slot ${s:-?} unbootable + rebooting"
+    "$BOOTCTL" mark-unbootable ${s:+--slot "$s"} 2>/dev/null || true
+else
+    logger -t netcheck-recover "no good fallback; plain reboot to retry"
+fi
+sync
+systemctl reboot -f 2>/dev/null || /sbin/reboot -f

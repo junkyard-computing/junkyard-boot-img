@@ -1,0 +1,13 @@
+[Unit]
+Description=Force Type-C host data-role for dongle enumeration (PD DR-swap)
+After=systemd-udevd.service
+Before=NetworkManager.service network-pre.target
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/typec-host-fix
+
+[Install]
+WantedBy=multi-user.target

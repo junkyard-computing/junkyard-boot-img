@@ -1,0 +1,21 @@
+#!/bin/sh
+# Deterministically bring the felix Type-C port to USB host so a downstream
+# dongle/dock enumerates, on a PD-capable partner. felix's mainline TCPM lands
+# power=sink,data=host (dongle up) only intermittently; on the bad boots it
+# lands sink+DEVICE (charging, no dongle). Since the partner speaks PD, a
+# data-role swap to host works -- do it. Also logs each boot's state so the
+# intermittency is observable.
+LOG=/var/log/typec-host-fix.log
+P=/sys/class/typec/port0
+[ -e "$P/data_role" ] || exit 0
+# wait up to 30s for a partner to attach
+n=0; while [ $n -lt 30 ] && [ ! -e "$P/port0-partner" ]; do n=$((n+1)); sleep 1; done
+pd=$(cat "$P/port0-partner/supports_usb_power_delivery" 2>/dev/null)
+{ echo "=== $(date) ==="; echo "boot state: power=$(cat $P/power_role 2>/dev/null) data=$(cat $P/data_role 2>/dev/null) partner=$([ -e $P/port0-partner ] && echo yes || echo no) pd=$pd"; } >> "$LOG"
+case "$(cat "$P/data_role" 2>/dev/null)" in *'[host]'*) echo "already host; ok" >>"$LOG"; exit 0;; esac
+[ -e "$P/port0-partner" ] || { echo "no partner; cannot swap" >>"$LOG"; exit 0; }
+t=0; while [ $t -lt 6 ]; do
+    t=$((t+1)); echo host > "$P/data_role" 2>>"$LOG"; sleep 1
+    case "$(cat "$P/data_role" 2>/dev/null)" in *'[host]'*) echo "DR-swap -> host succeeded (try $t)" >>"$LOG"; exit 0;; esac
+done
+echo "DR-swap FAILED after $t tries; data=$(cat $P/data_role 2>/dev/null)" >>"$LOG"

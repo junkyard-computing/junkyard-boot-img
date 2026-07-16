@@ -1,0 +1,12 @@
+[Unit]
+Description=Self-healing A/B network recovery (fall back / reboot if no IP in 5 min)
+After=NetworkManager.service network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/netcheck-recover
+TimeoutStartSec=360
+
+[Install]
+WantedBy=multi-user.target
