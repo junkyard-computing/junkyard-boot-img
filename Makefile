@@ -265,6 +265,17 @@ all:
 	$(NSPAWN) -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/usb0-gadget.nmconnection
 	# Apply tracked overlay (usb_gadget, blacklist.conf, custom service, ...).
 	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
+	# usb-gadget: the overlay has shipped the script + unit for a while, but
+	# nothing ever enabled the unit, so the gadget was dead code in every
+	# image. Enable it. This is safe for the dongle path and does NOT pin the
+	# port to device-role: the unit is gated on
+	# ConditionPathExistsGlob=/sys/class/udc/*, and a UDC only exists when the
+	# Type-C port lands device-role (cabled to a PC). With the dongle attached
+	# the port is data=host, there is no UDC, and the unit no-ops -- so
+	# ethernet+charging and gadget+fastboot coexist, selected by what is
+	# plugged in. 99-usb-gadget.rules additionally starts it on UDC hot-plug,
+	# since the cable is moved at runtime rather than only at boot.
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl enable usb-gadget.service
 	# pstore-beacon: surface previous-boot panic dmesg/console/pmsg from
 	# /sys/fs/pstore to /dev/kmsg (UART) and archive to /var/log/pstore.
 	# systemd-pstore.service would otherwise race us for the records, so mask

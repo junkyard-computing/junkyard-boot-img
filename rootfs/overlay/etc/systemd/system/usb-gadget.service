@@ -8,6 +8,12 @@ Description=Configure CDC-NCM + CDC-ACM USB gadget (felix mainline)
 # gadget service starts and writes to kmsg.
 After=getty.target sys-kernel-config.mount
 Requires=sys-kernel-config.mount
+# No-op unless the Type-C port landed device-role and dwc3 exposed a UDC.
+# With the dongle attached the port is data=host, there is no UDC, and this
+# service does not run -- so it cannot disturb the ethernet+charging path.
+# Both modes are required, and this condition is what keeps them disjoint.
+# Also started on UDC hot-plug via 99-usb-gadget.rules, because the cable is
+# moved between dongle and PC at runtime, not just at boot.
 ConditionPathExistsGlob=/sys/class/udc/*
 
 [Service]
