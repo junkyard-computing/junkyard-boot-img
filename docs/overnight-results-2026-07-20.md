@@ -317,3 +317,149 @@ Three candidate fixes, cheapest first:
 working one.** See the risk note at the top: A/B rollback did not save this, because a
 hard hang never resets.
 
+---
+
+## Stage 2 — genpd: code-verified, BLOCKED on hardware
+
+Could not be flashed or measured (device down). What was established without it:
+
+**The safety property holds structurally, not just by convention.** On
+`feature/mainline-genpd-proven11` the domains that must never be gated —
+`hsi0` (USB), `hsi2` (UFS/rootfs), `g3d`, `embedded_g3d`, `aoc`, `eh` — are **not
+declared as `google,gs201-pd` nodes at all**. They aren't merely disabled; there is
+no provider for them, so `genpd_power_off_unused()` cannot reach them even in
+principle. **[MEASURED — grep over the branch's DTS returns nothing]**
+
+16 domain nodes are declared; 5 carry `status = "disabled"`: `dpu` (0x2200),
+`disp` (0x2280), `g2d` (0x2300), `bo` (0x2880), `tpu` (0x2900). The remaining
+**11 are exactly the proven set**: mfc, csis, pdp, dns, g3aa, ipp, itp, mcsc,
+gdc, tnr, aur. Matches the intent. **[MEASURED]**
+
+**Ready to flash as-is once the device is back**, with the thermal-comparison caveat
+above: baseline and test must be taken in the same charge/OTG state.
+
+**One thing Stage 3 changes about Stage 2:** `pd_tpu` is currently disabled because
+gating it crashed edgetpu. We now know edgetpu **was already failing for an
+unrelated reason** (the Trusty race), so the old "gating pd_tpu crash-loops
+edgetpu" conclusion was drawn against a driver that never worked. It should be
+re-tested on top of the edgetpu fix before `pd_tpu` is written off — the TPU zone
+is the single biggest thermal contributor (~6 °C). **[INFERRED]**
+
+---
+
+## Stage 4 — GPU performance: the brief's premise is out of date
+
+No benchmarking possible (device down), but the desk work materially changes the plan.
+
+**The brief names "the clpeak register-light 548-vs-730 gap" as the next lever.
+`docs/gpu-perf-investigation.md` already answers it, and the answer is that the
+gap is largely a benchmark artifact.** With hand-tuned ILP, panfrost reaches
+**637 GFLOPS = 87 % of the closed compiler's 730** on the same silicon at the same
+clock. clpeak's 548 simply **under-provisions ILP for Valhall**; it is not
+measuring a 25 % compiler deficit. The real residual is **~13–20 %**. **[MEASURED,
+previously]**
+
+**And the one remaining lever is now dead.** That doc lists register-pressure-aware
+unrolling as "the only non-dead lever, not yet tractable". It has since been
+implemented and falsified: it fires correctly but yields **zero speedup**, because
+the rolled form is already FMA-saturated. So every identified lever is now closed:
+
+| lever | verdict |
+|---|---|
+| MIF interconnect coupling | **shipped** |
+| `PAN_PRESSURE_UNROLL` | **shipped** (~2× prefill on `[[unroll]]` shaders) |
+| gpu_id normalization | **shipped** (without it the open stack doesn't run at all) |
+| spiller remat | **shipped** (+1.6 % prefill, token-identical) |
+| `PAN_HOIST_LOADS` | dead — throughput-bound, not latency-bound |
+| raise unroll limit 32→128 | dead — net loss (prefill −64 %) |
+| pressure-aware unrolling | **dead — premise falsified, zero speedup** |
+
+**Honest conclusion for discussion: the open-vs-closed GPU gap is at a
+hardware-bounded wall, not a to-do item.** Everything traces to the **64-register
+file**: it caps FMA ILP (spill at ~33 accumulators), forces the llama GEMM tile
+(128 accumulators) to spill, and makes unroll policy zero-sum. Closing the last
+13–20 % means matching the closed compiler's spill/schedule co-design without
+access to it — that is a compiler-research programme, not a tuning task.
+
+**Recommendation: stop treating the residual as a bug to fix.** The defensible
+framing is "open stack reaches 87 % of proprietary peak and is token-identical on
+llama", which is a result worth presenting rather than a gap worth chasing. If GPU
+effort continues, the higher-yield direction is PanVK/Vulkan breadth (the
+prefill-at-scale hang, issue #30) rather than more FMA tuning. **[INFERRED from
+the measured lever table]**
+
+---
+
+# Summary for the PI discussion
+
+## The one-line version
+The headline result is **not** fbcon — it's that **the Edge TPU has never actually
+booted on this platform**, for a reason that is now root-caused to an ~80 ms
+probe-order race and has a written fix. The fbcon detour failed and cost the device
+a power-cycle.
+
+## Per stage
+
+| stage | outcome | evidence |
+|---|---|---|
+| 1. fbcon | **Failed.** Root-caused twice over, patch written, flashed, hard-hangs at t=0.289 s. Device needs fastboot recovery. | UART divergence vs a known-good boot in the same log |
+| 2. genpd | **Blocked on hardware.** Branch code-verified: unsafe domains aren't declarable; the 11 gated are the proven set. | grep over branch DTS |
+| 3. TPU/GPU power | **★ Root-caused + fixed (unvalidated).** TPU never came up; 3-part fix committed and pushed. | boot timestamps; rmmod/modprobe control |
+| 4. GPU perf | **Premise out of date.** The named lever is a benchmark artifact; every identified lever is now closed. | existing measurements re-read |
+
+## Three findings worth presenting
+
+1. **The TPU was never working, and "the device node exists" was never evidence.**
+   `/dev/accel/accel0` registers whether or not firmware bring-up succeeds. Every
+   previous "TPU is live" claim rested on that node plus a loaded module. The actual
+   bring-up fails on every cold boot because edgetpu probes ~80 ms before
+   `trusty_ipc` comes online. A contributing cause is a **diagnostic** bug: GSA
+   flattened `-ENOENT`, `-ENODEV`, `-ETIMEDOUT` and connect failures all into
+   `-EIO`, so the race was indistinguishable from a hardware fault. Fixing the error
+   propagation is what made it findable.
+
+2. **A/B rollback does not protect against a hard early-init hang.** Slot B was
+   deliberately flashed *active-but-not-successful* so a slot that never reaches
+   userspace would fall back to AOSP. That assumes the device **resets** so the
+   bootloader can decrement the retry counter. This hang deadlocks with
+   `console_lock` held — no panic, no watchdog, no output, no reset — so the counter
+   never moves and the protection never engages. **Display-path changes need a
+   different safety net than boot-chain changes.**
+
+3. **The open GPU stack is at a hardware wall, not a backlog item.** Panfrost reaches
+   87 % of the proprietary compiler's FMA peak on identical silicon; the widely-quoted
+   "548 vs 730" understates it because clpeak under-provisions ILP for Valhall. Every
+   lever with a plausible mechanism has now been tested and closed, the last one
+   (pressure-aware unrolling) falsified outright. The remaining 13–20 % traces to the
+   64-register file. This is a result to present, not a gap to chase.
+
+## Method notes (things that cost real time)
+- **Verify artifacts, not exit codes.** `make …; echo "EXIT=$?"` reported success for
+  a build that failed to link; caught only because `Image.lz4` kept its old timestamp.
+- **"Config didn't take" often means the symbol has no prompt.** Two separate
+  Kconfig lines in this repo have now been silently overridden this way.
+- **Hold the power state constant when comparing thermals.** The recorded baseline was
+  taken while charging; the device now idles ~3–4 °C hotter purely because it sources
+  VBUS for the dongle. That alone is the size of the effect genpd is meant to produce.
+- **Diff a failing boot against a good boot in the same log.** Pinned the fbcon hang to
+  a 78 ms window in one step; no bisect needed.
+
+## What I'd do next, in order
+1. **Recover the device** (`/home/chris/felix-recovery/RECOVER.sh`, ~30 s).
+2. **Validate the edgetpu fix** — highest value, and the change can't affect networking
+   or the display, so it's low-risk to flash. If it works, the TPU boots for the first
+   time.
+3. **Re-test `pd_tpu` gating on top of it** — the old "it crashes edgetpu" verdict was
+   measured against a driver that never worked, and the TPU zone is the biggest single
+   thermal contributor.
+4. **Then genpd proven-11**, with a same-power-state thermal baseline.
+5. **fbcon only if it's actually wanted** — try
+   `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y` first, and validate on a slot
+   that isn't the only working one. kmscon works today; this is a cosmetic win with a
+   demonstrated ability to brick.
+
+## Commits (all pushed)
+- kernel `feature/mainline-edgetpu-probe-race` @ `11d2bb0e` — the TPU fix.
+- kernel `feature/mainline-fbcon-KNOWN-BAD` @ `9ba00eea` — quarantined; **do not flash**.
+- boot-img `859a672` — removes the inert Kconfig line, adds this document.
+- Deployed branch `feature/mainline-otg-ss` @ `4c234bd` untouched; held WIP untouched.
