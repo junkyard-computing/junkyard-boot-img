@@ -373,17 +373,32 @@ all:
 	#   firmware_class.path=/vendor/firmware   replaces the stock felix dtb's
 	#                                          /chosen/bootargs entry; without it
 	#                                          AOC retry-loops and starves UART RX.
-	#   rd.udev.children-max=1                 (h14) Serialize udev workers in
-	#                                          dracut/initrd. Workaround for the
-	#                                          (h6) PWM SBFES wedge: when udev's
-	#                                          coldplug burst fires 4 parallel
-	#                                          scsi_id INQUIRYs + 2x 64KB READ_10
-	#                                          back-to-back, the controller's bus
-	#                                          state breaks. Serializing should
-	#                                          let each command drain before the
-	#                                          next is queued. Remove once HS-Rate-B
-	#                                          works (controller can handle the
-	#                                          parallel storm at HS speed).
+	#   rd.udev.children-max=1                 REMOVED 2026-07-19 -- it was the
+	#                                          cause of the long-standing "random
+	#                                          boot hang". Originally a workaround
+	#                                          for the (h6) PWM SBFES wedge
+	#                                          (parallel scsi_id INQUIRYs breaking
+	#                                          the controller's bus state), to be
+	#                                          dropped "once HS-Rate-B works".
+	#                                          Measured on felix (UART capture):
+	#                                          our module tree emits ~9,700 udev
+	#                                          coldplug events per boot. A full
+	#                                          coldplug takes 22.9s parallel but
+	#                                          >175s serialized to one worker --
+	#                                          past dracut-initqueue's 120s
+	#                                          `udevadm settle` timeout. Every boot
+	#                                          that lost the race stalled ~120s
+	#                                          ("Timed out while waiting for udev
+	#                                          queue to empty"), and the near-miss
+	#                                          against that boundary is exactly why
+	#                                          it looked intermittent and
+	#                                          config-independent. Removing it:
+	#                                          initrd 2m14s -> ~4.6s, total startup
+	#                                          ~10s, 0 settle timeouts, 0 UFS errors
+	#                                          across repeated reboots (UFS runs HS
+	#                                          gear 4, so the original wedge premise
+	#                                          no longer holds). Do NOT re-add
+	#                                          without re-measuring both numbers.
 	#
 	# No console=ttySAC0,115200 — samsung_tty stays disabled in gs201-felix.dts
 	# until we have a working serial-getty story (tentative attempt with a 200 MHz
@@ -409,7 +424,7 @@ all:
 	#                                          enter reason: reboot bootloader".
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=protected rd.udev.children-max=1 loglevel=4 clk_ignore_unused reboot=warm" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=protected loglevel=4 clk_ignore_unused reboot=warm" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
