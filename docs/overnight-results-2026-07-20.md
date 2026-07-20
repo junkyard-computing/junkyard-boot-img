@@ -1,8 +1,20 @@
-# ⛔ READ FIRST — THE PHONE NEEDS A POWER CYCLE (my fault, sorry)
+# ✅ UPDATE (morning 2026-07-20) — RECOVERED + edgetpu fix VALIDATED
 
-**State: felix is hard-hung in early kernel init and cannot be recovered without hands.**
+The device was recovered (fastboot-flashed `boot_b` with the known-good kernel; back on SSH
+in ~16s) and now runs the **validated** edgetpu fix on slot B, marked successful.
+**Headline: the Edge TPU firmware reached RUNNING + KCI FW_INFO for the first time on
+mainline** — before/after numbers in "Stage 3 — VALIDATION UPDATE" at the bottom. The fbcon
+hang mechanism was also corrected: it is NOT the "TE-forever" wait first claimed — see
+"fbcon — CORRECTED mechanism" at the bottom. The banner below is the original incident
+report, kept for the record.
+
+---
+
+# ⛔ ORIGINAL INCIDENT REPORT — the phone hard-hung (since recovered)
+
+**State at the time: felix hard-hung in early kernel init, unrecoverable without hands.**
 It stopped responding at **00:06 on 2026-07-20**. Not pingable, no SSH, no UART console
-(the link is fine — `uartd` still reports `connected=true` — the *device* is wedged).
+(the link was fine — `uartd` still reported `connected=true` — the *device* was wedged).
 
 **What I did:** flashed a kernel to slot B with an fbcon change. It hangs at kernel
 **t=0.289 s**, immediately after
@@ -463,3 +475,73 @@ a power-cycle.
 - kernel `feature/mainline-fbcon-KNOWN-BAD` @ `9ba00eea` — quarantined; **do not flash**.
 - boot-img `859a672` — removes the inert Kconfig line, adds this document.
 - Deployed branch `feature/mainline-otg-ss` @ `4c234bd` untouched; held WIP untouched.
+---
+
+# Stage 3 — VALIDATION UPDATE (morning 2026-07-20, device recovered)
+
+The edgetpu fix is **validated on hardware**. The TPU firmware runs on mainline for the
+first time. All **[MEASURED]** from `.138` dmesg.
+
+## Recovery first
+Fastboot-flashed `boot_b` with `/home/chris/felix-recovery/boot-known-good.img` (the exact
+pre-experiment kernel). Back on SSH in ~16s, 10.2s boot, `running` (not degraded). Battery
+in fastboot read **3826 mV / soc-ok** — the 8-hour wedge deep-drained it but did no damage.
+
+## The fix needed a second iteration — validation caught it
+- **v1** returned `EPROBE_DEFER` from `firmware_bringup()`. Flashed → **no retry happened**.
+  `probe()` swallows bring-up errors (logs, registers the accel node, returns `Ok`), so the
+  core never saw a defer. Only `EPROBE_DEFER` from `probe()` *itself* triggers a re-probe.
+  This is the same "accel node registers regardless" property that hid the original bug —
+  it also hid the fix's failure until it was measured.
+- **v2** (shipped) gates on GSA/Trusty reachability as the **first statement of `probe()`**,
+  before any resource. Placement is load-bearing: `Clk::prepare_enable()` takes no guard and
+  `Clk`'s Drop only `clk_put`s (not `clk_disable_unprepare`, rust/kernel/clk.rs:254), so
+  deferring after the clock is enabled would leak an enable-ref per retry.
+
+## Before → after (measured)
+| | dmesg |
+|---|---|
+| **before** (known-good kernel) | `[8.0517] GSA GET_STATE failed: EIO → bring-up failed: EIO` / `[8.0645] trusty_ipc is online` (13 ms too late) |
+| **after** (`4bcd83d`) | `[7.8535] deferring probe` → `[7.8555] trusty_ipc online` → `[7.8569] gsa hwmgr.tpu connected` → `[7.8689] TPU firmware RUNNING (state 2)` → `[7.9245] KCI FW_INFO ok fw_flavor=3` → `M2 bring-up complete` |
+
+`/dev/accel/accel0` live; the qos `already added request` WARN count is **0** (idempotency
+fix confirmed); slot B **marked successful**. Kernel branch
+`feature/mainline-edgetpu-probe-race` @ `4bcd83d`, pushed.
+
+## One unrelated pre-existing WARN found (not mine)
+At **t=0.37s**, before edgetpu loads: `WARNING qos.c:415 __dev_pm_qos_update_request`, trace
+`exynos_generic_icc_set → icc_node_add → exynos_generic_icc_probe → exynos_bus_probe`. The
+Exynos interconnect provider updates a dev_pm_qos request that isn't active yet. Harmless so
+far, worth a separate fix. **[MEASURED]**
+
+---
+
+# fbcon — CORRECTED mechanism (earlier "TE-forever" was WRONG)
+
+The Stage-1 write-up above says the commit "waits on a frame-done/TE with no timeout." **That
+is disproven by the code.** Every wait in the felix DPU driver is timeout-bounded (fences
+250ms, deps 10s, flip-done frame+100ms/10s, framedone `wait_event_timeout`); a `grep` for
+untimed waits across decon/crtc/dsim returns nothing. A bounded wait times out and *prints* —
+it cannot cause 8 hours of silence.
+
+Actual mechanism (from a full static trace):
+1. `drm_client_register()` runs the fbdev hotplug **synchronously, inline** (drm_client.c:143).
+2. The initial modeset commits from inside `fbcon_init` → `fb_set_par`, **holding
+   `console_lock`** (fbcon.c:3002); felix runs `commit_tail` **inline in that thread**.
+3. Because the bootloader left the panel on, DECON is in **`DECON_STATE_HANDOVER`**, so
+   `decon_enable` runs `_decon_reinit_locked()` + `_decon_enable_locked()` **under
+   `spin_lock_irqsave(&decon->slock)` — IRQs disabled** (decon.c:1655-1665).
+
+So a forced modeset re-inits the display controller from the bootloader handover state at
+t=0.289s, with **both IRQs disabled and `console_lock` held**. The wedge is inside that
+register sequence (the `cal_9845/9855` CAL layer) — a bus-stuck SFR or a busy-poll — and the
+context makes it fatal+silent: IRQs off → watchdog IRQ can't fire (and isn't armed that early)
+→ **no reset/rollback**; console_lock held → **no printk escapes**; a stuck bus/poll, not a
+timed wait → **no timeout saves it**. kmscon survives because it modesets from userspace
+seconds later, after boot settles — same code, very different surrounding state.
+
+**Not fully pinned (needs device):** the exact CAL-layer instruction and what about t=0.289s
+differs from kmscon's later modeset. Decide with earlycon writes bisecting the reinit — **not**
+netconsole (IRQs are off). Fix direction: never trigger a DECON re-init from IRQ-disabled early
+probe; `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y` achieves that incidentally and is the
+cheapest thing to try — on a slot that isn't the only working one.
