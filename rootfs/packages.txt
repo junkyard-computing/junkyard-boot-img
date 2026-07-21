@@ -25,3 +25,4 @@ clinfo
 libclc-19
 libclang-cpp19
 libllvmspirvlib19.1
+firmware-realtek
