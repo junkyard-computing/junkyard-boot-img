@@ -545,3 +545,50 @@ differs from kmscon's later modeset. Decide with earlycon writes bisecting the r
 netconsole (IRQs are off). Fix direction: never trigger a DECON re-init from IRQ-disabled early
 probe; `CONFIG_FRAMEBUFFER_CONSOLE_DEFERRED_TAKEOVER=y` achieves that incidentally and is the
 cheapest thing to try — on a slot that isn't the only working one.
+---
+
+# Session 2 (evening 2026-07-20) — fbcon end-to-end, UVLO root-caused, kmscon shipped
+
+## fbcon on the outer panel: SOLVED (then deliberately shelved for kmscon)
+Got the outer cover panel to render the login via fbcon. Four fixes, all required:
+1. **Defer `drm_client_setup`** off a workqueue (`fbcon_delay_ms`, ~6s) — synchronous at
+   probe hard-hangs at t=0.289s. **[MEASURED]**
+2. **`cma=128M`** — the 9 MB contiguous scanout buffer won't allocate against stock 32 MB
+   CMA. **[MEASURED]**
+3. **Retire kmscon + `getty@tty1`** — kmscon held card0 master; fbcon's fb0 wasn't shown
+   until kmscon was masked. **[MEASURED]**
+4. **`.dirty = drm_atomic_helper_dirtyfb`** — the non-obvious one. The panel is DSI
+   command-mode; the DECON only transfers a frame on a commit. Without `.dirty`, fbcon
+   writes never commit → `frame_done_count` frozen at 8, panel black. With it: frame_done
+   170→186 on a write, login renders. **[MEASURED]** Commit `95fb228`.
+
+**Why we shipped kmscon anyway:** fbcon-as-login == kmscon functionally. The only upside
+(kernel boot-tail + shutdown on the panel) is capped — fbcon can't attach until ~8.7s so
+early boot is never on-panel, and `console=tty0` is stripped by the bootloader (arm64 has
+no `CMDLINE_EXTEND`; forcing it needs an `add_preferred_console` patch that would move
+`/dev/console` off UART). For a device that has UART, not worth it. **Reverted to kmscon
+(AOSP-consistent); device left on known-good `…00095`, stable.** All fbcon work committed.
+
+## The reboot loop: root-caused to the TPU clock, NOT power budget
+A skeptical "is it really power?" was correct. **[MEASURED]**:
+- fbcon-only kernel (TPU dark) boots stable; draws **0.68A** vs known-good **0.67A** —
+  display adds ~0.01A. Battery **4.10V**, not sourcing OTG. So display/power-budget is
+  refuted.
+- The loop is `0xcfcd UVLO (IF-PMIC)` at **~12.2s, right after `TPU firmware RUNNING`**.
+  The edgetpu fix pins the TPU at **NOM/1066 MHz** the instant firmware starts
+  (`driver.rs:103`) → a current step that trips the IF-PMIC UVLO.
+
+Second, independent UVLO (**fixed**): warm reboot didn't tear down the max77759 OTG boost
+before PSCI reset → UVLO loop until cold power-off. Added charger `.shutdown` → MODE_OFF
+(`dd2f99b`).
+
+## Chase-TPU (next session) — well-scoped
+Bring the TPU up at a **low DVFS state (UUD/226 or SUD/627 MHz)** at firmware start and
+ramp to NOM only on actual inference. That removes the current step that trips UVLO, so the
+TPU and fbcon can coexist on battery. Also re-check current-step vs rail/S2MPU transient
+(measure `maxfg` current before/after). Then edgetpu + fbcon can ship together.
+
+## Branches (all pushed, kernel repo)
+- `feature/mainline-edgetpu-probe-race` @ `4bcd83d` — TPU boots (validated).
+- `feature/mainline-fbcon-deferred` @ `dd2f99b` — fbcon chain + edgetpu + max77759 .shutdown.
+- `feature/mainline-fbcon-only` @ `dab10e99` — fbcon on SS base, no TPU (the validated fbcon config).
