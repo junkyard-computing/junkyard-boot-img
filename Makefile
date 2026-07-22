@@ -113,6 +113,35 @@ all:
 		$(KERNEL_SOURCE_DIR)/scripts/kconfig/merge_config.sh -m -O $(KERNEL_BUILD_DIR) \
 		$(KERNEL_BUILD_DIR)/.config $(CURDIR)/kernel/custom_defconfig_mod/felix.config
 	$(KMAKE) olddefconfig
+	# Assert the fragment actually took. merge_config warns about overridden
+	# symbols, but olddefconfig will silently DROP any option whose
+	# dependencies the toolchain can't satisfy, and the build then succeeds
+	# without the feature. That is how a dockershell build shipped a kernel
+	# with no Edge TPU: the image had cargo (for the musl cross-builds) but not
+	# the kernel-Rust prerequisites, so RUST_IS_AVAILABLE failed,
+	# CONFIG_RUSTC_VERSION came out 0, CONFIG_RUST=y was discarded, and
+	# CONFIG_DRM_ACCEL_EDGETPU=m went with it. It booted fine and looked fine.
+	# A requested =m may legitimately come back =y (something selected it);
+	# anything weaker than requested is a silent feature loss, so fail.
+	@echo "Verifying the felix config fragment survived olddefconfig"
+	@miss=0; \
+	while IFS= read -r line; do \
+		case "$$line" in CONFIG_*=y|CONFIG_*=m) ;; *) continue ;; esac; \
+		sym=$${line%%=*}; want=$${line##*=}; \
+		got=$$(grep -m1 "^$$sym=" $(KERNEL_BUILD_DIR)/.config 2>/dev/null | cut -d= -f2); \
+		[ -z "$$got" ] && got="(unset)"; \
+		if [ "$$want" = y ] && [ "$$got" != y ]; then \
+			echo "  $$sym: requested =y, got $$got"; miss=$$((miss+1)); \
+		elif [ "$$want" = m ] && [ "$$got" != m ] && [ "$$got" != y ]; then \
+			echo "  $$sym: requested =m, got $$got"; miss=$$((miss+1)); \
+		fi; \
+	done < $(CURDIR)/kernel/custom_defconfig_mod/felix.config; \
+	if [ "$$miss" -ne 0 ]; then \
+		echo "ERROR: $$miss option(s) from felix.config did not survive olddefconfig."; \
+		echo "       The build would silently omit those features. Check the toolchain"; \
+		echo "       (e.g. CONFIG_RUSTC_VERSION=0 means kernel Rust is unavailable)."; \
+		exit 1; \
+	fi
 	# DTC_FLAGS=-@ makes dtc emit the __symbols__ node into the compiled dtbs.
 	# Without it, the felix bootloader refuses to boot because its factory
 	# dtbo partition's phandle fixups can't resolve against a symbol-less dtb
