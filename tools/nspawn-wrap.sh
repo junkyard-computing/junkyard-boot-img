@@ -116,11 +116,24 @@ if [ -f /.dockerenv ]; then
     #
     # Strip the nspawn-only options the Makefile passes ("--resolv-conf=... -D
     # <dir>") to recover the bare command to chroot-exec.
+    #
+    # --bind=/--bind-ro= are NOT strippable: they are the only way a caller gets
+    # its inputs into the new root (the mesa stage binds its work dir to /mesa
+    # and its build script to /build-mesa.sh, then runs `bash /build-mesa.sh`).
+    # Dropping them leaves the command with nothing to run. Leaving --bind= out
+    # of the case list entirely is worse: it falls through to `*) break` and
+    # chroot tries to exec the mount spec as the command —
+    #   chroot: failed to run command '--bind=/…/build/mesa:/mesa'
+    # which is what blocked .build_mesa. So collect them and perform them as
+    # real mounts below.
+    chroot_binds=""
     while [ "$#" -gt 0 ]; do
         case "$1" in
             -D) shift 2 ;;
             --directory=*) shift ;;
-            --resolv-conf=*|--setenv=*|--bind-ro=*|--register=*|--keep-unit) shift ;;
+            --bind=*)    chroot_binds="$chroot_binds rw:${1#--bind=}" ; shift ;;
+            --bind-ro=*) chroot_binds="$chroot_binds ro:${1#--bind-ro=}" ; shift ;;
+            --resolv-conf=*|--setenv=*|--register=*|--keep-unit) shift ;;
             *) break ;;
         esac
     done
@@ -148,7 +161,31 @@ if [ -f /.dockerenv ]; then
             > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
     fi
 
+    # Apply the --bind/--bind-ro requests collected above. nspawn creates the
+    # destination for you; chroot does not, so make it first — a file source
+    # needs a file target, a directory needs a directory.
+    chroot_bind_targets=""
+    for spec in $chroot_binds; do
+        mode="${spec%%:*}"; pair="${spec#*:}"
+        src="${pair%%:*}"; dst="${pair#*:}"
+        [ "$dst" = "$src" ] && dst="$src"          # nspawn allows a bare path meaning src==dst
+        target="$sysroot$dst"
+        if [ -d "$src" ]; then
+            mkdir -p "$target"
+        else
+            mkdir -p "$(dirname "$target")"
+            [ -e "$target" ] || : > "$target"
+        fi
+        mount -o bind "$src" "$target"
+        [ "$mode" = "ro" ] && mount -o remount,bind,ro "$target" 2>/dev/null || true
+        # unmount in reverse order (deepest first) during cleanup
+        chroot_bind_targets="$target $chroot_bind_targets"
+    done
+
     chroot_cleanup() {
+        for t in $chroot_bind_targets; do
+            umount -lR "$t" 2>/dev/null || true
+        done
         umount -lR "$sysroot/proc" "$sysroot/sys" "$sysroot/dev" 2>/dev/null || true
     }
     trap chroot_cleanup EXIT INT TERM
