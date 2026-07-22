@@ -105,7 +105,59 @@ nspawn_compat="--register=no --keep-unit"
 # binfmt qemu wrapper resolves), so its presence no longer distinguishes the
 # two environments.
 if [ -f /.dockerenv ]; then
-    exec systemd-nspawn $nspawn_compat $extra_binds --setenv="PATH=$container_path" "$@"
+    # systemd-nspawn (systemd 257 in the debian-trixie build image) fails to
+    # spawn inside this docker container — it exits 255 even for `-D sysroot
+    # true`, with no useful diagnostic — so nspawn is unusable here. Fall back to
+    # chroot + binfmt-qemu: the dockershell host registers the aarch64 binfmt
+    # with the F (fix-binary) flag, which preloads the qemu interpreter fd at
+    # registration, so aarch64 binaries run under chroot without the /nix/store
+    # interpreter path being visible in the new root. (On a real host we still
+    # use nspawn below — it works there.)
+    #
+    # Strip the nspawn-only options the Makefile passes ("--resolv-conf=... -D
+    # <dir>") to recover the bare command to chroot-exec.
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            -D) shift 2 ;;
+            --directory=*) shift ;;
+            --resolv-conf=*|--setenv=*|--bind-ro=*|--register=*|--keep-unit) shift ;;
+            *) break ;;
+        esac
+    done
+
+    # /dev was wiped+recreated empty above; bind the container's real /dev, and
+    # mount fresh proc/sys so the aarch64 tools (depmod, dracut) have a working
+    # environment. resolv.conf best-effort mirrors --resolv-conf=bind-host.
+    mount -t proc  proc  "$sysroot/proc" 2>/dev/null || true
+    mount -t sysfs sysfs "$sysroot/sys"  2>/dev/null || true
+    mount -o bind  /dev   "$sysroot/dev"
+    cp -f /etc/resolv.conf "$sysroot/etc/resolv.conf" 2>/dev/null || true
+
+    # binfmt_misc is often left UNMOUNTED in the build container (so no aarch64
+    # handler is active and every aarch64 exec — even /bin/true — returns 255),
+    # and any handler inherited from the NixOS host points at a /nix-pathed qemu
+    # wrapper that can't resolve here. Mount binfmt_misc and register the
+    # container's own qemu-aarch64-static with the F (fix-binary) flag, which
+    # preloads the interpreter fd so it runs under chroot without the qemu path
+    # being visible in the new root.
+    mountpoint -q /proc/sys/fs/binfmt_misc 2>/dev/null || \
+        mount -t binfmt_misc none /proc/sys/fs/binfmt_misc 2>/dev/null || true
+    if [ ! -e /proc/sys/fs/binfmt_misc/jbqemu-aarch64 ] && \
+       command -v qemu-aarch64-static >/dev/null 2>&1; then
+        printf ':jbqemu-aarch64:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7\x00:\xff\xff\xff\xff\xff\xff\xff\x00\xff\xff\xff\xff\xff\xff\xff\xff\xfe\xff\xff\xff:/usr/bin/qemu-aarch64-static:F' \
+            > /proc/sys/fs/binfmt_misc/register 2>/dev/null || true
+    fi
+
+    chroot_cleanup() {
+        umount -lR "$sysroot/proc" "$sysroot/sys" "$sysroot/dev" 2>/dev/null || true
+    }
+    trap chroot_cleanup EXIT INT TERM
+
+    PATH="$container_path" chroot "$sysroot" "$@"
+    rc=$?
+    chroot_cleanup
+    trap - EXIT INT TERM
+    exit "$rc"
 else
     exec unshare -m --propagation private \
         systemd-nspawn $nspawn_compat $extra_binds --setenv="PATH=$container_path" "$@"
