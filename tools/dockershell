@@ -13,6 +13,34 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 IMAGE="${JUNKYARD_IMAGE:-junkyard-build}"
 DOCKERFILE="$REPO_ROOT/tools/Dockerfile"
 
+# Mount the repo at its REAL path, not /work, and drag in the owning gitdir when
+# this is a worktree checkout.
+#
+# A worktree keeps its git state outside the tree, reached by a chain that mixes
+# absolute and relative paths in both directions:
+#
+#   .git                     -> gitdir: /abs/…/<owner>/.git/worktrees/<name>
+#   kernel/source/.git       -> gitdir: ../../../<owner>/.git/worktrees/…       (escapes the repo)
+#   …/worktrees/…/source     -> ../../../../../../../<repo>/kernel/source        (points back)
+#
+# No single mount point satisfies all three, and mounting at /work satisfies
+# none — so git fails inside the container. That broke `clone_kernel_source`
+# outright (exit 128) and, far more quietly, made scripts/setlocalversion fall
+# back to the bare tag: kernel_version came out `7.2.0-rc4` instead of
+# `7.2.0-rc4-00112-gc39947346ac6`. A kernel whose uname -r cannot identify the
+# build is a debugging trap, so keep the host layout intact here.
+mount_args=(-v "$REPO_ROOT:$REPO_ROOT")
+if [ -f "$REPO_ROOT/.git" ]; then
+  _gitdir="$(sed -n 's/^gitdir: //p' "$REPO_ROOT/.git")"
+  case "$_gitdir" in
+    /*) _owner="${_gitdir%%/.git/*}" ;;                      # absolute -> owning repo root
+    *)  _owner="$(cd "$REPO_ROOT/${_gitdir%%/.git/*}" && pwd)" ;;
+  esac
+  if [ -n "${_owner:-}" ] && [ -d "$_owner" ] && [ "$_owner" != "$REPO_ROOT" ]; then
+    mount_args+=(-v "$_owner:$_owner")
+  fi
+fi
+
 if [ "${1:-}" = "setup" ]; then
   echo "Registering aarch64 binfmt on the host kernel (one-time)..." >&2
   exec docker run --privileged --rm tonistiigi/binfmt --install arm64
@@ -57,8 +85,8 @@ exec docker run --rm \
   "${tty_args[@]}" \
   --privileged \
   --cgroupns=host \
-  -v "$REPO_ROOT:/work" \
-  -w /work \
+  "${mount_args[@]}" \
+  -w "$REPO_ROOT" \
   ${device_args[@]+"${device_args[@]}"} \
   --entrypoint /usr/bin/env \
   "$IMAGE" \
