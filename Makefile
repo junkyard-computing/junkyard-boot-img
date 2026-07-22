@@ -121,6 +121,25 @@ all:
 	lz4 -f -9 $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4
 	@echo "Updating kernel version string"
 	cat $(KERNEL_BUILD_DIR)/include/config/kernel.release > kernel/kernel_version
+	# A kernel built from a git checkout must carry -g<sha> in its version.
+	# When setlocalversion cannot reach git -- e.g. this is a git *worktree* and
+	# the owning gitdir isn't visible, as happened inside the build container --
+	# it silently degrades to a bare "7.2.0-rcN". The build still succeeds, which
+	# is the hazard: every such build then installs modules to the SAME
+	# /lib/modules/<ver> and boots to an unidentifiable `uname -r`, so a module
+	# vermagic mismatch on-device becomes very hard to diagnose (and a stale .ko
+	# from a previous build can silently survive an install). Fail loudly here
+	# rather than ship an unidentifiable kernel.
+	@if git -C $(KERNEL_SOURCE_DIR) rev-parse --git-dir >/dev/null 2>&1; then \
+		v=$$(cat kernel/kernel_version); \
+		case "$$v" in \
+		*-g[0-9a-f]*) ;; \
+		*) echo "ERROR: kernel version '$$v' carries no -g<sha>, but $(KERNEL_SOURCE_DIR)"; \
+		   echo "       is a git checkout -- setlocalversion could not reach git."; \
+		   echo "       Refusing to build unidentifiable modules; check the gitdir is visible."; \
+		   exit 1;; \
+		esac; \
+	fi
 	touch $@
 
 .sync_vendor_firmware:
