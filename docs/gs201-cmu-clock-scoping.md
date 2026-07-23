@@ -192,7 +192,30 @@ Correcting the offset makes it readable → un-skip it.
 - **Risk:** bad gate/clock breaks UFS → rootfs unbootable → rollback. Med-high.
   **Payoff:** up to +125 mW.
 
-### Phase 2 — CMU_DISP → INT (+99 mW)
+### Phase 2 — CMU_DISP → INT  ❌ DPU-clock lever FALSIFIED (kernel 62d5e943b273)
+- **RESULT: VDD_INT +99 mW is NOT the DPU clock frequency.** Corrected the cmu_top
+  DPU distribution offsets (gs201 renames DISP_BUS→DPU_NOC: mux 0x1054, div 0x1850;
+  gs101's 0x1050/0x1848 read garbage on gs201). `dout_cmu_disp_bus` then decoded
+  **399.36 MHz** on mainline vs AOSP's **134 MHz** idle (DEVFREQ_DISP min; AOSP
+  scales 134↔664, mainline never scales — no devfreq_disp) — a promising 3× gap.
+- Causation test (volatile devmem poke of the div reg 0x1e081850, /1→/3): DPU_NOC
+  dropped 399→133 MHz (confirmed in clk_summary), system stayed up — **VDD_INT
+  (s2mpg12 buck5m / S5M_VDD_INT) stayed ~116 mW, unchanged** (before==after; AOSP
+  ~17 mW). If the +99 mW were DPU dynamic clock power, a 3× freq cut would drop it
+  ~3×. It didn't → the rail is not DPU clock-frequency dynamic power. Same pattern
+  as UFS 1b-ii: the CMU-clock hypothesis fails under direct test.
+- ⚠️ Reading cmu_dpu regs (0x1c200600) to confirm propagation **wedged the device**
+  (watchdog reset, ~10s, full recovery — the poke was volatile). CMU_DPU is not
+  safely accessible without proper bring-up, and its gates have no CLK_IS_CRITICAL,
+  so instantiating cmu_dpu would let clk_disable_unused kill the live display. The
+  one safe angle (frequency) is negative; the gating angle is behind the pd_dpu
+  wedge. **INT +99 mW is likely static/leakage from a powered block AOSP power-gates
+  — not a clock lever.** Parked.
+- KEPT: the DPU_NOC offset fix (cmu_top now decodes the real DPU rate — a
+  correctness win independent of the failed power result).
+
+<!-- superseded plan below -->
+### Phase 2 (original plan) — CMU_DISP → INT (+99 mW)
 - gs201 variant of `dpu_cmu_info` (mux+div+gate) from cmucal CMU_DISP @0x1c200000.
 - Add `cmu_disp` DT node; wire DECON/DSIM (`1c240000.drmdecon`) real clocks
   (currently the DECON node has no `clocks` at all).
