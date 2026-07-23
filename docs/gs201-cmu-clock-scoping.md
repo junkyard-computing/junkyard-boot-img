@@ -97,11 +97,38 @@ cmucal-sfr.c:
   computes shared0/4 = 532.992 MHz) but its DIV register aborts — so re-add it as
   a **fixed-factor** clock (shared0 ÷ 4), not a register divider.
 
-### Phase 1 — CMU_HSI2 → UFS (+125 mW)  [prereq: correct cmu_top rates above]
-First fix the cmu_top rates (gs201 PLL +0x40 / MUX −0x4 variants of top_pll_clks
-& top_mux_clks; fixed-factor shared0_div4). Validate every rate against the stub
-back-computations / AOSP clk_summary — failure here is a SILENT wrong rate, not a
-SError, so compare rates explicitly. THEN:
+### gs201 CMU_TOP register-offset map vs gs101 (measured against cmucal-sfr.c)
+The gs101 map is offset per register CLASS; each class has its own delta:
+
+| register class | delta (gs201 = gs101 + Δ) | status |
+|---|---|---|
+| PLL_CON\* (rate) | **+0x40** | ✅ done, validated (shared0 = 2131968000) |
+| PLL_LOCKTIME | **+0x4** | ✅ done |
+| CLK_CON_DIV_PLL_SHARED\* (fan-out) | **+0x28** (uniform, all 9) | TODO |
+| CLK_CON_MUX_MUX_CLKCMU_\* | **varies** (−4, −8, …) — per-register from cmucal | TODO |
+| CLK_CON_DIV_CLKCMU_\* (IP divs) | **0** (same) | ok as-is |
+| CLK_CON_GAT_\* | **0** (same) | ok as-is |
+
+The "shared0_div4 register hole" in gs201_top_skip_ids was a MISREAD: the driver
+read gs101's 0x1908; gs201's real DIV4 is 0x1930 (+0x28) and is a valid register.
+Correcting the offset makes it readable → un-skip it.
+
+### Phase 1a — remaining cmu_top rate fixes  [prereq for UFS wiring]
+- Add GS201 shared-DIV offsets (+0x28) for shared0_div2..5, shared1_div2..4,
+  shared2_div2, shared3_div2; give top_cmu_info_gs201 a div table using them.
+  Remove shared0_div4 (and the other now-valid shared divs) from
+  gs201_top_skip_ids.
+- Fix the UFS-chain mux offset(s): CLK_CON_MUX_MUX_CLKCMU_HSI2_UFS_EMBD = 0x10a8
+  (and any other mux the UFS parent chain touches: its parents are shared0_div4,
+  shared2_div2, spare_pll). Muxes are per-register — look each up in cmucal.
+- Validate on device: `dout_cmu_hsi2_ufs_embd` should read ~177.664 MHz
+  (shared0÷4=532.992 MHz via mux, ÷3 via the IP div). SILENT-wrong-rate failure
+  mode — compare the clk_summary rate to the stub back-computation before wiring.
+- Cleanliness: these tables are shared with gs101's (unused on felix) top info.
+  Make gs201 variants (top_div_clks_gs201 etc.) rather than mutating the gs101
+  defines, so the change stays upstreamable.
+
+### Phase 1b — CMU_HSI2 → UFS (+125 mW)  [after 1a validates the rate]
 - Diff `top_cmu_info_gs201`'s `top_div_clks` (and mux/gate) offsets against AOSP
   gs201 CMU_TOP. Find the divider(s) at a gs101-only offset; correct or drop.
 - `gs201_top_skip_ids` already exists — extend it for clocks gs201 lacks.
