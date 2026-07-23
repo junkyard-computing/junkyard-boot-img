@@ -138,20 +138,37 @@ Correcting the offset makes it readable → un-skip it.
 - **Effort:** the biggest table (PLLs+muxes+divs+gates), but the fix may be a
   handful of offsets. Bounded by "find the one bad divider."
 
-### Phase 1 — CMU_HSI2 → UFS (+125 mW)
-- Verify/branch `hsi2_cmu_info` to a gs201 variant with cmucal-correct HSI2
-  offsets (mux + gate only; no div — small).
-- Add the `cmu_hsi2` DT node (compat gs201-cmu-hsi2, reg 0x14400000, parent
-  clocks from cmu_top).
-- Replace the `ufs_aclk` / `ufs_unipro` fixed-clock stubs in the UFS node with
-  real `&cmu_hsi2 CLK_...` gate clocks (core_clk / sclk_unipro_main / fmp).
+### Phase 1b-i — cmu_hsi2 provider node  ✅ DONE (kernel e4d2c78e07c6)
+- Added `cmu_hsi2` DT node (compat gs201-cmu-hsi2, reg 0x14400000, `bus`
+  register-access clock a fixed-clock stub, samsung,sysreg = sysreg_hsi2).
+  hsi2_cmu_info is gs101-shared and probes clean on gs201 (HSI2 register map
+  matches per cal-if). UFS still on its own stubs → zero rootfs risk.
+- VALIDATED on slot B: no SError; UFS gates track cmu_top's real clocks —
+  mout_hsi2_ufs_embd_user / gout_hsi2_ufs_embd_i_clk_unipro = **177.664 MHz**,
+  gout_hsi2_ufs_embd_i_{aclk,fmp_clk} / qe_* = 133.248 MHz.
+
+### Phase 1b-ii — UFS rewire + un-pin gates (+125 mW)  [NOT STARTED — rootfs risk]
+- **BLOCKER FOUND in 1b-i:** the three UFS gates (I_ACLK, I_CLK_UNIPRO,
+  I_FMP_CLK) are flagged **`CLK_IS_CRITICAL`** in hsi2_gate_clks (enable_cnt=1
+  with no consumer). CLK_IS_CRITICAL pins them enabled forever — the framework
+  will NEVER gate them, so the HSI2_UFS distribution clock up through cmu_top
+  stays on regardless of UFS idle. **Naively rewiring UFS onto these gates would
+  yield ZERO power drop.** 1b-ii MUST make a gs201 variant of hsi2_gate_clks that
+  clears CLK_IS_CRITICAL on (at least) the UFS gates, so ufshcd clock-gating can
+  disable them. (gs201 variant, don't mutate gs101 — same pattern as the div/mux
+  tables.)
+- Then replace the `ufs_aclk` / `ufs_unipro` fixed-clock stubs in the UFS node
+  with real `&cmu_hsi2 CLK_GOUT_HSI2_UFS_EMBD_I_*` gate clocks (core_clk /
+  sclk_unipro_main / fmp / aclk / pclk / sysreg).
+- Confirm mainline ufshcd actually clock-gates: needs UFSHCD_CAP_CLK_GATING
+  (± HIBERN8_WITH_CLK_GATING) so clk_disable reaches the gates on idle. If that
+  cap isn't set for google,gs201-ufs, wiring the clocks alone still won't gate.
 - **Validate:** UFS still enumerates + rootfs I/O sane (gear4, 0 errors); then
-  measure L2S_PLL_MIPI_UFS with the meter. Expect the gated-idle rail to fall
-  from ~144 mW toward AOSP's ~20 mW as ufshcd clock-gating now actually gates
-  the CMU clocks. If it does NOT drop, the PLL-idle hypothesis is wrong and we
-  learn the refclk PLL is independent — a real result either way.
-- **Risk:** wrong offset SErrors, or bad gate breaks UFS → rootfs unbootable →
-  rollback. Med-high. **Payoff:** up to +125 mW.
+  measure L2S_PLL_MIPI_UFS. Expect gated-idle to fall from ~144 mW toward AOSP's
+  ~20 mW. If it does NOT drop even with gates un-pinned + clk-gating on, the
+  PLL-idle hypothesis is wrong (refclk PLL independent) — a real result.
+- **Risk:** bad gate/clock breaks UFS → rootfs unbootable → rollback. Med-high.
+  **Payoff:** up to +125 mW.
 
 ### Phase 2 — CMU_DISP → INT (+99 mW)
 - gs201 variant of `dpu_cmu_info` (mux+div+gate) from cmucal CMU_DISP @0x1c200000.
