@@ -76,7 +76,32 @@ cmu_top, so **cmu_top must be fixed first**. All validation is on slot B; slot A
 mark-unbootable` / retry exhaustion. UFS/DPU changes risk the rootfs/display —
 recover by rollback or fastboot reflash.
 
-### Phase 0 — fix CMU_TOP (linchpin)
+### Phase 0 — fix CMU_TOP (linchpin) — ✅ DONE 2026-07-22 (kernel cb54dc49b2cf)
+Enabled `cmu_top` in gs201.dtsi. It probes cleanly (no SError — the SHARED0_DIV4+
+holes were already in the skip list), system boots healthy, all rails unchanged
+(consumers still on stubs). The clock tree now exposes `fout_shared0_pll`,
+`dout_cmu_hsi2_ufs_embd`, `dout_cmu_disp_bus`.
+
+**BUT the rates are wrong** (harmless while unused, blocks Phase 1). The gs101
+register map is offset from gs201 by a SYSTEMATIC delta, measured against
+cmucal-sfr.c:
+- **PLL_CON\* registers: gs201 = gs101 + 0x40** (all 4 shared PLLs). The driver
+  reads shared0 CON3 at 0x10c → decodes DIV_M=137 → 841.728 MHz; the real reg is
+  0x14c → DIV_M=347 → 2131.968 MHz (matches the DT stub back-computation).
+- **MUX registers: gs201 = gs101 − 0x4** (e.g. HSI2_UFS_EMBD mux 0x10ac→0x10a8,
+  HSI0_USB31DRD mux 0x1090→0x108c).
+- **DIV and GATE registers: same offset** (HSI2_UFS_EMBD div 0x18a4, gate 0x20cc
+  match). So dividers/gates are fine; PLLs and muxes are mis-decoded.
+- `dout_cmu_hsi2_ufs_embd` reads 0 because its mux selects shared0_div4, which is
+  in the skip list as a register-hole. On gs201 div4 exists as a *rate* (the stub
+  computes shared0/4 = 532.992 MHz) but its DIV register aborts — so re-add it as
+  a **fixed-factor** clock (shared0 ÷ 4), not a register divider.
+
+### Phase 1 — CMU_HSI2 → UFS (+125 mW)  [prereq: correct cmu_top rates above]
+First fix the cmu_top rates (gs201 PLL +0x40 / MUX −0x4 variants of top_pll_clks
+& top_mux_clks; fixed-factor shared0_div4). Validate every rate against the stub
+back-computations / AOSP clk_summary — failure here is a SILENT wrong rate, not a
+SError, so compare rates explicitly. THEN:
 - Diff `top_cmu_info_gs201`'s `top_div_clks` (and mux/gate) offsets against AOSP
   gs201 CMU_TOP. Find the divider(s) at a gs101-only offset; correct or drop.
 - `gs201_top_skip_ids` already exists — extend it for clocks gs201 lacks.
