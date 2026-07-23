@@ -113,20 +113,18 @@ The "shared0_div4 register hole" in gs201_top_skip_ids was a MISREAD: the driver
 read gs101's 0x1908; gs201's real DIV4 is 0x1930 (+0x28) and is a valid register.
 Correcting the offset makes it readable → un-skip it.
 
-### Phase 1a — remaining cmu_top rate fixes  [prereq for UFS wiring]
-- Add GS201 shared-DIV offsets (+0x28) for shared0_div2..5, shared1_div2..4,
-  shared2_div2, shared3_div2; give top_cmu_info_gs201 a div table using them.
-  Remove shared0_div4 (and the other now-valid shared divs) from
-  gs201_top_skip_ids.
-- Fix the UFS-chain mux offset(s): CLK_CON_MUX_MUX_CLKCMU_HSI2_UFS_EMBD = 0x10a8
-  (and any other mux the UFS parent chain touches: its parents are shared0_div4,
-  shared2_div2, spare_pll). Muxes are per-register — look each up in cmucal.
-- Validate on device: `dout_cmu_hsi2_ufs_embd` should read ~177.664 MHz
-  (shared0÷4=532.992 MHz via mux, ÷3 via the IP div). SILENT-wrong-rate failure
-  mode — compare the clk_summary rate to the stub back-computation before wiring.
-- Cleanliness: these tables are shared with gs101's (unused on felix) top info.
-  Make gs201 variants (top_div_clks_gs201 etc.) rather than mutating the gs101
-  defines, so the change stays upstreamable.
+### Phase 1a — remaining cmu_top rate fixes  [prereq for UFS wiring]  ✅ DONE (kernel ec1f71c7a4c8)
+- Added GS201 shared-DIV offsets (+0x28) for shared0_div2..5, shared1_div2..4,
+  shared2_div2, shared3_div2 and the UFS mux (0x10a8, −0x4). New gs201 variant
+  tables `top_mux_clks_gs201` / `top_div_clks_gs201` (byte-identical to the gs101
+  tables except those 10 macro renames — gs101 left untouched, upstreamable).
+  All shared divs un-skipped in `gs201_top_skip_ids`.
+- VALIDATED on felix slot B: clk_summary reads the full chain correctly —
+  shared0_pll 2131.968M → div2 1065.984M → div4 532.992M → mout_cmu_hsi2_ufs_embd
+  532.992M → **dout_cmu_hsi2_ufs_embd 177.664 MHz** (exactly the DT ufs_unipro
+  stub). System healthy, zero SError. No functional change (UFS still on stubs).
+- Note: the "shared0_div4 register-hole" was a MISREAD (gs101 offset 0x1908 landed
+  on an unrelated reg); real gs201 offset is 0x1930 (+0x28), a valid register.
 
 ### Phase 1b — CMU_HSI2 → UFS (+125 mW)  [after 1a validates the rate]
 - Diff `top_cmu_info_gs201`'s `top_div_clks` (and mux/gate) offsets against AOSP
