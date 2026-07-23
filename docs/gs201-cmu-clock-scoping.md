@@ -147,7 +147,29 @@ Correcting the offset makes it readable → un-skip it.
   mout_hsi2_ufs_embd_user / gout_hsi2_ufs_embd_i_clk_unipro = **177.664 MHz**,
   gout_hsi2_ufs_embd_i_{aclk,fmp_clk} / qe_* = 133.248 MHz.
 
-### Phase 1b-ii — UFS rewire + un-pin gates (+125 mW)  [NOT STARTED — rootfs risk]
+### Phase 1b-ii — UFS rewire + un-pin gates  ❌ DEAD LEVER (kernel 524a913cf95f)
+- **RESULT: the +125 mW is NOT the CMU digital clock. Hypothesis falsified end-to-end.**
+  Built + validated the full change on slot B: gs201 hsi2_gate_clks variant (5 UFS
+  gate offsets corrected — I_* +0x18, QE_* +0x14; the gs101 offsets 1b-i shipped
+  were wrong-but-benign), CLK_IS_CRITICAL cleared on the UNIPRO gate, UFS
+  sclk_unipro_main rewired stub → `<&cmu_hsi2 CLK_GOUT_HSI2_UFS_EMBD_I_CLK_UNIPRO>`.
+- Rootfs healthy (deferred probe on cmu_hsi2 resolves; /dev/sda30 ext4; 0 UFS errors).
+  On idle ufshcd gates the unipro clock AND it propagates all the way up: leaf
+  `gout_hsi2_ufs_embd_i_clk_unipro` = N, and cmu_top `gout_cmu_hsi2_ufs_embd` = N
+  (whole chain enable_cnt 0). **YET L2S_PLL_MIPI_UFS stays ~145 mW (before == after;
+  AOSP ~20 mW).** The rail is the analog UFS PHY refclk-PLL LDO (s2mpg13 ldo2),
+  independent of the CMU tree. Even the earlier "difference is UPSTREAM in CMU_TOP"
+  root-cause is now disproven by direct test.
+- Remaining UFS lever (if any) = PHY hibern8 PLL-powerdown (phy-gs101-ufs.c) or PMIC
+  ldo2 gating — a PHY/PMIC problem, not a clock one. Deep puzzle: PHY h8 config
+  byte-identical + userspace regs identical + now clock-gating identical, yet the
+  rail differs 20 vs 145. Parked.
+- The change works and is more correct (real clock tree, unipro gates on idle like
+  AOSP) but yields 0 mW. **Keep-vs-revert is a judgment call** (kept: upstream-correct
+  clock wiring + cmu_hsi2 infra; reverted: drops a deferred-probe dep for no benefit).
+
+<!-- superseded plan below, kept for the offset/mechanism notes -->
+### Phase 1b-ii (original plan) — UFS rewire + un-pin gates (+125 mW)
 - **BLOCKER FOUND in 1b-i:** the three UFS gates (I_ACLK, I_CLK_UNIPRO,
   I_FMP_CLK) are flagged **`CLK_IS_CRITICAL`** in hsi2_gate_clks (enable_cnt=1
   with no consumer). CLK_IS_CRITICAL pins them enabled forever — the framework
