@@ -22,7 +22,11 @@ KMSCON_URL ?= https://snapshot.debian.org/file/19dae225043718dfcbf02b50a7fcbedbf
 KMSCON_SHA256 ?= 5a200898513a82cac4f9262f7c20fe4b2bfc6d1d57045ab5f7d9ee0b9ca07a4f
 # felix's super partition is 2082816 × 4096B = 8136.9 MiB; 8100M leaves a small
 # margin so fastboot doesn't reject on a slightly-oversized image.
-SIZE ?= 8100M
+# Sized to fit ONE HALF of `super`, not all of it. super is 8136 MiB, split into
+# two 4068 MiB rootfs slots that the initramfs maps one at a time (see the
+# rootfs-slot dracut module); 4000M leaves a little slack inside a half. Raising
+# this past 4068 silently produces an image that overruns slot A into slot B.
+SIZE ?= 4000M
 SYSROOT_DIR ?= rootfs/sysroot
 KERNEL_SOURCE_DIR ?= kernel/source
 KERNEL_BUILD_DIR ?= $(KERNEL_SOURCE_DIR)/out/felix/dist
@@ -370,7 +374,7 @@ all:
 		--lz4 \
 		--show-modules \
 		--force \
-		--add "rescue bash rootfs-flash" \
+		--add "rescue bash rootfs-flash rootfs-slot" \
 		--install /vendor/firmware/aoc.bin \
 		--kernel-cmdline "rd.shell" \
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
@@ -414,7 +418,7 @@ install_arm_blobs: .install_packages
 .build_boot: .install_initramfs .install_vendor_firmware
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
-		--cmdline "root=/dev/disk/by-partlabel/super" \
+		--cmdline "root=/dev/mapper/rootfs" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
