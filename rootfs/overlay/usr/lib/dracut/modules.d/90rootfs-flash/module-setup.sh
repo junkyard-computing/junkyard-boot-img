@@ -24,5 +24,7 @@ install() {
     inst_hook pre-mount 50 "$moddir/flash-rootfs.sh"
     # The hook needs these in the initramfs. The base image's busybox/util set
     # lacks sync(1); pull it in so the hook can flush without relying on sysrq.
-    inst_multiple cat mount umount mkdir rm sync
+    # sha256sum is what makes the write safe (the sidecar check is mandatory, so
+    # without it the hook refuses everything); stat + blockdev drive the fit check.
+    inst_multiple cat mount umount mkdir rm sync sha256sum stat blockdev
 }

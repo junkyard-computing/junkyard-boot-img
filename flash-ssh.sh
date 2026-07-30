@@ -19,13 +19,21 @@
 #      image predates both tools, so we assume NEITHER is present: we CHECK each
 #      and scp+install only the ones that are missing.
 #   3. Stage rootfs.img onto userdata (the long, fail-prone transfer happens
-#      while the device is still untouched, so a failure here changes nothing).
+#      while the device is still untouched, so a failure here changes nothing),
+#      then sha256 the staged copy against the local image and drop the digest
+#      beside it as rootfs.img.sha256. The pre-mount hook REQUIRES that sidecar
+#      and re-checks it, so an unverified image is never written over the root.
 #   4. Boot chain: copy boot/vendor_boot/dtbo and run `pixel-ota update` — writes
 #      the inactive slot and switches the active slot (no reboot).
-#   5. Arm `pixel-ota flash-rootfs --staged --no-reboot` — the in-place rootfs
-#      reflash via systemd's shutdown initramfs.
-#   6. One reboot applies both: the shutdown initramfs dd's the new rootfs onto
-#      `super`, then the bootloader boots the freshly-switched slot.
+#   5. Arm `pixel-ota flash-rootfs --staged --no-reboot`. The reflash is done by
+#      the initramfs' 90rootfs-flash PRE-MOUNT hook, NOT by a systemd shutdown
+#      pivot: `dracut-shutdown.service` is /bin/true on these images, so the
+#      shutdown pivot pixel-ota's own README describes is inert here. Arming
+#      means staging the image + touching `flash-pending` on userdata, which is
+#      the protocol that hook keys on (see the hook for the full contract).
+#   6. One reboot applies both: on the way back up, before root is mounted, the
+#      hook verifies the staged image against its sha256 sidecar and writes it
+#      onto `super`, then boot continues into the freshly-switched slot.
 #
 # WARNING: the rootfs reflash is destructive and rollback-free — a bad image
 # bricks the root and needs fastboot/recovery. The boot-chain half is A/B-safe.
@@ -122,6 +130,19 @@ sshc "sudo mkdir -p '$stage'"
 # userdata, where pixel-ota --staged resolves it back to the userdata partition.
 gzip -c -- "$ROOTFS_IMG" | sshc "sudo sh -c 'gzip -dc > \"$stage/rootfs.img\"'"
 
+# Verify the staged copy before arming anything. The pre-mount hook re-checks this
+# sha256 and refuses to write super without it, but checking here too means a
+# truncated transfer fails now, in front of whoever ran this, instead of silently
+# not flashing three minutes later on a device that has already rebooted.
+log "verifying staged image"
+img_sha=$(sha256sum -- "$ROOTFS_IMG" | { read -r h _; printf '%s' "$h"; })
+stg_sha=$(sshc "sudo sha256sum -- '$stage/rootfs.img'" | { read -r h _; printf '%s' "$h"; })
+[ "$img_sha" = "$stg_sha" ] ||
+	die "staged image is corrupt: local $img_sha != device ${stg_sha:-<none>} (re-run)"
+# Written only after the digests agree, so the sidecar's presence means "verified".
+sshc "sudo sh -c 'printf %s\\\\n \"$img_sha\" > \"$stage/rootfs.img.sha256\"'"
+log "staged image verified ($img_sha)"
+
 # 5) Boot chain: flash inactive slot + switch (no reboot) --------------------
 log "boot chain -> inactive slot (pixel-ota update)"
 rdir=$(sshc 'mktemp -d')
@@ -143,4 +164,4 @@ sshc "sudo pixel-ota flash-rootfs --staged --no-reboot '$stage/rootfs.img'"
 # 7) One reboot applies new slot + rootfs flash ------------------------------
 log "rebooting $HOST (connection will drop)"
 sshc 'sudo systemctl reboot' || true
-log "done — $HOST flashes super from the shutdown initramfs, then boots the new slot."
+log "done — $HOST writes super from the boot initramfs' pre-mount hook, then boots the new slot."
