@@ -34,9 +34,14 @@ confirm
     post-boot service does this automatically after a good boot. Until committed, a failed
     boot rolls back.
 flash-rootfs <img> [--staged] [--no-reboot]
-    In-place reflash of the single shared `super` via systemd's shutdown initramfs.
-    DESTRUCTIVE, ROLLBACK-FREE, RAM-staged, and historically FLAKY on felix (the
-    shutdown-pivot path). AVOID for iteration — only for a deliberate full-image swap.
+    Arms an in-place reflash of the single shared `super`. DESTRUCTIVE, ROLLBACK-FREE.
+    The write is NOT done by pixel-ota, and NOT by systemd's shutdown initramfs (that
+    pivot, which pixel-ota's own README describes, is inert here — dracut-shutdown.service
+    is /bin/true on these images). It is done by the boot initramfs' 90rootfs-flash
+    PRE-MOUNT hook, which keys on `userdata:/pixel-ota/flash-pending` and verifies the
+    staged image against a `rootfs.img.sha256` sidecar before writing. Arming therefore
+    means: stage the image + sidecar on userdata, touch the flag, reboot.
+    AVOID for iteration — only for a deliberate full-image swap.
 ```
 
 ## Build / install

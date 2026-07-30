@@ -62,7 +62,7 @@ fastboot oem disable-verification
 
 `flash-fastboot.sh` wraps flashing `boot.img` + `vendor_boot.img` + `rootfs.img` (to the `super` slot) over fastboot, with the device in the bootloader on USB.
 
-For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then reflashes the rootfs via the systemd shutdown initramfs. It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and requires a persistent staging partition mounted at `/userdata` (the rootfs reflash is destructive and rollback-free).
+For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then arms a rootfs reflash that the initramfs' `90rootfs-flash` **pre-mount hook** performs on the way back up — before root is mounted, and after verifying the staged image against its `sha256` sidecar. (Not a systemd shutdown pivot: `dracut-shutdown.service` is `/bin/true` on these images.) It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and requires a persistent staging partition mounted at `/userdata` (the rootfs reflash is destructive and rollback-free).
 
 ## TODO
 
