@@ -59,6 +59,11 @@ PIXEL_OTA_SOURCES := $(wildcard $(PIXEL_OTA_DIR)/Cargo.toml $(PIXEL_OTA_DIR)/Car
 # sentinel are PRESERVED across `clean_rootfs` (ninja resumes), like the kernel.
 MESA_FORK_URL ?= https://github.com/junkyard-computing/mesa.git
 MESA_FORK_BRANCH ?= felix-g710
+# Pinned exact revision on $(MESA_FORK_BRANCH) for reproducible builds. Bump this
+# deliberately when advancing the fork; without it the build tracks the branch
+# tip and a silent upstream commit changes what ships. 3ca7ae7 = branch tip w/
+# panfrost/bi spiller-rematerialize. Override on the CLI to build a different rev.
+MESA_FORK_REV ?= 3ca7ae7723543eed57eb41ea9ea284aad3065b76
 MESA_DIR ?= build/mesa
 MESA_SRC ?= $(MESA_DIR)/src
 MESA_OUT ?= $(MESA_DIR)/out
@@ -218,13 +223,16 @@ all:
 # reinstalls build deps + relinks, not a full rebuild.
 .build_mesa: .install_packages $(MESA_BUILD_SCRIPT)
 	mkdir -p $(MESA_SRC) $(MESA_DIR)/build $(MESA_OUT)
-	# Clone or update the fork host-side (native git, not under qemu).
+	# Clone or update the fork host-side (native git, not under qemu). Fetch the
+	# PINNED rev (MESA_FORK_REV), not the branch tip, for reproducibility.
 	if [ -d $(MESA_SRC)/.git ]; then \
-		git -C $(MESA_SRC) fetch --depth 1 origin $(MESA_FORK_BRANCH) && \
+		git -C $(MESA_SRC) fetch --depth 1 origin $(MESA_FORK_REV) && \
 		git -C $(MESA_SRC) checkout -B $(MESA_FORK_BRANCH) FETCH_HEAD; \
 	else \
 		rm -rf $(MESA_SRC) && \
-		git clone --depth 1 --branch $(MESA_FORK_BRANCH) $(MESA_FORK_URL) $(MESA_SRC); \
+		git clone $(MESA_FORK_URL) $(MESA_SRC) && \
+		git -C $(MESA_SRC) fetch --depth 1 origin $(MESA_FORK_REV) && \
+		git -C $(MESA_SRC) checkout -B $(MESA_FORK_BRANCH) FETCH_HEAD; \
 	fi
 	just mount_rootfs
 	# Bind the host mesa work dir into the sysroot at /mesa and run the build.
@@ -472,7 +480,7 @@ all:
 	#                                          enter reason: reboot bootloader".
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=protected loglevel=4 clk_ignore_unused reboot=warm" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
