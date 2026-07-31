@@ -28,6 +28,31 @@ KERNEL_SOURCE_DIR ?= kernel/source
 KERNEL_BUILD_DIR ?= $(KERNEL_SOURCE_DIR)/out/felix/dist
 APT_PACKAGES_FILE ?= rootfs/packages.txt
 
+# Kernel cmdline baked into boot.img.
+#
+# CMDLINE_CONSOLE puts the kernel log on the debug UART. Without it the kernel is
+# SILENT on UART — verified by grepping a 10.6 MB uartd capture and finding zero
+# kernel banners, ever. Only the bootloader was ever talking, so UART looked like
+# a working instrument while being blind to every Linux-stage failure.
+#
+#   earlycon=exynos4210,0x10a00000
+#       Covers the window before samsung_tty probes. `exynos4210` is the name
+#       registered by OF_EARLYCON_DECLARE in drivers/tty/serial/samsung_tty.c;
+#       0x10a00000 is felix's debug UART (sysfs shows 10a00000.uart -> ttySAC0).
+#   console=ttySAC0,115200
+#       The real console once the driver is up. NOTE the kernel's compiled-in
+#       CONFIG_CMDLINE ends with `console=ttynull` and CONFIG_CMDLINE_EXTEND=y
+#       APPENDS it AFTER ours, so ttynull always takes the /dev/console slot.
+#       That is fine and is not worth fighting: the kernel writes to EVERY
+#       registered console=, so naming ttySAC0 is enough to get kernel messages
+#       onto the wire. (It also explains why serial-getty@ttySAC0 has to be
+#       enabled explicitly — see .install_packages.)
+#
+# Set CMDLINE_CONSOLE= (empty) for a quiet build. Changing this only affects
+# boot.img, so `rm .build_boot && just all` rebuilds in seconds — no rootfs work.
+CMDLINE_CONSOLE ?= earlycon=exynos4210,0x10a00000 console=ttySAC0,115200
+BOOT_CMDLINE ?= root=/dev/disk/by-partlabel/super $(CMDLINE_CONSOLE)
+
 # Sysroot-relative paths retired from rootfs/overlay/. See the rm -f in
 # .install_packages for why deleting an overlay file is not enough on its own.
 RETIRED_OVERLAY_PATHS ?= \
@@ -455,7 +480,7 @@ install_arm_blobs: .install_packages
 .build_boot: .install_initramfs .install_vendor_firmware
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
-		--cmdline "root=/dev/disk/by-partlabel/super" \
+		--cmdline "$(BOOT_CMDLINE)" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
