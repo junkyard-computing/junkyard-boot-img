@@ -1,0 +1,98 @@
+#!/bin/sh
+# Self-healing network recovery. Wait up to DEADLINE for a real DHCP address.
+# If it comes up -> mark THIS boot slot successful and reset the attempt counter.
+# If it doesn't -> if the inactive slot is a good fallback, mark THIS slot
+# unbootable and reboot (immediate A/B rollback); otherwise plain reboot to
+# retry. Bounded by MAX_ATTEMPTS so a genuinely networkless device parks in a
+# debuggable state instead of reboot-looping.
+#
+# Ported from the mainline track with three changes for this image:
+#
+#   1. Any global-scope IPv4 counts, not a hardcoded 192.168.0.0/16. Devices
+#      here live on 10.0.0.0/24, so the mainline prefix test would never match
+#      and every boot would be treated as a failure. Link-local (169.254/16) is
+#      excluded — an autoconf address means DHCP did NOT succeed.
+#   2. No-NIC guard. If no non-loopback ethernet interface exists at all, this
+#      is a bench/UART-only boot with the dongle unplugged, not a network
+#      failure — log and exit rather than rebooting a box someone is working on.
+#   3. Bounded retries via a persistent counter. Without it, a dead dongle turns
+#      into an endless reboot cycle you can only break out of over fastboot.
+#
+# Slot handling: pixel-bootctl can self-detect the running slot from
+# androidboot.slot_suffix on this (AOSP) kernel, but we derive it from devinfo
+# and pass --slot explicitly anyway — same code then works unchanged if this is
+# ever run under a bootconfig-based kernel, where self-detection fails.
+#
+# Note mark-slot-successful.service already marks the slot successful
+# unconditionally post-boot; the mark here is redundant with it but keeps this
+# script self-contained. The rollback path is the part that only lives here.
+set -u
+DEADLINE=90
+MAX_ATTEMPTS=3
+BOOTCTL=/usr/local/bin/pixel-bootctl
+STATE=/var/lib/netcheck-recover
+COUNTER="$STATE/attempts"
+
+cur_slot() {
+    "$BOOTCTL" status 2>/dev/null | awk '
+        tolower($1)=="slot:" {s=tolower($2)}
+        $1=="active:" && $2=="true" {print s; exit}'
+}
+
+# Any global-scope IPv4 that isn't a 169.254 autoconf address.
+have_ip() {
+    ip -4 -o addr show scope global 2>/dev/null \
+        | awk '{print $4}' | grep -qv '^169\.254\.'
+}
+
+# At least one non-loopback ethernet interface present?
+have_nic() {
+    [ -n "$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')" ]
+}
+
+if ! have_nic; then
+    logger -t netcheck-recover "no non-loopback interface present; assuming intentional (dongle unplugged) — not rebooting"
+    exit 0
+fi
+
+i=0
+while [ "$i" -lt "$DEADLINE" ]; do
+    if have_ip; then
+        s=$(cur_slot)
+        "$BOOTCTL" mark-successful ${s:+--slot "$s"} 2>/dev/null || true
+        rm -f "$COUNTER"
+        logger -t netcheck-recover "network up; slot ${s:-?} marked successful"
+        exit 0
+    fi
+    i=$((i+1)); sleep 1
+done
+
+# Failed. Bump the persistent attempt counter before doing anything drastic.
+mkdir -p "$STATE" 2>/dev/null
+attempts=$(cat "$COUNTER" 2>/dev/null)
+case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
+attempts=$((attempts + 1))
+echo "$attempts" > "$COUNTER" 2>/dev/null
+sync
+
+if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
+    logger -t netcheck-recover "no IP after ${DEADLINE}s (attempt $attempts/$MAX_ATTEMPTS); giving up and staying up for debugging"
+    exit 1
+fi
+
+logger -t netcheck-recover "no IP after ${DEADLINE}s (attempt $attempts/$MAX_ATTEMPTS); evaluating A/B fallback"
+other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
+    tolower($1)=="slot:" {s=$2}
+    $1=="active:"     {a[s]=$2}
+    $1=="successful:" {ok[s]=$2}
+    $1=="unbootable:" {ub[s]=$2}
+    END { for (x in a) if (a[x]=="false" && ok[x]=="true" && ub[x]=="false") print "yes" }')
+s=$(cur_slot)
+if [ "$other_ok" = "yes" ]; then
+    logger -t netcheck-recover "inactive slot good; marking slot ${s:-?} unbootable + rebooting"
+    "$BOOTCTL" mark-unbootable ${s:+--slot "$s"} 2>/dev/null || true
+else
+    logger -t netcheck-recover "no good fallback; plain reboot to retry"
+fi
+sync
+systemctl reboot -f 2>/dev/null || /sbin/reboot -f
