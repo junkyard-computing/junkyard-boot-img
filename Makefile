@@ -283,7 +283,15 @@ all:
 		> /etc/NetworkManager/system-connections/default_connection.nmconnection"
 	$(NSPAWN) -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/default_connection.nmconnection
 	# Apply tracked overlay (usb_gadget, blacklist.conf, custom service, ...).
+	# Units are enabled by the .wants symlinks committed under the overlay's
+	# etc/systemd/system/, not by `systemctl enable` here.
 	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
+	# pstore-beacon (overlay) surfaces the PREVIOUS boot's panic dmesg on UART —
+	# felix has one USB-C port, so we usually can't be UART-attached for the boot
+	# that crashes. systemd-pstore.service would race it for the records, so mask
+	# it: the beacon is the single owner of /sys/fs/pstore consumption.
+	$(NSPAWN) -D $(SYSROOT_DIR) \
+		ln -sf /dev/null /etc/systemd/system/systemd-pstore.service
 	# NOTE: the image-version stamp used to live here — moved to the PHONY
 	# `stamp_version` target (run by `just all` after .build_boot) so it is
 	# recomputed every build and reflects the actual kernel, not whatever was
