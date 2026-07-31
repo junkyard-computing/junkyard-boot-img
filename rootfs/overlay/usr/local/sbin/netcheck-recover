@@ -27,7 +27,10 @@
 # unconditionally post-boot; the mark here is redundant with it but keeps this
 # script self-contained. The rollback path is the part that only lives here.
 set -u
-DEADLINE=90
+# Must exceed dongle enumeration, not just DHCP. Measured on felix: the r8152
+# dongle enumerates at t=142s (kernel log timestamp), so the old 90s deadline
+# expired before the NIC even existed and judged every dongle boot a failure.
+DEADLINE=240
 MAX_ATTEMPTS=3
 BOOTCTL=/usr/local/bin/pixel-bootctl
 STATE=/var/lib/netcheck-recover
@@ -45,15 +48,38 @@ have_ip() {
         | awk '{print $4}' | grep -qv '^169\.254\.'
 }
 
-# At least one non-loopback ethernet interface present?
-have_nic() {
-    [ -n "$(ls /sys/class/net 2>/dev/null | grep -v '^lo$')" ]
+# Is there a live wired link we should expect a DHCP lease on?
+#
+# This has to be far more specific than "any interface besides lo". A felix
+# boots with ~47 interfaces, 44 of them virtual (rmnet0-29, dummy0, gre*,
+# gretap0, erspan0, sit0, tunl0, ip*_vti0, ip6*, ifb0/1, umts_dummy), so a
+# not-lo test is true on literally every boot and guards nothing. Requiring all
+# three of:
+#
+#   - a `device` symlink        -> drops all 44 virtual interfaces
+#   - type 1 (ARPHRD_ETHER)     -> drops wpan0, which does have a device AND
+#                                  reports carrier=1
+#   - carrier 1                 -> drops an unplugged/absent dongle
+#
+# plus a device path under a USB *bus* directory (usbN/), leaves exactly the
+# USB-Ethernet dongle. That last part is what separates the dongle
+#   .../11210000.dwc3/xhci-hcd-exynos.5.auto/usb2/2-1/2-1:1.0
+# from the CDC-NCM gadget's usb0
+#   .../11210000.dwc3/gadget.0
+# which is a peer-to-peer link to a host PC and will never see a DHCP server.
+# Without that, a gadget-only boot (phone cabled to a laptop, no dongle) looks
+# like a failed dongle and gets rebooted.
+have_link() {
+    for i in /sys/class/net/*; do
+        [ -e "$i/device" ] || continue
+        [ "$(cat "$i/type" 2>/dev/null)" = "1" ] || continue
+        [ "$(cat "$i/carrier" 2>/dev/null)" = "1" ] || continue
+        case "$(readlink -f "$i/device" 2>/dev/null)" in
+            */usb[0-9]*/*) return 0 ;;
+        esac
+    done
+    return 1
 }
-
-if ! have_nic; then
-    logger -t netcheck-recover "no non-loopback interface present; assuming intentional (dongle unplugged) — not rebooting"
-    exit 0
-fi
 
 i=0
 while [ "$i" -lt "$DEADLINE" ]; do
@@ -66,6 +92,15 @@ while [ "$i" -lt "$DEADLINE" ]; do
     fi
     i=$((i+1)); sleep 1
 done
+
+# No address. Before treating that as a failure, check there was ever a link to
+# fail on. A gadget-only or dongle-less boot is a completely normal bench state
+# and must not be "recovered" — rebooting a device nobody attached a NIC to is
+# strictly destructive.
+if ! have_link; then
+    logger -t netcheck-recover "no live wired link after ${DEADLINE}s; nothing to recover (dongle absent / gadget-only boot) — not rebooting"
+    exit 0
+fi
 
 # Failed. Bump the persistent attempt counter before doing anything drastic.
 mkdir -p "$STATE" 2>/dev/null
