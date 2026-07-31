@@ -27,6 +27,12 @@ SYSROOT_DIR ?= rootfs/sysroot
 KERNEL_SOURCE_DIR ?= kernel/source
 KERNEL_BUILD_DIR ?= $(KERNEL_SOURCE_DIR)/out/felix/dist
 APT_PACKAGES_FILE ?= rootfs/packages.txt
+
+# Sysroot-relative paths retired from rootfs/overlay/. See the rm -f in
+# .install_packages for why deleting an overlay file is not enough on its own.
+RETIRED_OVERLAY_PATHS ?= \
+	etc/systemd/system.conf.d/10-watchdog.conf \
+	etc/systemd/system/multi-user.target.wants/netcheck-recover.service
 MODULE_ORDER_PATH ?= rootfs/module_order.txt
 ROOTFS_IMG ?= boot/rootfs.img
 MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
@@ -299,6 +305,20 @@ all:
 	# Units are enabled by the .wants symlinks committed under the overlay's
 	# etc/systemd/system/, not by `systemctl enable` here.
 	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
+	# RETIRED_OVERLAY_PATHS — files that USED to ship in the overlay and must be
+	# actively removed from the sysroot.
+	#
+	# The rsync above is deliberately NOT --delete: the overlay is a sparse graft
+	# onto a full Debian install, so --delete would try to remove the entire
+	# distro. The consequence is that `git rm`-ing an overlay file does NOT
+	# remove it from the image — .debootstrap's sentinel means the sysroot is
+	# never wiped between builds, so the stale copy survives every rebuild and
+	# keeps shipping. A deleted unit therefore stays ENABLED on device.
+	#
+	# So retiring an overlay file is two steps: delete it from the overlay AND
+	# list it here. Entries can be dropped once .debootstrap has been rerun for
+	# other reasons (a wiped sysroot never had them).
+	sudo rm -f $(addprefix $(SYSROOT_DIR)/,$(RETIRED_OVERLAY_PATHS))
 	# pstore-beacon (overlay) surfaces the PREVIOUS boot's panic dmesg on UART —
 	# felix has one USB-C port, so we usually can't be UART-attached for the boot
 	# that crashes. systemd-pstore.service would race it for the records, so mask
