@@ -136,7 +136,12 @@ all:
 	just mount_rootfs
 	# Trailing $(MIRROR) pins the archive to the snapshot.debian.org timestamp
 	# in rootfs/debian_snapshot; empty MIRROR => debootstrap's default mirror.
-	sudo debootstrap --variant=minbase --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR) $(MIRROR)
+	# --components: debootstrap defaults to `main` only, and writes the
+	# components it actually fetched into the sysroot's /etc/apt/sources.list.
+	# firmware-realtek (the r8152 dongle's errata patch — mandatory, see the
+	# network section of CLAUDE.md) ships in non-free-firmware, so it has to be
+	# enabled here or apt reports "no installation candidate".
+	sudo debootstrap --variant=minbase --components=main,non-free-firmware --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR) $(MIRROR)
 	# nixpkgs heavily patches debootstrap: both the shebang AND in-script
 	# references to dpkg/chroot/unshare are rewritten to absolute /nix/store
 	# paths. --foreign copies the host script verbatim into sysroot, so
@@ -236,6 +241,14 @@ all:
 		'Acquire::https::Timeout \"60\";' \
 		'Acquire::http::Pipeline-Depth \"0\";' \
 		> $(SYSROOT_DIR)/etc/apt/apt.conf.d/99snapshot"
+	# Ensure the non-free-firmware component is enabled before `apt-get update`,
+	# so firmware-realtek resolves. .debootstrap now passes --components for
+	# this, but editing that recipe does NOT invalidate its sentinel — an
+	# already-debootstrapped sysroot would still carry a main-only sources.list
+	# and fail here. Idempotent, so it is a no-op once the component is present.
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+		"grep -q non-free-firmware /etc/apt/sources.list \
+		|| sed -i '/^deb .* main/ s/$$/ non-free-firmware/' /etc/apt/sources.list"
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "apt-get update"
 	# Locale setup.
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
