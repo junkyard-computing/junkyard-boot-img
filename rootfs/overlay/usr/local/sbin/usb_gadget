@@ -59,4 +59,31 @@ if [ -e "$SOFT" ]; then
 	sleep 1; echo connect > "$SOFT" 2>/dev/null || true
 fi
 log "bound: state=$(cat "/sys/class/udc/$UDC/state" 2>/dev/null)"
+
+# Bring the NCM link up and address it ourselves.
+#
+# This has to be explicit, and it has to NOT go through NetworkManager. For
+# CDC-NCM the host only sees carrier once *this* end's usb0 is administratively
+# up — but NM will not autoconnect a device that has no carrier yet. That is
+# circular, and the observed result is that usb0 never comes up at all: measured
+# on the host across a 60s sample, carrier stayed 0 the entire time and never
+# so much as flickered, so the device was not even attempting DHCP.
+#
+# A static address also matches what this link is: a point-to-point cable to one
+# host PC. There is no DHCP server on it and there never will be, so asking for
+# a lease can only ever time out. usb0 is marked unmanaged in
+# /etc/NetworkManager/conf.d/10-unmanage-usb0.conf so NM's wildcard
+# default_connection cannot claim it and flush this address out from under us.
+#
+# Host side: give the peer 10.42.0.2/24 and ssh to 10.42.0.1.
+IFACE=usb0
+GADGET_IP=10.42.0.1/24
+if [ -e "/sys/class/net/$IFACE" ]; then
+	ip link set "$IFACE" up 2>/dev/null || log "failed to bring $IFACE up"
+	# `replace` so a re-run (cable moved, udev re-trigger) is idempotent.
+	ip addr replace "$GADGET_IP" dev "$IFACE" 2>/dev/null || log "failed to set $GADGET_IP"
+	log "$IFACE up: $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}')"
+else
+	log "no $IFACE netdev; NCM function missing?"
+fi
 exit 0
