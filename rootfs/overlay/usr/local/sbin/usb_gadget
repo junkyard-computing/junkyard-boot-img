@@ -1,14 +1,62 @@
 #!/bin/sh
-mkdir /sys/kernel/config/usb_gadget/g1
-mkdir /sys/kernel/config/usb_gadget/g1/strings/0x409
-echo 0x18D1 > /sys/kernel/config/usb_gadget/g1/idVendor
-echo 0xD001 > /sys/kernel/config/usb_gadget/g1/idProduct
-echo "Google" > /sys/kernel/config/usb_gadget/g1/strings/0x409/manufacturer
-echo "DEADC0FFE" > /sys/kernel/config/usb_gadget/g1/strings/0x409/serialnumber
-echo "Fold" > /sys/kernel/config/usb_gadget/g1/strings/0x409/product
-mkdir /sys/kernel/config/usb_gadget/g1/functions/ncm.usb0
-mkdir /sys/kernel/config/usb_gadget/g1/configs/c.1
-mkdir -p /sys/kernel/config/usb_gadget/g1/configs/c.1/strings/0x409
-echo "USB network" > /sys/kernel/config/usb_gadget/g1/configs/c.1/strings/0x409/configuration
-ln -s /sys/kernel/config/usb_gadget/g1/functions/ncm.usb0 /sys/kernel/config/usb_gadget/g1/configs/c.1/
-echo 11210000.dwc3 > /sys/kernel/config/usb_gadget/g1/UDC
+# Configure/bind the CDC-NCM(+ACM) gadget, so the device is reachable over
+# USB-Ethernet (and a USB serial console) when cabled to a host — SSH without
+# needing the wired dongle or a UART adapter.
+#
+# Idempotent against a pre-existing g1: if the gadget tree already exists we do
+# NOT rewrite locked descriptor attrs (idVendor etc. return -EIO once functions
+# are linked) — we just (re)bind the UDC. The previous version of this script
+# unconditionally mkdir'd and wrote every attribute, so a second invocation
+# (e.g. on cable re-plug) failed noisily partway through.
+#
+# The UDC is discovered from /sys/class/udc rather than hardcoded, so this
+# doesn't depend on the dwc3 node address staying 11210000.
+set -u
+GADGET=/sys/kernel/config/usb_gadget/g1
+
+log() { printf "[USB-GADGET] %s\n" "$*" | tee -a /dev/kmsg >/dev/null 2>&1 || true; }
+
+# Already bound? nothing to do.
+if [ -f "$GADGET/UDC" ] && [ -n "$(cat "$GADGET/UDC" 2>/dev/null)" ]; then
+	exit 0
+fi
+
+# Build the tree only if it isn't there yet (fresh boot). A partial/leftover g1
+# is left as-is; writing descriptor attrs on it returns -EIO.
+if [ ! -d "$GADGET/functions/ncm.usb0" ]; then
+	mkdir -p "$GADGET"
+	echo 0x18D1 > "$GADGET/idVendor"
+	echo 0xD001 > "$GADGET/idProduct"
+	echo 0x0100 > "$GADGET/bcdDevice"
+	echo 0x0200 > "$GADGET/bcdUSB"
+	mkdir -p "$GADGET/strings/0x409"
+	echo "Google" > "$GADGET/strings/0x409/manufacturer"
+	echo "Fold" > "$GADGET/strings/0x409/product"
+	echo "DEADC0FFE" > "$GADGET/strings/0x409/serialnumber"
+	mkdir -p "$GADGET/functions/ncm.usb0"
+	mkdir -p "$GADGET/functions/acm.usb0"
+	mkdir -p "$GADGET/configs/c.1/strings/0x409"
+	echo "NCM + ACM" > "$GADGET/configs/c.1/strings/0x409/configuration"
+	echo 250 > "$GADGET/configs/c.1/MaxPower"
+fi
+
+# Ensure the function links exist (harmless if already linked).
+[ -e "$GADGET/configs/c.1/ncm.usb0" ] || ln -s "$GADGET/functions/ncm.usb0" "$GADGET/configs/c.1/ncm.usb0"
+[ -d "$GADGET/functions/acm.usb0" ] && [ ! -e "$GADGET/configs/c.1/acm.usb0" ] && ln -s "$GADGET/functions/acm.usb0" "$GADGET/configs/c.1/acm.usb0"
+
+UDC=$(ls /sys/class/udc/ 2>/dev/null | head -n1)
+if [ -z "$UDC" ]; then
+	log "no UDC available under /sys/class/udc/"
+	exit 1
+fi
+log "binding UDC=$UDC"
+echo "$UDC" > "$GADGET/UDC" || { log "bind failed"; exit 1; }
+
+# Force the D+ pullup (gs201 dwc3 doesn't always drive it from a passive bind).
+SOFT="/sys/class/udc/$UDC/soft_connect"
+if [ -e "$SOFT" ]; then
+	sleep 1; echo disconnect > "$SOFT" 2>/dev/null || true
+	sleep 1; echo connect > "$SOFT" 2>/dev/null || true
+fi
+log "bound: state=$(cat "/sys/class/udc/$UDC/state" 2>/dev/null)"
+exit 0

@@ -1,0 +1,12 @@
+# Bring the CDC-NCM+ACM gadget up when a UDC appears.
+#
+# A UDC only exists when the Type-C port lands device-role, i.e. when felix is
+# cabled to a host/PC rather than to the dongle. usb-gadget.service's
+# WantedBy=multi-user.target only fires at boot, but the cable gets moved
+# between the dongle (ethernet + charging) and the PC (gadget + fastboot)
+# while the machine is running -- so trigger on UDC hot-plug as well.
+#
+# Safe for the host-mode path: with the dongle attached the port is data=host,
+# dwc3 exposes no UDC, this rule never matches, and the service's
+# ConditionPathExistsGlob=/sys/class/udc/* would no-op it anyway.
+SUBSYSTEM=="udc", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="usb-gadget.service"
