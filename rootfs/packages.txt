@@ -22,3 +22,4 @@ libvulkan1
 ocl-icd-libopencl1
 vulkan-tools
 clinfo
+firmware-realtek
