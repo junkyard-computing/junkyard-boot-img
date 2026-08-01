@@ -55,8 +55,16 @@ log() { printf "[USB-GADGET] %s\n" "$*" | tee -a /dev/kmsg >/dev/null 2>&1 || tr
 # on the network, run this script, check the dongle keeps its lease.
 
 # Already bound? nothing to do.
+# Already bound? Skip building and binding — but do NOT exit. Addressing usb0
+# and running the DHCP server are separate concerns, and an early exit here made
+# the script unable to repair either: on a device whose dnsmasq had died, every
+# re-run (udev trigger, manual invocation) returned immediately because the UDC
+# was still bound, and nothing ever restarted the server. Fall through instead;
+# the steps below are individually idempotent.
+ALREADY_BOUND=0
 if [ -f "$GADGET/UDC" ] && [ -n "$(cat "$GADGET/UDC" 2>/dev/null)" ]; then
-	exit 0
+	ALREADY_BOUND=1
+	log "already bound to $(cat "$GADGET/UDC" 2>/dev/null); re-checking address + DHCP"
 fi
 
 # Build the tree only if it isn't there yet (fresh boot). A partial/leftover g1
@@ -82,13 +90,17 @@ fi
 [ -e "$GADGET/configs/c.1/ncm.usb0" ] || ln -s "$GADGET/functions/ncm.usb0" "$GADGET/configs/c.1/ncm.usb0"
 [ -d "$GADGET/functions/acm.usb0" ] && [ ! -e "$GADGET/configs/c.1/acm.usb0" ] && ln -s "$GADGET/functions/acm.usb0" "$GADGET/configs/c.1/acm.usb0"
 
-UDC=$(ls /sys/class/udc/ 2>/dev/null | head -n1)
-if [ -z "$UDC" ]; then
-	log "no UDC available under /sys/class/udc/"
-	exit 1
+if [ "$ALREADY_BOUND" = 0 ]; then
+	UDC=$(ls /sys/class/udc/ 2>/dev/null | head -n1)
+	if [ -z "$UDC" ]; then
+		log "no UDC available under /sys/class/udc/"
+		exit 1
+	fi
+	log "binding UDC=$UDC"
+	echo "$UDC" > "$GADGET/UDC" || { log "bind failed"; exit 1; }
+else
+	UDC=$(cat "$GADGET/UDC" 2>/dev/null)
 fi
-log "binding UDC=$UDC"
-echo "$UDC" > "$GADGET/UDC" || { log "bind failed"; exit 1; }
 
 # NOTE: no soft_connect toggle here, deliberately.
 #
@@ -151,18 +163,40 @@ log "$IFACE up: $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}'
 # default route and resolver for the lifetime of the cable — fine on a dedicated
 # rig, hostile on a laptop with real connectivity. A bare address is all that is
 # needed to reach the device.
-if command -v dnsmasq >/dev/null 2>&1; then
-	pkill -f "dnsmasq.*--interface=$IFACE" 2>/dev/null || true
-	if dnsmasq --interface="$IFACE" --bind-interfaces \
+DNSMASQ=$(command -v dnsmasq 2>/dev/null || { [ -x /usr/sbin/dnsmasq ] && echo /usr/sbin/dnsmasq; })
+if [ -n "${DNSMASQ:-}" ]; then
+	# Launch it in its OWN transient unit, NOT as a child of this script.
+	#
+	# usb-gadget.service is Type=oneshot with the default KillMode=control-group.
+	# dnsmasq daemonises, so forking it from here put it in this unit's cgroup —
+	# and the moment ExecStart finished, systemd tore that cgroup down and killed
+	# it ("usb-gadget.service: Deactivated successfully" ~0s after the start).
+	# The fork also meant the parent exited 0 regardless, so the old check logged
+	# "serving DHCP" for a server that was already dead. Verified on
+	# 34291FDHS000WV: script logged success at t=20.4s, nothing listening after
+	# boot, and the identical command run by hand worked fine.
+	#
+	# systemd-run gives it a lifetime independent of this oneshot;
+	# --keep-in-foreground makes it a normal supervised Type=simple service.
+	systemctl stop "dnsmasq-$IFACE.service" 2>/dev/null || true
+	systemd-run --unit="dnsmasq-$IFACE" --collect \
+		--property=Restart=on-failure --property=RestartSec=5 \
+		"$DNSMASQ" --keep-in-foreground \
+		--interface="$IFACE" --bind-interfaces \
 		--dhcp-range=10.42.0.10,10.42.0.100,12h \
 		--dhcp-option=3 \
-		--dhcp-option=6 \
-		--pid-file=/run/dnsmasq-$IFACE.pid 2>/dev/null
-	then
-		log "dnsmasq serving DHCP on $IFACE (10.42.0.10-100, no router/DNS pushed)"
-	else
-		log "dnsmasq failed to start on $IFACE; host must set 10.42.0.2/24 by hand"
-	fi
+		--dhcp-option=6 >/dev/null 2>&1
+
+	# VERIFY it is actually serving. Never infer this from an exit status again.
+	i=0
+	while [ "$i" -lt 5 ]; do
+		if pgrep -f "dnsmasq.*--interface=$IFACE" >/dev/null 2>&1; then
+			log "dnsmasq serving DHCP on $IFACE (10.42.0.10-100, no router/DNS pushed)"
+			exit 0
+		fi
+		i=$((i + 1)); sleep 1
+	done
+	log "dnsmasq did NOT stay up on $IFACE; host must set 10.42.0.2/24 by hand"
 else
 	log "dnsmasq absent; host must set 10.42.0.2/24 by hand"
 fi
