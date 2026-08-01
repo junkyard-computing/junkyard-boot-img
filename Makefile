@@ -325,6 +325,13 @@ all:
 	# it: the beacon is the single owner of /sys/fs/pstore consumption.
 	$(NSPAWN) -D $(SYSROOT_DIR) \
 		ln -sf /dev/null /etc/systemd/system/systemd-pstore.service
+	# dnsmasq is installed ONLY to serve DHCP on the USB gadget link, started
+	# ad-hoc by usr/local/sbin/usb_gadget bound to usb0. Debian enables
+	# dnsmasq.service on install, and that system-wide instance binds the
+	# wildcard address — on a lab/fleet LAN that is a rogue DHCP server handing
+	# leases to everything on the wire. Disable it; the gadget script's
+	# --bind-interfaces instance is the only one that should ever run.
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl disable dnsmasq.service || true
 	# NOTE: the image-version stamp used to live here — moved to the PHONY
 	# `stamp_version` target (run by `just all` after .build_boot) so it is
 	# recomputed every build and reflects the actual kernel, not whatever was

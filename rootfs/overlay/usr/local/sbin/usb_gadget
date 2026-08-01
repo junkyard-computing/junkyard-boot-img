@@ -117,12 +117,47 @@ log "bound: state=$(cat "/sys/class/udc/$UDC/state" 2>/dev/null)"
 # Host side: give the peer 10.42.0.2/24 and ssh to 10.42.0.1.
 IFACE=usb0
 GADGET_IP=10.42.0.1/24
-if [ -e "/sys/class/net/$IFACE" ]; then
-	ip link set "$IFACE" up 2>/dev/null || log "failed to bring $IFACE up"
-	# `replace` so a re-run (cable moved, udev re-trigger) is idempotent.
-	ip addr replace "$GADGET_IP" dev "$IFACE" 2>/dev/null || log "failed to set $GADGET_IP"
-	log "$IFACE up: $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}')"
-else
+if [ ! -e "/sys/class/net/$IFACE" ]; then
 	log "no $IFACE netdev; NCM function missing?"
+	exit 0
+fi
+ip link set "$IFACE" up 2>/dev/null || log "failed to bring $IFACE up"
+# `replace` so a re-run (cable moved, udev re-trigger) is idempotent.
+ip addr replace "$GADGET_IP" dev "$IFACE" 2>/dev/null || log "failed to set $GADGET_IP"
+log "$IFACE up: $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}')"
+
+# Serve DHCP on the link, so the host needs no configuration at all.
+#
+# The static address alone put the burden on the wrong end. The host's peer
+# interface is named after the USB bus position, and the gadget moves: in one
+# session it came up as enp5s0u1u1, then usb0, then enp0s20f0u3 — each time
+# needing a fresh hand-built NetworkManager profile before anything was
+# reachable. Handing out a lease moves that decision to the side that knows the
+# answer: plug in any machine and it can reach 10.42.0.1 immediately.
+#
+# --interface + --bind-interfaces is LOAD-BEARING. Without it dnsmasq binds the
+# wildcard address and would answer DHCP on the WIRED network too — a rogue DHCP
+# server on the lab/fleet LAN. The packaged dnsmasq.service is disabled in
+# .install_packages for the same reason; this ad-hoc instance is the only one.
+#
+# Empty --dhcp-option=3 and =6 suppress the router and DNS options. The image we
+# copied this idea from advertises the device as both, which hijacks the host's
+# default route and resolver for the lifetime of the cable — fine on a dedicated
+# rig, hostile on a laptop with real connectivity. A bare address is all that is
+# needed to reach the device.
+if command -v dnsmasq >/dev/null 2>&1; then
+	pkill -f "dnsmasq.*--interface=$IFACE" 2>/dev/null || true
+	if dnsmasq --interface="$IFACE" --bind-interfaces \
+		--dhcp-range=10.42.0.10,10.42.0.100,12h \
+		--dhcp-option=3 \
+		--dhcp-option=6 \
+		--pid-file=/run/dnsmasq-$IFACE.pid 2>/dev/null
+	then
+		log "dnsmasq serving DHCP on $IFACE (10.42.0.10-100, no router/DNS pushed)"
+	else
+		log "dnsmasq failed to start on $IFACE; host must set 10.42.0.2/24 by hand"
+	fi
+else
+	log "dnsmasq absent; host must set 10.42.0.2/24 by hand"
 fi
 exit 0
