@@ -16,6 +16,31 @@ GADGET=/sys/kernel/config/usb_gadget/g1
 
 log() { printf "[USB-GADGET] %s\n" "$*" | tee -a /dev/kmsg >/dev/null 2>&1 || true; }
 
+# Refuse to bind unless the Type-C port is positively in DEVICE role.
+#
+# usb-gadget.service gates on ConditionPathExistsGlob=/sys/class/udc/*, which is
+# NOT a host/device discriminator. Measured on 34291FDHS000WV while it was live
+# on the wired network: /sys/class/udc/11210000.dwc3 was present, data_role read
+# "[host] device", and the r8152 dongle was up carrying 192.168.1.108. The UDC
+# node simply exists whenever dwc3 is loaded, either role.
+#
+# Binding from that state flips the port to device role and takes the dongle's
+# link down with it: the device boots fine but has NO network, showing only
+# usb0's static 10.42.0.1 on the console banner. Confirmed by disabling this
+# service, at which point the same unit came straight back on 192.168.1.108.
+#
+# The test is deliberately POSITIVE ("is it [device]?") rather than negative
+# ("is it not [host]?") so that an unreadable, absent or still-settling role
+# means we do NOT bind. Failing that way round is the safe one: a missing gadget
+# costs a convenience path that only matters when cabled to a PC, whereas a
+# wrongly-bound gadget destroys the wired network the fleet is reached over.
+ROLE=/sys/class/typec/port0/data_role
+case "$(cat "$ROLE" 2>/dev/null)" in
+	*'[device]'*) : ;;
+	*) log "port not in device role ($(cat "$ROLE" 2>/dev/null || echo unreadable)); not binding"
+	   exit 0 ;;
+esac
+
 # Already bound? nothing to do.
 if [ -f "$GADGET/UDC" ] && [ -n "$(cat "$GADGET/UDC" 2>/dev/null)" ]; then
 	exit 0
