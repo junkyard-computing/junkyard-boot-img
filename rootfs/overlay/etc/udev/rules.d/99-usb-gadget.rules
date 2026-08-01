@@ -10,3 +10,18 @@
 # dwc3 exposes no UDC, this rule never matches, and the service's
 # ConditionPathExistsGlob=/sys/class/udc/* would no-op it anyway.
 SUBSYSTEM=="udc", ACTION=="add", TAG+="systemd", ENV{SYSTEMD_WANTS}="usb-gadget.service"
+
+# ...but the udc rule above is NOT sufficient on its own. The UDC node does not
+# come and go with the cable: /sys/class/udc/11210000.dwc3 exists whenever dwc3
+# is loaded, in host mode too (measured on 34291FDHS000WV while it was on its
+# dongle). So "udc add" fires at driver load and essentially never again —
+# moving the cable from the dongle to a PC produces no udc event at all.
+#
+# This was masked until the data_role guard landed: usb_gadget used to bind
+# unconditionally at boot, so the gadget existed no matter the cable. Now a
+# dongle boot correctly declines, and without a second trigger nothing ever
+# starts it when the cable later moves to a host.
+#
+# Type-C partner attach DOES fire on every cable change. Triggering on it is
+# safe because usb_gadget re-checks data_role itself and no-ops in host mode.
+SUBSYSTEM=="typec", ACTION=="add", KERNEL=="port0-partner", TAG+="systemd", ENV{SYSTEMD_WANTS}="usb-gadget.service"

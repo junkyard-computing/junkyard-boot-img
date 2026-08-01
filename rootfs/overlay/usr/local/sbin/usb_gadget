@@ -34,12 +34,26 @@ log() { printf "[USB-GADGET] %s\n" "$*" | tee -a /dev/kmsg >/dev/null 2>&1 || tr
 # means we do NOT bind. Failing that way round is the safe one: a missing gadget
 # costs a convenience path that only matters when cabled to a PC, whereas a
 # wrongly-bound gadget destroys the wired network the fleet is reached over.
+# Give the role a few seconds to settle first. When this is triggered by Type-C
+# partner attach (99-usb-gadget.rules), PD negotiation and any data-role swap are
+# still in flight, so an immediate read can show [host] or nothing on a cable
+# that is about to resolve to device. Polling briefly avoids declining a genuine
+# host connection. On a dongle boot this costs ROLE_WAIT seconds once, in a
+# oneshot ordered after getty.target — it delays no login and blocks no boot.
 ROLE=/sys/class/typec/port0/data_role
-case "$(cat "$ROLE" 2>/dev/null)" in
-	*'[device]'*) : ;;
-	*) log "port not in device role ($(cat "$ROLE" 2>/dev/null || echo unreadable)); not binding"
-	   exit 0 ;;
-esac
+ROLE_WAIT=${ROLE_WAIT:-8}
+i=0
+while :; do
+	case "$(cat "$ROLE" 2>/dev/null)" in
+		*'[device]'*) break ;;
+	esac
+	i=$((i + 1))
+	[ "$i" -ge "$ROLE_WAIT" ] && {
+		log "port not in device role after ${ROLE_WAIT}s ($(cat "$ROLE" 2>/dev/null || echo unreadable)); not binding"
+		exit 0
+	}
+	sleep 1
+done
 
 # Already bound? nothing to do.
 if [ -f "$GADGET/UDC" ] && [ -n "$(cat "$GADGET/UDC" 2>/dev/null)" ]; then
