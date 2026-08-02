@@ -67,20 +67,59 @@ log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg
 peer_reachable() {
     _p="$1"
     [ -n "$_p" ] || return 1
+    # ICMP is the strong test.
     ping -c1 -W2 "$_p" >/dev/null 2>&1 && return 0
-    # Ping may be filtered; the ARP entry is still evidence the peer answered.
-    ip neigh show "$_p" 2>/dev/null | grep -qE 'REACHABLE|DELAY|PROBE|STALE' && return 0
+    # ICMP may be filtered. Fall back to L2: FLUSH the neighbour entry first,
+    # then let the failed ping above have re-triggered resolution — an entry
+    # that comes back with an lladdr and is not FAILED/INCOMPLETE means the peer
+    # answered ARP, so the link really does pass packets.
+    #
+    # The flush matters: without it this is circular, because some targets are
+    # themselves discovered FROM the ARP table and a leftover STALE entry would
+    # "prove" reachability of a link that is wedged. STALE only means we knew
+    # the mapping once.
+    ip neigh flush to "$_p" 2>/dev/null
+    ping -c1 -W2 "$_p" >/dev/null 2>&1
+    ip neigh show to "$_p" 2>/dev/null \
+        | grep -q 'lladdr' \
+        && ! ip neigh show to "$_p" 2>/dev/null | grep -qE 'FAILED|INCOMPLETE' \
+        && return 0
     return 1
 }
 
-# Wired path: reachable means the default gateway answers, not that we hold a
-# lease. Subnet-agnostic on purpose (10.0.0.0/24 in the datacenter,
-# 192.168.1.0/24 on the bench), so we ask the routing table rather than
-# hardcoding either.
+# Build the wired probe target list at RUN TIME. Nothing here is hardcoded and
+# nothing is a single point of false failure:
+#
+#   * the default gateway(s) from the routing table
+#   * the DNS servers we were actually handed (resolv.conf)
+#   * the DHCP server that gave us the lease
+#   * anything already in the ARP table on a wired link
+#
+# Deliberately NOT just the gateway. Plenty of gateways drop ICMP, a gateway can
+# be down while the rest of the LAN is fine, and in the datacenter the peer that
+# matters is the controller rather than the router — so any one target being
+# unreachable must not read as "this device is off the network".
+#
+# Operators can pin their own targets (one IP per line) in
+#   /etc/netcheck-recover.targets
+# which REPLACES the discovered set — e.g. point a fleet at its control plane.
+wired_targets() {
+    if [ -s /etc/netcheck-recover.targets ]; then
+        grep -vE '^[[:space:]]*(#|$)' /etc/netcheck-recover.targets
+        return
+    fi
+    ip -4 route show default 2>/dev/null | awk -v g="$GADGET_IF" '$5 != g {print $3}'
+    awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^[0-9]+\.'
+    # DHCP server for any non-gadget lease NM recorded
+    grep -sh '^SERVER_ADDRESS=' /var/lib/NetworkManager/*.lease 2>/dev/null | cut -d= -f2
+    # neighbours already known on a wired link (excludes the gadget subnet)
+    ip -4 neigh show 2>/dev/null | awk -v g="$GADGET_IF" '$3 != g && $1 ~ /^[0-9]/ {print $1}'
+}
+
+# Reachable = ANY discovered peer answers. Not "we hold an address".
 wired_reachable() {
-    for _gw in $(ip -4 route show default 2>/dev/null \
-                 | awk -v g="$GADGET_IF" '$5 != g {print $3}'); do
-        peer_reachable "$_gw" && return 0
+    for _t in $(wired_targets | sort -u); do
+        peer_reachable "$_t" && return 0
     done
     return 1
 }
