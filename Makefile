@@ -310,15 +310,14 @@ all:
 		"nmcli --offline connection add type ethernet con-name default_connection ipv4.method auto autoconnect true \
 		> /etc/NetworkManager/system-connections/default_connection.nmconnection"
 	$(NSPAWN) -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/default_connection.nmconnection
-	# usb0 is the CDC-NCM gadget interface (created by usb-gadget.service when
-	# the host plugs in). Static 10.42.0.1/24 — host gets matching DHCP from
-	# us via dnsmasq if installed, or sets its own static; SSH target is then
-	# 10.42.0.1.
-	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
-		"nmcli --offline connection add type ethernet ifname usb0 con-name usb0-gadget \
-		ipv4.method manual ipv4.addresses 10.42.0.1/24 ipv6.method disabled autoconnect true \
-		> /etc/NetworkManager/system-connections/usb0-gadget.nmconnection"
-	$(NSPAWN) -D $(SYSROOT_DIR) chmod 600 /etc/NetworkManager/system-connections/usb0-gadget.nmconnection
+	# usb0 (CDC-NCM gadget) is deliberately NOT managed by NetworkManager.
+	# Ported from the AOSP track: usr/local/sbin/usb_gadget brings usb0 up, sets
+	# 10.42.0.1/24, and runs dnsmasq on it itself; etc/NetworkManager/conf.d/
+	# 10-unmanage-usb0.conf marks usb0 unmanaged so the wildcard default_connection
+	# can't claim it, run DHCP on a server-less point-to-point cable, time out, and
+	# flush the address out from under the script. Remove any usb0-gadget NM
+	# profile a prior build of this image left in the (persistent) sysroot.
+	$(NSPAWN) -D $(SYSROOT_DIR) rm -f /etc/NetworkManager/system-connections/usb0-gadget.nmconnection
 	# Apply tracked overlay (usb_gadget, blacklist.conf, custom service, ...).
 	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
 	# usb-gadget: the overlay has shipped the script + unit for a while, but
@@ -338,12 +337,22 @@ all:
 	# it — our beacon is the single owner of /sys/fs/pstore consumption.
 	$(NSPAWN) -D $(SYSROOT_DIR) systemctl enable pstore-beacon.service
 	$(NSPAWN) -D $(SYSROOT_DIR) systemctl mask systemd-pstore.service
-	# serial-getty@ttyGS0: nothing provides a peripheral-mode /dev/ttyGS0 in the
-	# default (host-mode) cable setup, so an enabled instance just blocks boot
-	# ~90s waiting on dev-ttyGS0.device (BoundBy=serial-getty@ttyGS0.service).
-	# Mask it so a stray manual enable — or a future gadget ACM function — can't
-	# reintroduce that wait; UART/kmscon/SSH are the real login paths.
-	$(NSPAWN) -D $(SYSROOT_DIR) systemctl mask serial-getty@ttyGS0.service
+	# serial-getty@ttyGS0: give the gadget's ACM port a login console, but start
+	# it from udev (99-gadget-getty.rules, on /dev/ttyGS0 appearance) instead of
+	# ENABLING the instance. An enabled serial-getty@ttyGS0 blocks boot ~90s
+	# waiting on dev-ttyGS0.device (BindsTo/After=dev-%i.device) whenever the
+	# gadget isn't up. So unmask (a masked unit can't be started by the udev
+	# SYSTEMD_WANTS) and disable (drop any prior .wants link) — the udev rule
+	# owns starting it exactly when /dev/ttyGS0 appears.
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl unmask serial-getty@ttyGS0.service || true
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl disable serial-getty@ttyGS0.service || true
+	# dnsmasq is installed ONLY to serve DHCP on the usb0 gadget link, launched
+	# ad-hoc in its own transient unit by usr/local/sbin/usb_gadget bound to usb0.
+	# Debian enables dnsmasq.service on install; that system-wide instance binds
+	# the wildcard and would answer DHCP on the WIRED net too (a rogue DHCP server
+	# on the lab LAN). Disable it — the gadget script's --bind-interfaces instance
+	# is the only one that should ever run.
+	$(NSPAWN) -D $(SYSROOT_DIR) systemctl disable dnsmasq.service || true
 	just unmount_rootfs
 	touch $@
 

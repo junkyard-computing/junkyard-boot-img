@@ -7,9 +7,13 @@ Description=Configure CDC-NCM + CDC-ACM USB gadget
 # drawn) before this service starts writing to kmsg.
 After=getty.target sys-kernel-config.mount
 Requires=sys-kernel-config.mount
-# No-op unless the Type-C port landed device-role and dwc3 exposed a UDC. With
-# the dongle attached the port is data=host, there is no UDC, and this service
-# does not run — so it cannot disturb the ethernet+charging path.
+# Cheap pre-filter only: skip when dwc3 has not exposed a UDC at all.
+#
+# This condition does NOT tell host mode from device mode — measured on
+# 34291FDHS000WV, /sys/class/udc/11210000.dwc3 is present while data_role reads
+# "[host] device" with the dongle up on the wired network. The real guard is in
+# usb_gadget, which refuses to bind unless data_role is positively "[device]";
+# see the comment there for why binding in host mode kills the dongle's link.
 # Also started on UDC hot-plug via 99-usb-gadget.rules, because the cable gets
 # moved between dongle and PC at runtime, not just at boot.
 ConditionPathExistsGlob=/sys/class/udc/*
