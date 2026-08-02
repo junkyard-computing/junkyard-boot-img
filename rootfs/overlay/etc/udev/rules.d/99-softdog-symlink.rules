@@ -1,0 +1,11 @@
+# Stable name for the software watchdog, so systemd's WatchdogDevice can pin it
+# regardless of whether softdog enumerates as /dev/watchdog0 or watchdog1
+# relative to the s3c2410 hardware watchdog (probe order is not guaranteed).
+#
+# softdog is the *virtual* watchdog device (/sys/devices/virtual/watchdog/...);
+# the s3c2410 hardware watchdog lives on a platform path
+# (/sys/devices/platform/10060000.watchdog/...). This kernel's watchdog class
+# exposes NO `identity` sysfs attr, so match by the virtual DEVPATH rather than
+# identity. Paired with etc/systemd/system.conf.d/10-watchdog.conf
+# (WatchdogDevice=/dev/watchdog-soft).
+SUBSYSTEM=="watchdog", DEVPATH=="*/virtual/watchdog/*", SYMLINK+="watchdog-soft"
