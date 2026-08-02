@@ -1,40 +1,39 @@
 #!/bin/sh
-# Self-healing network recovery. Wait up to DEADLINE for a real DHCP address.
-# If it comes up -> mark THIS boot slot successful and reset the attempt counter.
-# If it doesn't -> if the inactive slot is a good fallback, mark THIS slot
-# unbootable and reboot (immediate A/B rollback); otherwise plain reboot to
-# retry. Bounded by MAX_ATTEMPTS so a genuinely networkless device parks in a
-# debuggable state instead of reboot-looping.
+# Network-loss recovery. Run PERIODICALLY by netcheck-recover.timer.
 #
-# Ported from the mainline track with three changes for this image:
+# This is the only recovery path on the shipped configuration: no screen, no
+# volume keys, no power button. If the device becomes unreachable over the
+# network there is nobody to press anything, so it has to rescue itself.
 #
-#   1. Any global-scope IPv4 counts, not a hardcoded 192.168.0.0/16. Devices
-#      here live on 10.0.0.0/24, so the mainline prefix test would never match
-#      and every boot would be treated as a failure. Link-local (169.254/16) is
-#      excluded — an autoconf address means DHCP did NOT succeed.
-#   2. No-NIC guard. If no non-loopback ethernet interface exists at all, this
-#      is a bench/UART-only boot with the dongle unplugged, not a network
-#      failure — log and exit rather than rebooting a box someone is working on.
-#   3. Bounded retries via a persistent counter. Without it, a dead dongle turns
-#      into an endless reboot cycle you can only break out of over fastboot.
+# Escalation, on consecutive failed checks:
+#   1..REBOOT_BEFORE_ROLLBACK   plain reboot   (clears a wedged or hung state)
+#   thereafter                  mark this slot unbootable and reboot, so the
+#                               bootloader falls back to the other slot
 #
-# Slot handling: pixel-bootctl can self-detect the running slot from
-# androidboot.slot_suffix on this (AOSP) kernel, but we derive it from devinfo
-# and pass --slot explicitly anyway — same code then works unchanged if this is
-# ever run under a bootconfig-based kernel, where self-detection fails.
-#
-# Note mark-slot-successful.service already marks the slot successful
-# unconditionally post-boot; the mark here is redundant with it but keeps this
-# script self-contained. The rollback path is the part that only lives here.
+# It deliberately NEVER gives up. An earlier version stopped after 3 attempts to
+# avoid reboot-looping a bench unit; on a device that cannot be touched that
+# turns a recoverable fault into a permanent brick. A reboot loop is noisy but
+# still trying, and rollback may land on a good slot. For bench use, create
+#   /etc/netcheck-recover.disable
+# and this exits immediately.
 set -u
-# Must exceed dongle enumeration, not just DHCP. Measured on felix: the r8152
-# dongle enumerates at t=142s (kernel log timestamp), so the old 90s deadline
-# expired before the NIC even existed and judged every dongle boot a failure.
-DEADLINE=240
-MAX_ATTEMPTS=3
+DEADLINE=${DEADLINE:-60}          # seconds to wait for an address before acting
+REBOOT_BEFORE_ROLLBACK=${REBOOT_BEFORE_ROLLBACK:-3}
 BOOTCTL=/usr/local/bin/pixel-bootctl
 STATE=/var/lib/netcheck-recover
 COUNTER="$STATE/attempts"
+
+log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg 2>/dev/null; }
+
+[ -e /etc/netcheck-recover.disable ] && { log "disabled by /etc/netcheck-recover.disable"; exit 0; }
+
+# Any global-scope IPv4 that is not a 169.254 autoconf address. Deliberately not
+# tied to a subnet: these devices run on 10.0.0.0/24 in the datacenter and
+# 192.168.1.0/24 on the bench, so hardcoding either prefix would make one of
+# them permanently "failing".
+have_ip() {
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | grep -qv '^169\.254\.'
+}
 
 cur_slot() {
     "$BOOTCTL" status 2>/dev/null | awk '
@@ -42,67 +41,21 @@ cur_slot() {
         $1=="active:" && $2=="true" {print s; exit}'
 }
 
-# Any global-scope IPv4 that isn't a 169.254 autoconf address.
-have_ip() {
-    ip -4 -o addr show scope global 2>/dev/null \
-        | awk '{print $4}' | grep -qv '^169\.254\.'
-}
-
-# Is there a live wired link we should expect a DHCP lease on?
-#
-# This has to be far more specific than "any interface besides lo". A felix
-# boots with ~47 interfaces, 44 of them virtual (rmnet0-29, dummy0, gre*,
-# gretap0, erspan0, sit0, tunl0, ip*_vti0, ip6*, ifb0/1, umts_dummy), so a
-# not-lo test is true on literally every boot and guards nothing. Requiring all
-# three of:
-#
-#   - a `device` symlink        -> drops all 44 virtual interfaces
-#   - type 1 (ARPHRD_ETHER)     -> drops wpan0, which does have a device AND
-#                                  reports carrier=1
-#   - carrier 1                 -> drops an unplugged/absent dongle
-#
-# plus a device path under a USB *bus* directory (usbN/), leaves exactly the
-# USB-Ethernet dongle. That last part is what separates the dongle
-#   .../11210000.dwc3/xhci-hcd-exynos.5.auto/usb2/2-1/2-1:1.0
-# from the CDC-NCM gadget's usb0
-#   .../11210000.dwc3/gadget.0
-# which is a peer-to-peer link to a host PC and will never see a DHCP server.
-# Without that, a gadget-only boot (phone cabled to a laptop, no dongle) looks
-# like a failed dongle and gets rebooted.
-have_link() {
-    for i in /sys/class/net/*; do
-        [ -e "$i/device" ] || continue
-        [ "$(cat "$i/type" 2>/dev/null)" = "1" ] || continue
-        [ "$(cat "$i/carrier" 2>/dev/null)" = "1" ] || continue
-        case "$(readlink -f "$i/device" 2>/dev/null)" in
-            */usb[0-9]*/*) return 0 ;;
-        esac
-    done
-    return 1
-}
-
+# Give a transient blip a chance to clear before rebooting over it.
 i=0
 while [ "$i" -lt "$DEADLINE" ]; do
     if have_ip; then
+        # Healthy. Commit this slot (this is what marks a slot good — nothing
+        # else does, deliberately: a slot must PROVE it has network before the
+        # bootloader stops being able to roll it back) and clear the counter.
         s=$(cur_slot)
-        "$BOOTCTL" mark-successful ${s:+--slot "$s"} 2>/dev/null || true
+        "$BOOTCTL" mark-successful ${s:+--slot "$s"} >/dev/null 2>&1 || true
         rm -f "$COUNTER"
-        logger -t netcheck-recover "network up; slot ${s:-?} marked successful"
         exit 0
     fi
-    i=$((i+1)); sleep 1
+    i=$((i + 1)); sleep 1
 done
 
-# No address. Before treating that as a failure, check there was ever a link to
-# fail on. A gadget-only or dongle-less boot is a completely normal bench state
-# and must not be "recovered" — rebooting a device nobody attached a NIC to is
-# strictly destructive.
-if ! have_link; then
-    logger -t netcheck-recover "no live wired link after ${DEADLINE}s; nothing to recover (dongle absent / gadget-only boot) — not rebooting"
-    exit 0
-fi
-
-# Failed. Bump the persistent attempt counter before doing anything drastic.
 mkdir -p "$STATE" 2>/dev/null
 attempts=$(cat "$COUNTER" 2>/dev/null)
 case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
@@ -110,24 +63,22 @@ attempts=$((attempts + 1))
 echo "$attempts" > "$COUNTER" 2>/dev/null
 sync
 
-if [ "$attempts" -ge "$MAX_ATTEMPTS" ]; then
-    logger -t netcheck-recover "no IP after ${DEADLINE}s (attempt $attempts/$MAX_ATTEMPTS); giving up and staying up for debugging"
-    exit 1
+if [ "$attempts" -gt "$REBOOT_BEFORE_ROLLBACK" ]; then
+    s=$(cur_slot)
+    other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
+        tolower($1)=="slot:" {s=$2}
+        $1=="active:"     {a[s]=$2}
+        $1=="unbootable:" {ub[s]=$2}
+        END { for (x in a) if (a[x]=="false" && ub[x]=="false") print "yes" }')
+    if [ "$other_ok" = "yes" ]; then
+        log "no IP after ${DEADLINE}s (attempt $attempts); marking slot ${s:-?} unbootable -> rollback"
+        "$BOOTCTL" mark-unbootable ${s:+--slot "$s"} >/dev/null 2>&1 || true
+    else
+        log "no IP after ${DEADLINE}s (attempt $attempts); no usable fallback slot, plain reboot"
+    fi
+else
+    log "no IP after ${DEADLINE}s (attempt $attempts/$REBOOT_BEFORE_ROLLBACK); rebooting"
 fi
 
-logger -t netcheck-recover "no IP after ${DEADLINE}s (attempt $attempts/$MAX_ATTEMPTS); evaluating A/B fallback"
-other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
-    tolower($1)=="slot:" {s=$2}
-    $1=="active:"     {a[s]=$2}
-    $1=="successful:" {ok[s]=$2}
-    $1=="unbootable:" {ub[s]=$2}
-    END { for (x in a) if (a[x]=="false" && ok[x]=="true" && ub[x]=="false") print "yes" }')
-s=$(cur_slot)
-if [ "$other_ok" = "yes" ]; then
-    logger -t netcheck-recover "inactive slot good; marking slot ${s:-?} unbootable + rebooting"
-    "$BOOTCTL" mark-unbootable ${s:+--slot "$s"} 2>/dev/null || true
-else
-    logger -t netcheck-recover "no good fallback; plain reboot to retry"
-fi
 sync
 systemctl reboot -f 2>/dev/null || /sbin/reboot -f

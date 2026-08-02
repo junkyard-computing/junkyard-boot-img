@@ -1,12 +1,12 @@
 [Unit]
-Description=Self-healing network recovery (fall back / reboot if no IP in 240s)
-After=NetworkManager.service network.target
-Wants=network.target
+Description=Network-loss recovery check (run by netcheck-recover.timer)
+# No [Install] section: this is driven by the timer, never enabled directly.
+# It used to be a boot-time oneshot, and that shape cannot catch a device that
+# comes up fine and loses reachability an hour later.
 
 [Service]
 Type=oneshot
 ExecStart=/usr/local/sbin/netcheck-recover
-TimeoutStartSec=600
-
-[Install]
-WantedBy=multi-user.target
+# Must exceed the script's DEADLINE (60s) with margin. The script reboots
+# deliberately; a systemd timeout killing it mid-decision would defeat recovery.
+TimeoutStartSec=180

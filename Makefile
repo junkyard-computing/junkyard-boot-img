@@ -31,8 +31,8 @@ APT_PACKAGES_FILE ?= rootfs/packages.txt
 # Sysroot-relative paths retired from rootfs/overlay/. See the rm -f in
 # .install_packages for why deleting an overlay file is not enough on its own.
 RETIRED_OVERLAY_PATHS ?= \
-	etc/systemd/system.conf.d/10-watchdog.conf \
-	etc/systemd/system/multi-user.target.wants/netcheck-recover.service
+	etc/systemd/system/multi-user.target.wants/netcheck-recover.service \
+	etc/systemd/system/multi-user.target.wants/mark-slot-successful.service
 MODULE_ORDER_PATH ?= rootfs/module_order.txt
 ROOTFS_IMG ?= boot/rootfs.img
 MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
