@@ -515,10 +515,36 @@ install_arm_blobs: .install_packages
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) ldconfig || true
 	just unmount_rootfs
 
+# usbcore.quirks=0bda:8153:k  ("k" = USB_QUIRK_NO_LPM) on the RTL8153 dongle.
+#
+# THIS IS THE FIX FOR THE DONGLE WEDGE, and it is on the cmdline rather than set
+# at runtime because USB quirks are applied at ENUMERATION — a runtime write to
+# /sys/module/usbcore/parameters/quirks only takes effect on the next enumerate.
+#
+# Evidence (xhci tracepoints, 2026-08-02, 490k lines captured across a wedge):
+#
+#   xhci_handle_port_status: port-0: Powered Connected Disabled
+#                            Link:Inactive PortSpeed:4 Change: PLC
+#   xhci_handle_event: ... status 'Stopped' ... slot 1 ep 7
+#
+# Link:Inactive is SS.Inactive — the state a USB3 link enters when link recovery
+# FAILS. The port stays "Powered Connected", which is exactly why the interface
+# kept carrier=1 and NetworkManager reported it activated with an address while
+# nothing moved: both TX and RX counters froze with rxe=0 txe=0 rxd=0, then the
+# driver tore the netdev down ~4s later. The rest of the trace is clean —
+# 127k 'Short Packet', 120k 'Success', 25 stopped events, all at the transitions.
+#
+# The classic trigger for SS.Inactive under load is a failed U1/U2 low-power
+# link-state exit, and NO_LPM disables exactly that for this device. It is
+# scoped to 0bda:8153 so nothing else on the bus is affected.
+#
+# NOT the same thing as the earlier usbcore autosuspend fix (that is DEVICE
+# power management, /sys/.../power/control, and is still needed — see
+# 99-usb-no-autosuspend.rules). This is LINK power management.
 .build_boot: .install_initramfs .install_vendor_firmware
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
-		--cmdline "root=/dev/disk/by-partlabel/super" \
+		--cmdline "root=/dev/disk/by-partlabel/super usbcore.quirks=0bda:8153:k" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
