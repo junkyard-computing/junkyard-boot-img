@@ -329,8 +329,14 @@ all:
 	# one that makes systemd-tmpfiles refuse to work. Chown every directory the
 	# overlay contains, plus the sysroot root itself. Scoped to overlay dirs on
 	# purpose: a blanket chown -R would clobber /home/$(USER_LOGIN).
+	# Built with -printf rather than `-exec chown ... {} +`: GNU find requires a
+	# lone {} in the + form, so embedding it in a longer path is a hard error
+	# ("the '{}' must appear by itself"). abspath also keeps this correct
+	# whether SYSROOT_DIR arrives relative or already absolute — the justfile
+	# passes it absolute, so an added $(CURDIR)/ prefix yielded /work//work/...
 	sudo chown root:root $(SYSROOT_DIR)
-	cd $(OVERLAY_DIR) && sudo find . -type d -exec chown root:root $(CURDIR)/$(SYSROOT_DIR)/{} +
+	cd $(OVERLAY_DIR) && find . -type d -printf '$(abspath $(SYSROOT_DIR))/%P\0' \
+		| sudo xargs -0 --no-run-if-empty chown root:root
 	# RETIRED_OVERLAY_PATHS — files that USED to ship in the overlay and must be
 	# actively removed from the sysroot.
 	#
