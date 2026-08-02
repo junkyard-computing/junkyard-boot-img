@@ -34,3 +34,29 @@ CONFIG_VXLAN=y
 CONFIG_NETFILTER_XT_MATCH_ADDRTYPE=y
 CONFIG_NETFILTER_XT_MATCH_RECENT=y
 CONFIG_IP6_NF_NAT=y
+
+# Shutdown/boot forensics over the network (netconsole).
+# felix has ONE USB-C port, so the physical UART is mutually exclusive with both
+# the ethernet dongle and the USB gadget, and the bootloader overwrites the
+# ramoops CONSOLE region on every boot (its log is the tail of every
+# console-ramoops record). The pmsg zone does not exist either: gs201-rmem.dtsi
+# splits the 4MB ramoops region into console 2MB + pmsg 2MB with no room left
+# for zone headers, and declares no record-size, so dmesg dumps are impossible.
+# netconsole is the only instrument that gets kernel messages OFF the device
+# without a UART and without a persistent buffer to be clobbered. It is what
+# the mainline track uses. NETCONSOLE_DYNAMIC allows retargeting at runtime via
+# configfs (the dongle MAC/IP changes between bench and datacenter).
+#
+# BUILT-IN (=y), not =m, deliberately. kleaf enforces an exact module manifest:
+# building it as a module fails the build with
+#   "The following kernel modules are built but not copied. Add these lines to
+#    the module_outs attribute of @//aosp:kernel_aarch64:
+#        drivers/net/netconsole.ko"
+# and that attribute lives in kernel/source/aosp/BUILD.bazel — the repo-managed
+# GKI tree, so an edit there is reverted by the next `repo sync`. Built-in
+# produces no .ko, so there is nothing to declare. NETCONSOLE_DYNAMIC still
+# gives runtime retargeting through /sys/kernel/config/netconsole, which is what
+# we need anyway since the dongle's MAC and the target IP differ between the
+# bench and the datacenter.
+CONFIG_NETCONSOLE=y
+CONFIG_NETCONSOLE_DYNAMIC=y
