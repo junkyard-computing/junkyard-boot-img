@@ -200,7 +200,12 @@ all:
 .install_vendor_firmware: .debootstrap .sync_vendor_firmware
 	just mount_rootfs
 	sudo mkdir -p $(SYSROOT_DIR)/vendor/firmware
-	sudo rsync -a $(VENDOR_FIRMWARE_STAGE)/firmware/ $(SYSROOT_DIR)/vendor/firmware/
+	# --chown=root:root for the same reason as the overlay rsync: the extracted
+	# staging tree is owned by the build user (uid 1000 = $(USER_LOGIN) on the
+	# device), and `rsync -a` preserves that. Without it the unprivileged user
+	# owns /vendor/firmware and everything in it — including aoc.bin, which the
+	# firmware loader reads and without which the device does not boot.
+	sudo rsync -a --chown=root:root $(VENDOR_FIRMWARE_STAGE)/firmware/ $(SYSROOT_DIR)/vendor/firmware/
 	just unmount_rootfs
 	touch $@
 
