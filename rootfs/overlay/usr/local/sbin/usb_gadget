@@ -16,43 +16,33 @@ GADGET=/sys/kernel/config/usb_gadget/g1
 
 log() { printf "[USB-GADGET] %s\n" "$*" | tee -a /dev/kmsg >/dev/null 2>&1 || true; }
 
-# Refuse to bind unless the Type-C port is positively in DEVICE role.
+# We bind UNCONDITIONALLY — there is deliberately no host/device role gate here.
 #
-# usb-gadget.service gates on ConditionPathExistsGlob=/sys/class/udc/*, which is
-# NOT a host/device discriminator. Measured on 34291FDHS000WV while it was live
-# on the wired network: /sys/class/udc/11210000.dwc3 was present, data_role read
-# "[host] device", and the r8152 dongle was up carrying 192.168.1.108. The UDC
-# node simply exists whenever dwc3 is loaded, either role.
+# The history matters, because the obvious guard is the wrong one. Binding the
+# gadget really did used to take the wired dongle's link down: the device would
+# boot fine but have NO network, showing only usb0's static 10.42.0.1 on the
+# console banner, and disabling this service brought the same unit straight back
+# on 192.168.1.108. The apparent culprit was that usb-gadget.service gates on
+# ConditionPathExistsGlob=/sys/class/udc/*, which is NOT a host/device
+# discriminator — measured on 34291FDHS000WV while it was live on the wired
+# network, /sys/class/udc/11210000.dwc3 was present while data_role read
+# "[host] device". So the fix looked like "only bind when the port is
+# positively [device]".
 #
-# Binding from that state flips the port to device role and takes the dongle's
-# link down with it: the device boots fine but has NO network, showing only
-# usb0's static 10.42.0.1 on the console banner. Confirmed by disabling this
-# service, at which point the same unit came straight back on 192.168.1.108.
+# That gate was the wrong fix for the right problem, and it never worked. Read
+# at boot the role has not resolved yet, so a dongle boot could still be caught
+# mid-settle reading [device], bind, and lose the dongle anyway — which is
+# exactly what stranded 34291FDHS000WV. Adding a settle-poll made it worse: it
+# binds the instant it sees [device] on a port that is on its way to host.
 #
-# The test is deliberately POSITIVE ("is it [device]?") rather than negative
-# ("is it not [host]?") so that an unreadable, absent or still-settling role
-# means we do NOT bind. Failing that way round is the safe one: a missing gadget
-# costs a convenience path that only matters when cabled to a PC, whereas a
-# wrongly-bound gadget destroys the wired network the fleet is reached over.
-# NOTE: no data_role gate here either, deliberately.
-#
-# An earlier version refused to bind unless /sys/class/typec/port0/data_role read
-# "[device]". That was the wrong fix for the right problem, and it never worked:
-# read at boot the role has not resolved yet, so a dongle boot could still be
-# caught mid-settle showing [device], bind, and lose the dongle anyway — which is
-# exactly what stranded 34291FDHS000WV. Adding a settle-poll then made it worse,
-# because it binds the instant it sees [device] on a port heading for host.
-#
-# With soft_connect gone there is nothing to gate: binding attaches a gadget
-# driver to the UDC and it simply sits idle until the port actually becomes a
-# device, which is why ../image can bind unconditionally at boot and be fine on a
-# dongle. Binding early is also what makes cable moves work with no hot-plug
-# trigger at all — the gadget is already bound and just enumerates when a host
-# appears.
-#
-# NOT yet verified on a dongle-attached device; the reference implementation and
-# the removal of soft_connect are the evidence. Confirm with: dongle attached and
-# on the network, run this script, check the dongle keeps its lease.
+# The actual culprit was the soft_connect toggle (see below), which is now gone.
+# With it removed there is nothing to gate: binding merely attaches a gadget
+# driver to the UDC, and it sits idle until the port genuinely becomes a device.
+# That is why the ../image reference binds unconditionally at boot and is fine
+# on a dongle. Binding early is also what makes cable moves work with no
+# hot-plug trigger at all — the gadget is already bound and simply enumerates
+# when a host appears, which is the "automatically switch between dongle and
+# gadget" behaviour the shipped configuration depends on.
 
 # Already bound? nothing to do.
 # Already bound? Skip building and binding — but do NOT exit. Addressing usb0

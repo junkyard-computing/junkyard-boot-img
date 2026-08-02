@@ -5,34 +5,71 @@
 # volume keys, no power button. If the device becomes unreachable over the
 # network there is nobody to press anything, so it has to rescue itself.
 #
-# Escalation, on consecutive failed checks:
-#   1..REBOOT_BEFORE_ROLLBACK   plain reboot   (clears a wedged or hung state)
-#   thereafter                  mark this slot unbootable and reboot, so the
-#                               bootloader falls back to the other slot
+# The policy is deliberately asymmetric, because the two failure modes have
+# very different costs:
 #
-# It deliberately NEVER gives up. An earlier version stopped after 3 attempts to
-# avoid reboot-looping a bench unit; on a device that cannot be touched that
-# turns a recoverable fault into a permanent brick. A reboot loop is noisy but
-# still trying, and rollback may land on a good slot. For bench use, create
-#   /etc/netcheck-recover.disable
-# and this exits immediately.
+#   a slot that has NEVER proven network   -> probably a bad image. Reboot a
+#                                             few times, then mark it
+#                                             unbootable so the bootloader
+#                                             falls back to the other slot.
+#   a slot that HAS proven network before  -> the image is known good, so the
+#                                             fault is outside it (cable,
+#                                             switch, wedged dongle). Reboot,
+#                                             but NEVER roll back.
+#
+# That second rule is the important one. An earlier version escalated to
+# rollback purely on elapsed failures, which meant unplugging a working,
+# already-commissioned device for ~20 minutes would silently mark its good slot
+# unbootable and flip it to whatever the other slot happens to hold (an older
+# image, or stock Android). Losing a cable must not re-image the device.
+#
+# And if a proven slot has had no address since boot at all, we do not reboot
+# either: the overwhelmingly likely cause is that nothing is plugged in, and
+# rebooting will not plug anything in. Once it HAS held an address this boot,
+# losing it is a real fault and does get a reboot.
+#
+# For bench use, create /etc/netcheck-recover.disable and this exits at once.
 set -u
 DEADLINE=${DEADLINE:-60}          # seconds to wait for an address before acting
 REBOOT_BEFORE_ROLLBACK=${REBOOT_BEFORE_ROLLBACK:-3}
+GADGET_IF=${GADGET_IF:-usb0}
 BOOTCTL=/usr/local/bin/pixel-bootctl
 STATE=/var/lib/netcheck-recover
 COUNTER="$STATE/attempts"
+HADIP=/run/netcheck-recover.had-ip   # tmpfs: per-boot, cleared by a reboot
 
 log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg 2>/dev/null; }
 
 [ -e /etc/netcheck-recover.disable ] && { log "disabled by /etc/netcheck-recover.disable"; exit 0; }
 
-# Any global-scope IPv4 that is not a 169.254 autoconf address. Deliberately not
-# tied to a subnet: these devices run on 10.0.0.0/24 in the datacenter and
-# 192.168.1.0/24 on the bench, so hardcoding either prefix would make one of
-# them permanently "failing".
-have_ip() {
-    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | grep -qv '^169\.254\.'
+# A global-scope IPv4 on something OTHER than the gadget. Deliberately not tied
+# to a subnet: these run on 10.0.0.0/24 in the datacenter and 192.168.1.0/24 on
+# the bench, so hardcoding either would make one of them permanently "failing".
+wired_ip() {
+    ip -4 -o addr show scope global 2>/dev/null \
+        | awk -v g="$GADGET_IF" '$2 != g {print $4}' \
+        | grep -qv '^169\.254\.'
+}
+
+# The gadget's 10.42.0.1 is a global-scope address that usb_gadget assigns
+# unconditionally, so its mere presence proves nothing — it is there whether or
+# not a host is on the other end of the cable. Carrier is the discriminator:
+# for CDC-NCM the device side only reports carrier once the host has actually
+# configured the interface. A DHCP lease we handed out is a second positive.
+gadget_host_attached() {
+    [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ] && return 0
+    [ -s /var/lib/misc/dnsmasq.leases ] && return 0
+    return 1
+}
+
+healthy() { wired_ip || gadget_host_attached; }
+
+slot_field() {  # slot_field <field>  -> value for the ACTIVE slot
+    "$BOOTCTL" status 2>/dev/null | awk -v f="$1:" '
+        tolower($1)=="slot:" {s=tolower($2); next}
+        $1=="active:" && $2=="true" {want=s}
+        {v[s FS $1]=$2}
+        END {print v[want FS f]}'
 }
 
 cur_slot() {
@@ -41,20 +78,31 @@ cur_slot() {
         $1=="active:" && $2=="true" {print s; exit}'
 }
 
-# Give a transient blip a chance to clear before rebooting over it.
+# Give a transient blip a chance to clear before acting on it.
 i=0
 while [ "$i" -lt "$DEADLINE" ]; do
-    if have_ip; then
-        # Healthy. Commit this slot (this is what marks a slot good — nothing
-        # else does, deliberately: a slot must PROVE it has network before the
-        # bootloader stops being able to roll it back) and clear the counter.
+    if healthy; then
+        # Healthy. Commit this slot — this is what marks a slot good, and
+        # nothing else does, deliberately: a slot must PROVE it has network
+        # before the bootloader loses the ability to roll it back.
         s=$(cur_slot)
         "$BOOTCTL" mark-successful ${s:+--slot "$s"} >/dev/null 2>&1 || true
+        : > "$HADIP" 2>/dev/null
         rm -f "$COUNTER"
         exit 0
     fi
     i=$((i + 1)); sleep 1
 done
+
+proven=$(slot_field successful)
+[ "$proven" = true ] || proven=false
+
+# Proven slot that has never held an address since boot: nothing is plugged in.
+# Sit still and stay debuggable rather than reboot-looping a working device.
+if [ "$proven" = true ] && [ ! -e "$HADIP" ]; then
+    log "no address since boot, but this slot is already proven good — assuming nothing is plugged in; not rebooting"
+    exit 0
+fi
 
 mkdir -p "$STATE" 2>/dev/null
 attempts=$(cat "$COUNTER" 2>/dev/null)
@@ -63,7 +111,9 @@ attempts=$((attempts + 1))
 echo "$attempts" > "$COUNTER" 2>/dev/null
 sync
 
-if [ "$attempts" -gt "$REBOOT_BEFORE_ROLLBACK" ]; then
+if [ "$proven" = true ]; then
+    log "lost network after having it (attempt $attempts); slot proven good, rebooting without rollback"
+elif [ "$attempts" -gt "$REBOOT_BEFORE_ROLLBACK" ]; then
     s=$(cur_slot)
     other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
         tolower($1)=="slot:" {s=$2}
@@ -71,13 +121,13 @@ if [ "$attempts" -gt "$REBOOT_BEFORE_ROLLBACK" ]; then
         $1=="unbootable:" {ub[s]=$2}
         END { for (x in a) if (a[x]=="false" && ub[x]=="false") print "yes" }')
     if [ "$other_ok" = "yes" ]; then
-        log "no IP after ${DEADLINE}s (attempt $attempts); marking slot ${s:-?} unbootable -> rollback"
+        log "no network after ${DEADLINE}s (attempt $attempts) and this slot never proved network; marking slot ${s:-?} unbootable -> rollback"
         "$BOOTCTL" mark-unbootable ${s:+--slot "$s"} >/dev/null 2>&1 || true
     else
-        log "no IP after ${DEADLINE}s (attempt $attempts); no usable fallback slot, plain reboot"
+        log "no network after ${DEADLINE}s (attempt $attempts); no usable fallback slot, plain reboot"
     fi
 else
-    log "no IP after ${DEADLINE}s (attempt $attempts/$REBOOT_BEFORE_ROLLBACK); rebooting"
+    log "no network after ${DEADLINE}s (attempt $attempts/$REBOOT_BEFORE_ROLLBACK); rebooting"
 fi
 
 sync
