@@ -426,30 +426,16 @@ all:
 	# Strip blacklisted modules so dracut --force-drivers doesn't pull them
 	# into the initramfs despite /etc/modprobe.d/blacklist.conf.
 	#
-	# exynos_seclog is excluded because it is implicated in the boot-time panic
-	# in add_uevent_var. Evidence from 8 consecutive boots of 1.4.0-g2b7cf3f:
-	#
-	#   3 boots logged "exynos-seclog: probe of seclog failed with error -22"
-	#     -> ALL 3 panicked
-	#   5 boots never mentioned seclog at all
-	#     -> ALL 5 were clean
-	#
-	# Not a truncation artifact: every console-ramoops record starts at
-	# t=0.000000 and is 125-355KB against a 2MB buffer, so nothing wrapped.
-	#
-	# The panic is a level-3 translation fault dereferencing an UNMAPPED
-	# vmalloc address as the "%s" of SUBSYSTEM= (x6/x7 spell "SUBSYSTEM="),
-	# reached from userspace: udevadm writes a /sys/.../uevent file ->
-	# uevent_store -> kobject_synth_uevent -> kobject_uevent_env ->
-	# add_uevent_var -> vsnprintf -> string(). seclog's probe-failure path
-	# does vunmap(ldata.virt_addr) — it is the one driver in the log that
-	# unmaps a vmalloc region while failing — which matches the fault class.
-	#
-	# The exact internal mechanism is NOT proven; the correlation and the fault
-	# class are. This exclusion is the testable fix: seclog is TrustZone secure
-	# logging, which this image has no use for, so dropping it costs nothing
-	# and the panic rate across a boot campaign is the measurement.
-	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d; /^exynos_seclog$$/d' $(MODULE_ORDER_PATH)
+	# NOTE: exynos_seclog was excluded here for a while on the theory that it
+	# caused the boot-time add_uevent_var panic — 3 of 8 boots logged
+	# "exynos-seclog: probe of seclog failed with error -22" and exactly those
+	# 3 panicked. That correlation was FALSE. With seclog excluded from this
+	# list AND blacklisted (verified not loaded, and its only trace in the
+	# panicking boot was the reserved-memory node at t=0.000000), the identical
+	# panic recurred — same call path, same faulting address
+	# ffffffc00e1e3568. Do not re-add it on that reasoning; the panic is
+	# something else. See the uevent-panic notes for the live state.
+	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d' $(MODULE_ORDER_PATH)
 	# Prune module/header/boot trees from other kernel versions so a
 	# KERNEL_VERSION bump doesn't accumulate stale ones in the image. (The new
 	# version's initrd is (re)created later in .install_initramfs.)
