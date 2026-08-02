@@ -42,27 +42,81 @@ log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg
 
 [ -e /etc/netcheck-recover.disable ] && { log "disabled by /etc/netcheck-recover.disable"; exit 0; }
 
-# A global-scope IPv4 on something OTHER than the gadget. Deliberately not tied
-# to a subnet: these run on 10.0.0.0/24 in the datacenter and 192.168.1.0/24 on
-# the bench, so hardcoding either would make one of them permanently "failing".
-wired_ip() {
-    ip -4 -o addr show scope global 2>/dev/null \
-        | awk -v g="$GADGET_IF" '$2 != g {print $4}' \
-        | grep -qv '^169\.254\.'
-}
-
-# The gadget's 10.42.0.1 is a global-scope address that usb_gadget assigns
-# unconditionally, so its mere presence proves nothing — it is there whether or
-# not a host is on the other end of the cable. Carrier is the discriminator:
-# for CDC-NCM the device side only reports carrier once the host has actually
-# configured the interface. A DHCP lease we handed out is a second positive.
-gadget_host_attached() {
-    [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ] && return 0
-    [ -s /var/lib/misc/dnsmasq.leases ] && return 0
+# REACHABILITY, not address presence.
+#
+# The previous version asked "is there a global IPv4 on a non-gadget interface?"
+# and "is there anything in dnsmasq.leases?". Both were wrong, and on
+# 2026-08-02 they let a device sit unreachable for ~7 minutes without the
+# recovery logic ever firing once:
+#
+#   * A WEDGED LINK KEEPS ITS ADDRESS. The r8152 dongle stopped passing traffic
+#     in both directions while NetworkManager still reported the connection
+#     `activated` with 192.168.1.108, carrier up, and the kernel logged nothing
+#     at all. `wired_ip()` returned true throughout a total outage.
+#   * THE LEASE FILE IS NEVER PRUNED. dnsmasq.leases had 30 stale entries, so
+#     `[ -s ... ]` was true forever — on any unit that has ever been cabled to a
+#     PC, that single line made healthy() unconditionally true.
+#
+# `journalctl -t netcheck-recover` showed no entries for the whole outage: the
+# timer ran every 5 minutes and concluded "healthy" every time. On a device
+# whose only access is the network, that disables the entire safety net.
+#
+# So: prove we can actually exchange packets with a peer. Ping first; if ICMP is
+# filtered, fall back to whether the neighbour resolved (ARP), which is a weaker
+# but still real proof that L2 works and something answered.
+peer_reachable() {
+    _p="$1"
+    [ -n "$_p" ] || return 1
+    ping -c1 -W2 "$_p" >/dev/null 2>&1 && return 0
+    # Ping may be filtered; the ARP entry is still evidence the peer answered.
+    ip neigh show "$_p" 2>/dev/null | grep -qE 'REACHABLE|DELAY|PROBE|STALE' && return 0
     return 1
 }
 
-healthy() { wired_ip || gadget_host_attached; }
+# Wired path: reachable means the default gateway answers, not that we hold a
+# lease. Subnet-agnostic on purpose (10.0.0.0/24 in the datacenter,
+# 192.168.1.0/24 on the bench), so we ask the routing table rather than
+# hardcoding either.
+wired_reachable() {
+    for _gw in $(ip -4 route show default 2>/dev/null \
+                 | awk -v g="$GADGET_IF" '$5 != g {print $3}'); do
+        peer_reachable "$_gw" && return 0
+    done
+    return 1
+}
+
+# Gadget path: the gadget's 10.42.0.1 is assigned unconditionally by
+# usb_gadget, so its presence proves nothing. Require carrier (for CDC-NCM the
+# device side only sees carrier once a host has configured the link) AND a peer
+# that actually answers — validated live, so a stale lease cannot vote.
+gadget_reachable() {
+    [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ] || return 1
+    for _l in $(awk '{print $3}' /var/lib/misc/dnsmasq.leases 2>/dev/null); do
+        peer_reachable "$_l" && return 0
+    done
+    return 1
+}
+
+# A wired network with NO default gateway (isolated bench switch) cannot be
+# proven either way by pinging a gateway that does not exist. Treat that as
+# healthy-but-unverified rather than escalating: a false "unhealthy" reboot-loops
+# a working device, which is strictly worse than a false "healthy" that merely
+# fails to rescue one. Logged so it is visible rather than silent.
+wired_unverifiable() {
+    [ -z "$(ip -4 route show default 2>/dev/null | awk -v g="$GADGET_IF" '$5 != g {print $3}')" ] || return 1
+    ip -4 -o addr show scope global 2>/dev/null \
+        | awk -v g="$GADGET_IF" '$2 != g {print $4}' | grep -qv '^169\.254\.'
+}
+
+healthy() {
+    wired_reachable && return 0
+    gadget_reachable && return 0
+    if wired_unverifiable; then
+        log "wired address present but no default gateway to probe — cannot verify reachability, not escalating"
+        return 0
+    fi
+    return 1
+}
 
 slot_field() {  # slot_field <field>  -> value for the ACTIVE slot
     "$BOOTCTL" status 2>/dev/null | awk -v f="$1:" '
