@@ -439,6 +439,20 @@ all:
 	# (/vendor/firmware, set by the dtb's /chosen/bootargs) points at.
 	# Without it, the AOC coprocessor retry-loops in dracut and starves
 	# UART RX, so emergency-shell keystrokes are dropped.
+	#
+	# rd.shell=0 rd.emergency=reboot: a dracut failure must REBOOT, never wait
+	# at an interactive shell. The shipped configuration has no screen, no
+	# volume keys and no power button, and the initramfs has no networking, so
+	# an emergency shell is reachable only by someone physically attaching a
+	# UART adapter — which on a fielded unit is nobody. Worse, it is reachable
+	# only in theory even on the bench: the one time dracut actually did fail
+	# here (missing aoc.bin, no /dev/disk/by-partlabel/super) it dropped to an
+	# emergency shell that could not be typed into, because the AOC retry loop
+	# was starving UART RX. So the shell buys nothing and costs everything: a
+	# hang is permanent, whereas a reboot burns a slot-retry and lets the
+	# bootloader roll back to the other slot. Panics already self-recover
+	# (CONFIG_PANIC_TIMEOUT=-1, CONFIG_PANIC_ON_OOPS=y); this closes the
+	# non-panic hang path.
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) dracut \
 		--kver $(KERNEL_VERSION) \
 		--lz4 \
@@ -446,7 +460,7 @@ all:
 		--force \
 		--add "rescue bash rootfs-flash" \
 		--install /vendor/firmware/aoc.bin \
-		--kernel-cmdline "rd.shell" \
+		--kernel-cmdline "rd.shell=0 rd.emergency=reboot" \
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
 	just unmount_rootfs
 	touch $@
