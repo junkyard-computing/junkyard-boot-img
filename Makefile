@@ -316,6 +316,16 @@ all:
 	# → /sys ..."), so tmpfiles.d entries under /sys are skipped with no error.
 	# That is how the USB-autosuspend fix appeared to apply and did nothing.
 	sudo rsync -a --chown=root:root $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
+	# ...and repair the ancestors. --chown only takes effect on entries rsync
+	# actually rewrites, so leaf dirs whose contents changed get fixed while
+	# untouched parents keep whatever ownership a previous (pre---chown) build
+	# gave them. Measured: /etc/systemd/system and /usr/local/sbin came out
+	# uid=0 while `/`, /etc and /usr stayed uid=1000 — and `/` is exactly the
+	# one that makes systemd-tmpfiles refuse to work. Chown every directory the
+	# overlay contains, plus the sysroot root itself. Scoped to overlay dirs on
+	# purpose: a blanket chown -R would clobber /home/$(USER_LOGIN).
+	sudo chown root:root $(SYSROOT_DIR)
+	cd $(OVERLAY_DIR) && sudo find . -type d -exec chown root:root $(CURDIR)/$(SYSROOT_DIR)/{} +
 	# RETIRED_OVERLAY_PATHS — files that USED to ship in the overlay and must be
 	# actively removed from the sysroot.
 	#
