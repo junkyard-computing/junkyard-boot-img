@@ -304,7 +304,18 @@ all:
 	# Apply tracked overlay (usb_gadget, blacklist.conf, custom service, ...).
 	# Units are enabled by the .wants symlinks committed under the overlay's
 	# etc/systemd/system/, not by `systemctl enable` here.
-	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
+	# --chown=root:root is REQUIRED. `rsync -a` preserves SOURCE ownership, and
+	# rootfs/overlay/ is owned by the build user (uid 1000 here) — which is the
+	# same uid as $(USER_LOGIN) on the device. Without this, every directory the
+	# overlay touches lands owned by that unprivileged user, including `/`,
+	# /etc, /usr, /etc/systemd/system, /etc/udev/rules.d and /usr/local/sbin.
+	#
+	# That is a privilege hole on its own, and it also silently breaks
+	# systemd-tmpfiles: it refuses to traverse an unprivileged-owned directory
+	# into a root-owned one ("Detected unsafe path transition / (owned by kalm)
+	# → /sys ..."), so tmpfiles.d entries under /sys are skipped with no error.
+	# That is how the USB-autosuspend fix appeared to apply and did nothing.
+	sudo rsync -a --chown=root:root $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
 	# RETIRED_OVERLAY_PATHS — files that USED to ship in the overlay and must be
 	# actively removed from the sysroot.
 	#
