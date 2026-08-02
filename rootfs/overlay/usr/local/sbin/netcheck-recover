@@ -190,11 +190,45 @@ done
 proven=$(slot_field successful)
 [ "$proven" = true ] || proven=false
 
-# Proven slot that has never held an address since boot: nothing is plugged in.
-# Sit still and stay debuggable rather than reboot-looping a working device.
-if [ "$proven" = true ] && [ ! -e "$HADIP" ]; then
-    log "no address since boot, but this slot is already proven good — assuming nothing is plugged in; not rebooting"
+# Is there any PHYSICAL wired NIC attached at all? This is the discriminator for
+# "nothing is plugged in", and it must be hardware presence — NOT address
+# history.
+#
+# Getting this wrong stranded a device on 2026-08-02. The rule used to be "a
+# proven slot that never held an address since boot must have nothing plugged
+# in, so don't reboot". But the dongle WAS plugged in; it had wedged and come up
+# dead, so no address was ever obtained. netcheck then logged
+#   "no address since boot ... assuming nothing is plugged in; not rebooting"
+# every 5 minutes while the device sat unreachable, and it took a manual reboot
+# to recover — on a unit whose only access is the network, that is the whole
+# failure.
+#
+# A NIC that is present but cannot reach anything is exactly the case we must
+# reboot for. Only genuine absence means "nobody plugged anything in".
+# Requires: a real device symlink (filters the ~44 virtual rmnet/gre/sit
+# interfaces this kernel creates), ARPHRD_ETHER, and not the gadget itself.
+wired_nic_present() {
+    for _d in /sys/class/net/*; do
+        _n=$(basename "$_d")
+        [ "$_n" = "lo" ] && continue
+        [ "$_n" = "$GADGET_IF" ] && continue
+        [ -e "$_d/device" ] || continue
+        [ "$(cat "$_d/type" 2>/dev/null)" = "1" ] || continue
+        return 0
+    done
+    return 1
+}
+
+# Nothing physically attached: sit still and stay debuggable rather than
+# reboot-looping a device that nobody has cabled. Gated on HARDWARE PRESENCE,
+# not on address history — see wired_nic_present() above for why. If a NIC is
+# present but dead, we fall through and reboot, which is the case that matters.
+if [ "$proven" = true ] && [ ! -e "$HADIP" ] && ! wired_nic_present; then
+    log "no wired NIC attached and no address since boot — nothing plugged in; not rebooting"
     exit 0
+fi
+if [ ! -e "$HADIP" ] && wired_nic_present; then
+    log "wired NIC present but never reachable this boot — treating as a dead link, escalating"
 fi
 
 mkdir -p "$STATE" 2>/dev/null
