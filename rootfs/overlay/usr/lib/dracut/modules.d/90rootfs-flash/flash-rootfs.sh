@@ -33,6 +33,46 @@ if ! mount -t ext4 "$UD" "$MNT" 2>/dev/null; then
 fi
 
 if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
+    # INTEGRITY GATE — `[ -s ]` above only proves the file is non-empty, which is
+    # nowhere near enough to bet the rootfs on. Staging is a long network
+    # transfer and is interruptible; setting the flag is a SEPARATE action, so a
+    # partial image plus a flag is an entirely reachable state. Observed for real
+    # on 2026-08-03: a 1.06 GB fragment of a 7.9 GiB image sat in the staging dir
+    # from an interrupted transfer days earlier. Writing that over `super`
+    # produces a truncated filesystem and a device that cannot boot — and since
+    # `super` is NOT slotted there is no rollback, so recovery means fastboot and
+    # physical access to a unit whose whole point is that it has neither.
+    #
+    # Protocol: the updater SHOULD stage `<img>.sha256` next to the image (the
+    # bare hex digest, as produced by `sha256sum <img> | cut -d' ' -f1`). If that
+    # file is present the digest MUST match or the flash is refused. If it is
+    # absent we proceed, so older updaters keep working — but we say so loudly,
+    # because an unverified write is exactly the failure mode above.
+    if [ -s "$MNT/$IMG.sha256" ]; then
+        want=$(cat "$MNT/$IMG.sha256" 2>/dev/null | tr -d ' \t\n\r')
+        info "rootfs-flash: verifying $IMG against staged digest"
+        got=$(sha256sum "$MNT/$IMG" 2>/dev/null | cut -d' ' -f1)
+        if [ -z "$got" ]; then
+            warn "rootfs-flash: sha256sum unavailable -- REFUSING to flash"
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        if [ "$got" != "$want" ]; then
+            warn "rootfs-flash: DIGEST MISMATCH -- refusing to flash $SUPER"
+            warn "rootfs-flash:   staged: $want"
+            warn "rootfs-flash:   actual: $got"
+            # Clear the flag: a corrupt image will not become correct on retry,
+            # and leaving it armed would re-attempt this every single boot.
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        info "rootfs-flash: digest OK"
+    else
+        warn "rootfs-flash: no $IMG.sha256 staged -- writing UNVERIFIED image"
+    fi
+
     info "rootfs-flash: pending flash -> writing $IMG onto $SUPER"
     rm -f "$MNT/$PENDING"
     # Persist the flag removal first. This initramfs may lack sync(1); sysrq is

@@ -22,10 +22,16 @@
 #      while the device is still untouched, so a failure here changes nothing).
 #   4. Boot chain: copy boot/vendor_boot/dtbo and run `pixel-ota update` — writes
 #      the inactive slot and switches the active slot (no reboot).
-#   5. Arm `pixel-ota flash-rootfs --staged --no-reboot` — the in-place rootfs
-#      reflash via systemd's shutdown initramfs.
-#   6. One reboot applies both: the shutdown initramfs dd's the new rootfs onto
-#      `super`, then the bootloader boots the freshly-switched slot.
+#   5. Arm the in-place rootfs reflash: `pixel-ota flash-rootfs --staged
+#      --no-reboot` AND touch `<userdata>/pixel-ota/flash-pending`.
+#      ★ The flag is the part that matters. pixel-ota's own systemd
+#      shutdown-pivot is INERT on these images (dracut-shutdown.service is
+#      /bin/true); the reflash is actually done by the overlay's 90rootfs-flash
+#      dracut PRE-MOUNT hook, which triggers on that flag and nothing else.
+#      Omitting it makes this script silently flash only HALF the update.
+#   6. One reboot applies both: the dracut pre-mount hook writes the staged
+#      image onto `super` before root is mounted (verifying rootfs.img.sha256
+#      first), then the bootloader boots the freshly-switched slot.
 #
 # WARNING: the rootfs reflash is destructive and rollback-free — a bad image
 # bricks the root and needs fastboot/recovery. The boot-chain half is A/B-safe.
@@ -54,9 +60,59 @@ PIXEL_BOOTCTL_BIN="${PIXEL_BOOTCTL_BIN:-$here/rootfs/overlay/usr/local/bin/pixel
 PIXEL_OTA_BIN="${PIXEL_OTA_BIN:-$here/rootfs/overlay/usr/local/bin/pixel-ota}"
 
 SSH_OPTS="${SSH_OPTS:-}"
+
+# RATE LIMIT — conservative pacing for an intermittent, UNEXPLAINED fault.
+# Off by default. Read this before turning it on or quoting a number from it.
+#
+# THE FAULT IT HEDGES AGAINST: the phone's xHCI HOST CONTROLLER dies outright,
+# taking the dongle with it and stranding the unit:
+#     xHCI host not responding to stop endpoint command
+#     xHCI host controller not responding, assume dead / HC died; cleaning up
+#     r8152 ...: Tx status -2        <- consequence, NOT the cause
+# A Stop Endpoint command that fails to retire makes the xHCI core do an
+# unconditional xhci_halt() + xhci_hc_died() (xhci-ring.c), so one stalled
+# endpoint takes the whole bus down. On a fielded unit the network is the only
+# way in, so an OTA that trips this destroys the thing it depends on. That part
+# is well established.
+#
+# ★★ WHAT IS NOT ESTABLISHED: that throughput causes it.
+# An earlier version of this comment asserted a "cliff between 89 and 133 Mb/s"
+# and called the cap load-bearing. THAT WAS WRONG and is retracted. Measured on
+# 34291FDHS000WV 2026-08-03, same unit, same evening:
+#     ~923 Mb/s (line rate, wired source) -> 60s clean, 0 HC deaths
+#     10 consecutive trials, 89 GiB moved -> 0 HC deaths, no reboot
+# The original "cliff" was an artifact of the traffic SOURCE: every early
+# measurement came from a WiFi-attached laptop that could not push past
+# ~133 Mb/s. Rate never was the variable.
+#
+# Also retracted from that era: that the mainline port is immune (at line rate
+# the two tracks are indistinguishable), and that
+# `snps,parkmode-disable-ss-quirk` fixes it (it was already installed for the
+# last observed failure). Real HC deaths that day: 5, all at or before 19:26;
+# none in any later trial. The trigger is still UNIDENTIFIED and the fault is
+# INTERMITTENT — it has produced both quiet and failing phases with no isolated
+# variable, which is why this knob exists at all.
+#
+# WHY IT DEFAULTS OFF: capping at 80 Mb/s makes an 8 GB rootfs push take ~13min
+# instead of ~80s, and there is no evidence it prevents anything. Paying a 10x
+# slowdown for a hedge against a mechanism we have disproven is the wrong trade.
+# Set SCP_RATE_KBIT to a positive value to pace transfers if a unit starts
+# showing HC deaths again — it is a mitigation of last resort, not a fix.
+#
+# ★ UNITS: scp -l is Kbit/s, NOT KB/s. 80000 = 80 Mb/s. Writing -l 700 here
+# (a mistake made once) is 700 Kbit/s ~ 87 KB/s and would take ~25h for an
+# 8 GB rootfs.
+SCP_RATE_KBIT="${SCP_RATE_KBIT:-0}"
+if [ "$SCP_RATE_KBIT" -gt 0 ] 2>/dev/null; then
+	SCP_LIMIT="-l $SCP_RATE_KBIT"
+else
+	SCP_LIMIT=""
+fi
+
 # shellcheck disable=SC2086  # SSH_OPTS is intentionally word-split.
 sshc() { ssh $SSH_OPTS "$HOST" "$@"; }
-scpc() { scp $SSH_OPTS "$@"; }
+# shellcheck disable=SC2086  # SSH_OPTS and SCP_LIMIT are intentionally word-split.
+scpc() { scp $SCP_LIMIT $SSH_OPTS "$@"; }
 log()  { printf '\n>>> %s\n' "$*"; }
 die()  { printf 'flash-ssh: %s\n' "$*" >&2; exit 1; }
 
@@ -120,7 +176,33 @@ sshc "sudo mkdir -p '$stage'"
 # gzip the stream so the image's large zero regions don't cross the wire in
 # full (gzip is Priority:required on the device). sudo sh writes it as root onto
 # userdata, where pixel-ota --staged resolves it back to the userdata partition.
+#
+# NOTE on the rate cap: this path deliberately does NOT go through scpc(), so
+# SCP_RATE_KBIT does not apply. It is safe anyway — what matters for the
+# host-controller bug is the WIRE rate, and the wire carries the COMPRESSED
+# stream. A mostly-empty 7.9 GiB image compresses to ~1 GB, measured at ~1.3
+# MB/s on the wire, far under the ~90 Mb/s cliff. Do not "optimise" this into a
+# raw uncompressed transfer without re-reading the rate-limit comment above.
 gzip -c -- "$ROOTFS_IMG" | sshc "sudo sh -c 'gzip -dc > \"$stage/rootfs.img\"'"
+
+# Stage the digest next to the image so the 90rootfs-flash dracut hook can
+# refuse a truncated write. The hook writes the staged image over `super`, which
+# is NOT slotted — a partial image means an unbootable device with no rollback,
+# recoverable only by fastboot on a unit that by design has no physical access.
+# Staging is a long interruptible transfer and arming the flag is a separate
+# step, so "flag set, image incomplete" is reachable; it was observed for real
+# (a 1.06 GB fragment of a 7.9 GiB image left over from an aborted run).
+#
+# Written AFTER the image so the digest can never look valid for a partial file:
+# if the transfer above dies, no .sha256 exists and the hook flags the write as
+# unverified rather than silently trusting it.
+log "staging rootfs.img.sha256 (integrity gate for the flash hook)"
+rootfs_sha=$(sha256sum -- "$ROOTFS_IMG" | cut -d' ' -f1)
+printf '%s\n' "$rootfs_sha" | sshc "sudo sh -c 'cat > \"$stage/rootfs.img.sha256\"'"
+# Verify the staged copy end-to-end before anything is armed.
+remote_sha=$(sshc "sudo sha256sum '$stage/rootfs.img' | cut -d' ' -f1")
+[ "$remote_sha" = "$rootfs_sha" ] || die "staged rootfs.img digest mismatch (local $rootfs_sha, remote $remote_sha)"
+log "staged rootfs verified: $rootfs_sha"
 
 # 5) Boot chain: flash inactive slot + switch (no reboot) --------------------
 log "boot chain -> inactive slot (pixel-ota update)"
@@ -139,6 +221,30 @@ sshc "sudo pixel-ota update '$rdir'"
 # 6) Arm the in-place rootfs reflash (no reboot) -----------------------------
 log "arming rootfs reflash (pixel-ota flash-rootfs --staged)"
 sshc "sudo pixel-ota flash-rootfs --staged --no-reboot '$stage/rootfs.img'"
+
+# ★ AND set the flag the mechanism that ACTUALLY RUNS keys on.
+#
+# pixel-ota arms its own systemd shutdown-pivot, which is INERT on these images
+# (dracut-shutdown.service is /bin/true here). The reflash is really performed by
+# the overlay's 90rootfs-flash dracut PRE-MOUNT hook, which triggers on
+# `<userdata>/pixel-ota/flash-pending` and nothing else.
+#
+# Without this touch the OTA silently does HALF the job: the boot chain switches
+# slots and comes up fine, so the run looks successful, while `super` is never
+# written and the device keeps running the OLD rootfs. Reproduced end-to-end
+# 2026-08-03 — the hook logged exactly this and correctly declined:
+#     rootfs-flash: hook invoked
+#     rootfs-flash: no pending flash (looked for .../flash-pending + .../rootfs.img)
+# and the device came back on the previous rootfs with flash-ssh reporting
+# success. A silent half-flash is worse than a loud failure: it invites you to
+# conclude the new image is running when it is not.
+#
+# Safe to set unconditionally: the hook clears the flag BEFORE it writes
+# (write-once), so a crash mid-write cannot loop-flash, and a stale flag with no
+# image is a no-op. The digest staged above is what protects the write itself.
+log "arming the dracut pre-mount hook (userdata:/pixel-ota/flash-pending)"
+sshc "sudo touch '$stage/flash-pending' && sudo sync"
+sshc "sudo ls -l '$stage/'" | sed 's/^/    /'
 
 # 7) One reboot applies new slot + rootfs flash ------------------------------
 log "rebooting $HOST (connection will drop)"
