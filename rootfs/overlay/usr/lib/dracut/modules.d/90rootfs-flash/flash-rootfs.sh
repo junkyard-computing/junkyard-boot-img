@@ -64,12 +64,27 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
     # it catches the failure that has actually happened twice here — a truncated
     # staging transfer (a 1.06 GB fragment, and a 457 MB one) — and it is far
     # better than either refusing a good image or writing an unchecked one.
+    #
+    # ★ The "unresolved library" guess above was WRONG, and the way it was wrong
+    # is the lesson. On 35071FDHS0017C (2026-08-04) this hook again reported
+    # "PRESENT but BROKEN" and fell through to the size check — but sha256sum was
+    # fine. `cut` was simply NOT in the initramfs, so `... | cut -d' ' -f1`
+    # produced nothing and the self-test could never match. `tr` *was* present,
+    # which is why the size branch worked and hid the real cause. The self-test
+    # was measuring its own pipeline, not sha256sum.
+    #
+    # So parse with shell parameter expansion instead: no external command, no
+    # second tool that can silently be absent. Anything the integrity gate itself
+    # depends on has to be as close to zero-dependency as possible, because when
+    # it fails it fails toward "cannot verify" — and that is the branch that
+    # decides whether an unverified image gets written over the only rootfs.
     verified=""
 
     # Known vector: sha256 of the empty string.
     _sha_empty=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
     _sha_err=$(printf '' | sha256sum 2>&1 >/dev/null)
-    _sha_probe=$(printf '' | sha256sum 2>/dev/null | cut -d' ' -f1)
+    _sha_probe=$(printf '' | sha256sum 2>/dev/null)
+    _sha_probe=${_sha_probe%% *}
     if [ "$_sha_probe" = "$_sha_empty" ]; then
         _sha_ok=1
     else
@@ -85,7 +100,8 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
     if [ -s "$MNT/$IMG.sha256" ] && [ "$_sha_ok" = 1 ]; then
         want=$(cat "$MNT/$IMG.sha256" 2>/dev/null | tr -d ' \t\n\r')
         info "rootfs-flash: verifying $IMG against staged digest"
-        got=$(sha256sum "$MNT/$IMG" 2>/dev/null | cut -d' ' -f1)
+        got=$(sha256sum "$MNT/$IMG" 2>/dev/null)
+        got=${got%% *}
         if [ "$got" != "$want" ]; then
             warn "rootfs-flash: DIGEST MISMATCH -- refusing to flash $SUPER"
             warn "rootfs-flash:   staged: $want"

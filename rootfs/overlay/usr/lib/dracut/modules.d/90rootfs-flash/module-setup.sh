@@ -31,5 +31,13 @@ install() {
     # installed here and still produced nothing, which made the hook refuse a
     # good image and leave the unit on a mismatched kernel/rootfs pair. The
     # fallback needs a tool that is NOT the one that just failed.
-    inst_multiple cat mount umount mkdir rm sync sha256sum stat
+    #
+    # cut/tr: the hook no longer parses digests with `cut` (it uses shell
+    # parameter expansion, because `cut` turned out to be absent here and that
+    # made the sha256sum self-test fail against its own pipeline rather than
+    # against sha256sum). `tr` is still used to strip whitespace from the staged
+    # .sha256/.size files. Install both anyway — a missing helper in the
+    # integrity gate degrades it silently, which is the one failure mode this
+    # whole hook exists to avoid.
+    inst_multiple cat mount umount mkdir rm sync sha256sum stat cut tr
 }
