@@ -583,8 +583,20 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	# place causes every module to fail MODVERSIONS check against a freshly
 	# rebuilt kernel and kicks the device into a watchdog reboot loop.
 	sudo find $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION) -name '*.ko' -delete 2>/dev/null || true
+	# ...and wipe the UNPACK tree too, not just the sysroot. tar overlays, it never
+	# deletes, so a module dropped from the kernel build survives in
+	# rootfs/unpack/<staging>/ indefinitely and the rsync below copies it straight
+	# back into the sysroot the sweep above just cleaned. Net effect: removing a
+	# module from the build does not remove it from the image, and nothing says so.
+	#
+	# Measured 2026-08-04: clk-acpm-gpu.ko was reverted out of the kernel and the
+	# rebuilt staging archive contained 0 copies of it, yet it still shipped in
+	# rootfs.img (13240 bytes, live inode) because the stale copy in
+	# rootfs/unpack/vendor_dlkm/ was rsynced over the top. The archive was clean,
+	# the sysroot sweep ran, and the module shipped anyway.
 	for staging in vendor_dlkm system_dlkm; \
 	do \
+		sudo rm -rf rootfs/unpack/"$$staging"; \
 		sudo mkdir -p rootfs/unpack/"$$staging" && \
 		sudo tar \
 			-xvzf $(KERNEL_BUILD_DIR)/"$$staging"_staging_archive.tar.gz \
