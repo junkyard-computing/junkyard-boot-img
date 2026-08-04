@@ -236,50 +236,58 @@ all:
 PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune -o -name '*.patch' -print 2>/dev/null | sort)
 
 .apply_kernel_patches: $(PATCH_FILES)
-	# ⚠ TEMPORARY — REMOVE BEFORE SHIPPING (see below).
+	# Decide whether the patched files may be hidden from git's dirty check.
 	#
-	# Pin the scm version BEFORE patching. Patching the `aosp` project dirties
-	# the git tree that CONFIG_LOCALVERSION_AUTO derives the version from, so
-	# the kernel becomes 6.1.124-android14-11-g8769cc47188c-DIRTY. That renames
-	# every /lib/modules/<ver>/ path, which means the patched kernel can no
-	# longer be flashed boot-only: modules + initramfs must be rebuilt in
-	# lockstep or the kernel finds no modules at all — no dongle, no network,
-	# which is exactly what bricked slot B once already.
+	# `-dirty` should mean "there is uncommitted work in this kernel", NOT "a patch
+	# was applied". The patches under kernel/patches/ are tracked, reviewed content
+	# that every build applies, so a tree that differs from HEAD by exactly the
+	# patch set is not drifting and should keep a clean version string. That
+	# matters beyond tidiness: `-dirty` renames every /lib/modules/<ver>/ path, so
+	# a boot-only flash against an existing rootfs finds no modules at all — no
+	# dongle, no network, which is how slot B was bricked once already.
 	#
-	# `setlocalversion --save-scmversion` writes .scmversion, and only when the
-	# file is absent — so running it here, before `git apply`, captures the
-	# CLEAN version and later idempotent re-runs keep it. A repo sync removes
-	# .scmversion and leaves a clean tree, so the next build re-captures it
-	# correctly.
+	# The previous version of this stanza hid the patched files UNCONDITIONALLY,
+	# which bought that stability by making the kernel lie: real uncommitted work
+	# was hidden right alongside the patches. tools/kernel-drift.sh tells the two
+	# apart (see that file for why each test is needed and why the check must clear
+	# --assume-unchanged itself before measuring anything).
 	#
-	# ⚠ This deliberately makes a PATCHED kernel advertise an UNPATCHED version
-	# string. That is a real hazard — this session lost time twice to a version
-	# string that did not reflect the binary — and it is accepted only to keep
-	# the boot-only flash path usable while iterating on the uevent panic.
-	# Before shipping, DELETE this block so the image carries an honest
-	# "-dirty" and do the full rebuild + rootfs cutover that implies.
-	# Hide patched files from git's dirty check with --assume-unchanged.
+	#   clean (0) — tree == HEAD + our patches. Hide them; version stays clean.
+	#   dirty (1) — extra uncommitted work in the kernel project. Leave them
+	#               visible so setlocalversion stamps an honest -dirty.
+	#   fatal (2) — drift that CANNOT reach the version string: another project
+	#               (they feed modules, not the version) or an untracked file
+	#               (setlocalversion's check is -uno). Refuse to build rather than
+	#               emit an image whose contents no version identifies.
 	#
-	# NOT `.scmversion`: kleaf already supplies "-android14-11-g8769cc47188c" by
-	# its own mechanism and APPENDS .scmversion on top, producing
-	#   6.1.124-android14-11-g8769cc47188c-dirty-android14-11-g8769cc47188c
-	# which the build rejects outright ("exceeds 64 characters"). Tried, failed.
-	#
-	# NOT a local commit either: that changes the SHA, so the version moves
-	# anyway — the very thing we are avoiding.
-	#
-	# setlocalversion appends "-dirty" based on git seeing modified files;
-	# --assume-unchanged makes those files invisible to that check while leaving
-	# the patch fully applied on disk. Reverse with --no-assume-unchanged.
-	@for p in $(PATCH_FILES); do \
-		rel=$${p#kernel/patches/}; proj=$$(dirname "$$rel"); \
-		tgt="$(KERNEL_SOURCE_DIR)/$$proj"; \
-		[ -d "$$tgt" ] || continue; \
-		grep -oE '^\+\+\+ b/[^[:space:]]+' "$$p" | sed 's|^+++ b/||' | while read -r f; do \
-			( cd "$$tgt" && git update-index --assume-unchanged "$$f" 2>/dev/null ) || true; \
+	# Nothing here writes .scmversion: kleaf supplies "-android14-11-g8769cc47188c"
+	# by its own mechanism and APPENDS .scmversion on top, producing a string that
+	# blows the 64-character limit. A local commit is no good either — it moves the
+	# SHA, which is the thing being kept stable.
+	@set -e; \
+	verdict=$$(tools/kernel-drift.sh $(KERNEL_SOURCE_DIR) $(PATCH_FILES)) || true; \
+	case "$$verdict" in \
+	clean) \
+		for p in $(PATCH_FILES); do \
+			rel=$${p#kernel/patches/}; proj=$$(dirname "$$rel"); \
+			tgt="$(KERNEL_SOURCE_DIR)/$$proj"; \
+			[ -d "$$tgt" ] || continue; \
+			grep -oE '^\+\+\+ b/[^[:space:]]+' "$$p" | sed 's|^+++ b/||' | while read -r f; do \
+				( cd "$$tgt" && git update-index --assume-unchanged "$$f" 2>/dev/null ) || true; \
+			done; \
 		done; \
-	done
-	@echo "patched files hidden from git dirty check (keeps kernel_version stable)"
+		echo "kernel tree == HEAD + patches: version string stays clean"; \
+		;; \
+	dirty) \
+		echo "kernel tree has uncommitted work beyond our patches — building -dirty."; \
+		echo "  /lib/modules/<ver> will change, so a boot-only flash is NOT valid:"; \
+		echo "  rebuild modules + initramfs and do a full rootfs cutover."; \
+		;; \
+	*) \
+		echo "ERROR: kernel drift cannot be recorded in the version string (see above)."; \
+		exit 1; \
+		;; \
+	esac
 	@set -e; \
 	if [ -z "$(PATCH_FILES)" ]; then \
 		echo "No kernel patches to apply."; \
