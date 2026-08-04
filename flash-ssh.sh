@@ -229,10 +229,31 @@ esac
 # 3) Ensure the tools are on the device (check, copy only if missing) --------
 ensure_bin() {  # <name> <local-path>
 	local name="$1" src="$2"
-	if sshc "command -v '$name' >/dev/null 2>&1 || test -x '/usr/local/bin/$name'"; then
-		log "$name already on $HOST"
+	# ★ Refresh on MISMATCH, not merely when missing.
+	#
+	# "Install only if absent" makes the updater unable to update itself, and that
+	# is not a cosmetic problem: a bug in pixel-ota can then only be fixed by the
+	# rootfs flash that pixel-ota is required to perform. Hit exactly that on
+	# 2026-08-04 — a fleet deploy failed on the one already-A/B device because its
+	# on-device pixel-ota predated the size-based target fix, and no amount of
+	# re-running would ever have replaced it, since the working binary was sitting
+	# inside the image it was refusing to flash.
+	#
+	# Compare by content, not version string: these are static musl binaries with
+	# no --version contract, and a digest cannot disagree with what is actually
+	# installed.
+	local want have
+	want=$(sha256sum "$src" | cut -d' ' -f1)
+	have=$(sshc "sha256sum '/usr/local/bin/$name' 2>/dev/null | cut -d' ' -f1" || true)
+	have=${have//[$'\r\n']/}
+	if [ "$have" = "$want" ]; then
+		log "$name up to date on $HOST"
 	else
-		log "$name missing on $HOST — installing"
+		if [ -n "$have" ]; then
+			log "$name on $HOST differs from the build — replacing"
+		else
+			log "$name missing on $HOST — installing"
+		fi
 		scpc "$src" "$HOST:/tmp/$name"
 		sshc "sudo install -m 0755 '/tmp/$name' '/usr/local/bin/$name' && rm -f '/tmp/$name'"
 	fi
