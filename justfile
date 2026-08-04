@@ -110,7 +110,7 @@ default:
 # KERNEL_VERSION written by .build_kernel. justfile exports are evaluated at
 # parse time, so on a fresh checkout KERNEL_VERSION would be empty without
 # this split.
-all android_kernel_branch="android-gs-felix-6.1-android16" size=_rootfs_size debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000": (clone_kernel_source android_kernel_branch)
+all android_kernel_branch="android-gs-felix-6.1-android16" size=_rootfs_size debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000" fleet_id="": (clone_kernel_source android_kernel_branch)
     {{ _make }} -C {{ justfile_directory() }} .build_kernel
     KVER=$(cat {{ justfile_directory() }}/kernel/kernel_version); \
     {{ _make }} -C {{ justfile_directory() }} .build_boot \
@@ -125,9 +125,11 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size=_rootfs_size deb
     # Always-run provenance stamp (PHONY, recomputed every build) — writes the
     # kernel-bound IMAGE_VERSION into the rootfs so two phones can be told apart
     # by what they actually run. KERNEL_VERSION must be passed so the +k<ver>
-    # suffix reflects this build's kernel, not a stale one.
+    # suffix reflects this build's kernel, not a stale one. FLEET_ID (optional)
+    # additionally stamps /etc/junkyard-fleet, which flash-nmap.sh --fleet checks
+    # before it will write to a device.
     KVER=$(cat {{ justfile_directory() }}/kernel/kernel_version); \
-    {{ _make }} -C {{ justfile_directory() }} stamp_version KERNEL_VERSION=$KVER
+    {{ _make }} -C {{ justfile_directory() }} stamp_version KERNEL_VERSION=$KVER FLEET_ID={{ fleet_id }}
     # Decrypt + install the ARM NDA GPU blobs (Mali Vulkan/OpenCL). PHONY, so it
     # runs every build; warns and skips (never fails) if this builder can't
     # decrypt the blob. See secrets/README.md.
