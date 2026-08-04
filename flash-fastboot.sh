@@ -48,7 +48,29 @@ fb flash vendor_boot vendor_boot.img
 fb erase dtbo
 fb flash dtbo "$DTBO"
 fb erase super
-fb flash super rootfs.img
+# ★ super.img, NOT rootfs.img — this is the FULL FLASH, and it is what leaves the
+# device in a valid A/B state.
+#
+# rootfs.img is one rootfs sized to fit ONE HALF of super. Flashing it here would
+# land it at offset 0 (slot A) and leave slot B holding whatever was there before,
+# so the very first OTA would switch into a half that has never contained a
+# filesystem. super.img is the whole partition with BOTH halves seeded from the
+# same rootfs, which establishes the invariant the design depends on: both halves
+# always contain something bootable.
+#
+# That matters most for the case with no recovery path. A device whose fallback
+# half is garbage looks completely healthy — it boots, it is reachable, nothing
+# reports a problem — right up until an update fails its retries and the
+# bootloader rolls back into an unmountable half. On a unit with no screen, no
+# buttons and no physical access, that is the difference between a failed update
+# and a dead device.
+if [ ! -f super.img ]; then
+	echo "missing super.img — build it with: just build_super_image" >&2
+	echo "(rootfs.img alone is only half of super; flashing it would leave slot B" >&2
+	echo " unseeded and the first OTA would have no valid rollback target.)" >&2
+	exit 1
+fi
+fb flash super super.img
 fb erase vendor_kernel_boot
 # fb oem uart disable
 fb reboot

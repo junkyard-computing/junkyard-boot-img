@@ -377,3 +377,12 @@ build_boot_images:
     {{ _make }} -C {{ justfile_directory() }} .build_boot \
         KERNEL_VERSION=$KVER \
         INITRAMFS_PATH={{ _sysroot_dir }}/boot/initrd.img-$KVER
+
+# Not built by `all`: another 8 GiB of output, and only the fastboot flash and a
+# layout migration use it. See the SUPER_IMG block in the Makefile for why BOTH
+# halves are seeded rather than just slot A.
+#
+# Build the full-flash super.img (whole partition, both halves seeded).
+[group('boot')]
+build_super_image:
+    {{ _make }} -C {{ justfile_directory() }} super_image

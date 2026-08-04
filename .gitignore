@@ -166,6 +166,7 @@ rootfs/module_order.txt
 rootfs/sysroot/
 rootfs/unpack/
 boot/rootfs.img
+boot/super.img
 boot/boot.img
 boot/vendor_boot.img
 

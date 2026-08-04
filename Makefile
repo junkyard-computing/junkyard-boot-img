@@ -55,6 +55,42 @@ RETIRED_OVERLAY_PATHS ?= \
 	etc/systemd/system/multi-user.target.wants/mark-slot-successful.service
 MODULE_ORDER_PATH ?= rootfs/module_order.txt
 ROOTFS_IMG ?= boot/rootfs.img
+
+# ═══ FULL-FLASH IMAGE (`super.img`) ══════════════════════════════════════════
+#
+# `rootfs.img` is ONE rootfs, sized to fit one half of `super`. `super.img` is the
+# whole partition with BOTH halves seeded from it.
+#
+# Two artifacts because there are two different operations:
+#
+#   rootfs.img  ->  an in-layout upgrade: write the INACTIVE half while running,
+#                   switch the boot slot, reboot. Nothing is mounted on that half,
+#                   so this needs no initramfs involvement at all.
+#   super.img   ->  establishing or re-establishing the layout: the initial
+#                   fastboot flash, and a network MIGRATION of a device that is
+#                   still on the old single-rootfs `super`. Both rewrite the whole
+#                   partition, which for a running device means the pre-mount hook,
+#                   because the live root is inside what is being overwritten.
+#
+# ★ Why both halves are seeded rather than just half A: the invariant that makes
+# rootfs A/B worth having is "both halves always contain something bootable". If a
+# migration seeded only the half it boots into, the OTHER half would still hold a
+# fragment of the old 8100 MiB filesystem — an ext4 superblock claiming 8100 MiB
+# inside a 4068 MiB mapping. The device comes up fine, so nothing looks wrong,
+# and the damage only surfaces when the new image fails its retries and the
+# bootloader rolls back into an unmountable half. That is a brick on a unit whose
+# defining property is that nobody can reach it. Seeding both costs one extra
+# 4068 MiB write, once, and makes the first real upgrade rollback-safe.
+#
+# ⚠ SUPER_BYTES is felix's `super` and must match the TARGET device, not the build
+# host. Confirmed identical on all three felixes: 0x1FC800000 = 8136 MiB exactly.
+# The initramfs halves the REAL device at runtime, so a wrong value here does not
+# corrupt anything — it produces an image that does not line up with the mapping,
+# which the hook's fit check then rejects.
+SUPER_IMG   ?= boot/super.img
+SUPER_BYTES ?= 8531214336
+# Half, 4K-aligned exactly as rootfs-slot.sh computes it (sectors/2, minus %8).
+SUPER_HALF_BYTES := $(shell echo $$(( ( ($(SUPER_BYTES)/512/2) - ($(SUPER_BYTES)/512/2) % 8 ) * 512 )))
 MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
 BAZEL ?= kernel/source/tools/bazel
 OVERLAY_DIR ?= rootfs/overlay
@@ -826,3 +862,31 @@ clean_image:
 clean: clean_image
 	rm -f boot/boot.img boot/vendor_boot.img
 	sudo rm -rf rootfs/unpack
+
+# Build the full-flash `super.img`: the whole partition with both halves seeded
+# from $(ROOTFS_IMG). See the SUPER_IMG block near the top for why both.
+#
+# Not part of .build_boot: it is only needed for a fastboot flash or a layout
+# migration, and it is another 8 GiB of build output. `just build_super_image`.
+.PHONY: super_image
+super_image: $(ROOTFS_IMG)
+	@set -e; \
+	half=$(SUPER_HALF_BYTES); \
+	isz=$$(stat -c%s "$(ROOTFS_IMG)"); \
+	if [ "$$isz" -gt "$$half" ]; then \
+		echo "ERROR: $(ROOTFS_IMG) is $$isz bytes but a half of super is only $$half."; \
+		echo "       Lower _rootfs_size in the justfile — an image that does not fit a"; \
+		echo "       half cannot be used for A/B at all, and seeding it here would just"; \
+		echo "       overwrite the start of the other half."; \
+		exit 1; \
+	fi; \
+	echo "super.img: $(SUPER_BYTES) bytes, two halves of $$half, seeded from a $$isz-byte rootfs"; \
+	rm -f "$(SUPER_IMG)"; \
+	truncate -s $(SUPER_BYTES) "$(SUPER_IMG)"; \
+	dd if="$(ROOTFS_IMG)" of="$(SUPER_IMG)" bs=4M conv=notrunc status=none; \
+	: 'seek_bytes, NOT seek in bs units: half/4194304 truncates to 0 whenever the'; \
+	: 'half is not a whole number of blocks, which would stack both copies at'; \
+	: 'offset 0 and leave slot B empty — silently, since the image still builds.'; \
+	: 'It is exact for felix (1017 x 4M) and would not be for another device.'; \
+	dd if="$(ROOTFS_IMG)" of="$(SUPER_IMG)" bs=4M oflag=seek_bytes seek=$$half conv=notrunc status=none; \
+	echo "  wrote $(SUPER_IMG) (apparent $$(stat -c%s "$(SUPER_IMG)"), on disk $$(du -h --apparent-size=never "$(SUPER_IMG)" 2>/dev/null | cut -f1 || du -h "$(SUPER_IMG)" | cut -f1))"
