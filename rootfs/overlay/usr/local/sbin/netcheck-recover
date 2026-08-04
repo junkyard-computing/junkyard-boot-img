@@ -157,18 +157,36 @@ healthy() {
     return 1
 }
 
-slot_field() {  # slot_field <field>  -> value for the ACTIVE slot
-    "$BOOTCTL" status 2>/dev/null | awk -v f="$1:" '
-        tolower($1)=="slot:" {s=tolower($2); next}
-        $1=="active:" && $2=="true" {want=s}
-        {v[s FS $1]=$2}
-        END {print v[want FS f]}'
+# ★ EVERY slot decision here is about the slot we are RUNNING ON, never the one
+# devinfo calls "active". Those are the same in steady state and differ in exactly
+# one window: after an OTA has switched the active slot but before the reboot that
+# boots it. That window is short but it is also precisely when this timer is most
+# likely to fire, because flash-ssh switches the slot and reboots seconds later.
+#
+# Reading "active" there is actively dangerous. Observed 2026-08-04 on
+# 35071FDHS0017C: a deploy switched active to slot A and then failed before
+# rebooting; this timer fired on the still-running slot B, saw a healthy network,
+# and marked *A* successful — certifying a slot that had never booted and whose
+# rootfs half was destroyed. A slot marked successful is one the bootloader has no
+# reason to abandon, so that can silently disarm the rollback it was meant to
+# protect. The whole premise of this script is that a slot must PROVE it has
+# network; only the running slot can prove anything.
+#
+# The running slot comes from the kernel, not from devinfo — androidboot.slot_suffix
+# is what the bootloader actually booted, and it cannot be changed out from under us
+# by a concurrent OTA the way the devinfo active bit can.
+running_slot() {
+    awk -F'"' '/androidboot\.slot_suffix/ {print substr($2, 2); exit}' \
+        /proc/bootconfig 2>/dev/null
 }
 
-cur_slot() {
-    "$BOOTCTL" status 2>/dev/null | awk '
-        tolower($1)=="slot:" {s=tolower($2)}
-        $1=="active:" && $2=="true" {print s; exit}'
+slot_field() {  # slot_field <field>  -> value for the RUNNING slot
+    _rs=$(running_slot)
+    [ -n "$_rs" ] || return 1
+    "$BOOTCTL" status 2>/dev/null | awk -v f="$1:" -v want="$_rs" '
+        tolower($1)=="slot:" {s=tolower($2); next}
+        {v[s FS $1]=$2}
+        END {print v[want FS f]}'
 }
 
 # Give a transient blip a chance to clear before acting on it.
@@ -178,8 +196,9 @@ while [ "$i" -lt "$DEADLINE" ]; do
         # Healthy. Commit this slot — this is what marks a slot good, and
         # nothing else does, deliberately: a slot must PROVE it has network
         # before the bootloader loses the ability to roll it back.
-        s=$(cur_slot)
-        "$BOOTCTL" mark-successful ${s:+--slot "$s"} >/dev/null 2>&1 || true
+        : "no --slot: pixel-bootctl defaults to the RUNNING slot, which is the only
+          one this health check can vouch for"
+        "$BOOTCTL" mark-successful >/dev/null 2>&1 || true
         : > "$HADIP" 2>/dev/null
         rm -f "$COUNTER"
         exit 0
@@ -241,7 +260,7 @@ sync
 if [ "$proven" = true ]; then
     log "lost network after having it (attempt $attempts); slot proven good, rebooting without rollback"
 elif [ "$attempts" -gt "$REBOOT_BEFORE_ROLLBACK" ]; then
-    s=$(cur_slot)
+    s=$(running_slot)
     other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
         tolower($1)=="slot:" {s=$2}
         $1=="active:"     {a[s]=$2}
