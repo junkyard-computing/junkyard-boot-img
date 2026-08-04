@@ -1,9 +1,13 @@
 #!/bin/sh
-# dracut pre-mount hook: reflash the root partition (`super`) from a staged image
-# on `userdata`, BEFORE dracut mounts root. At this point `super` is just a free
+# dracut pre-mount hook: reflash the root filesystem from a staged image on
+# `userdata`, BEFORE dracut mounts root. At that point the target is just a free
 # block device, so this needs no live-root unmount, no systemd shutdown-pivot,
 # and no working dracut-shutdown.service (which is /bin/true on these images) —
 # which makes it the portable rootfs cutover / OTA primitive.
+#
+# Handles BOTH rootfs layouts, deciding by observation rather than configuration:
+# the whole `super` partition on a single-rootfs image, or just the active slot's
+# half on a rootfs-A/B image. See "WHERE THE IMAGE GOES" below.
 #
 # Trigger (set by the userspace updater, e.g. pixel-ota, then `reboot`):
 #   userdata:/pixel-ota/rootfs.img      the raw rootfs image to write to super
@@ -15,6 +19,7 @@
 command -v info >/dev/null 2>&1 || . /lib/dracut-lib.sh
 
 SUPER=/dev/disk/by-partlabel/super
+SLOTDEV=/dev/mapper/rootfs
 UD=/dev/disk/by-partlabel/userdata
 MNT=/rootfs-flash
 PENDING=pixel-ota/flash-pending
@@ -25,6 +30,41 @@ info "rootfs-flash: hook invoked"
 udevadm settle --timeout=10 2>/dev/null
 [ -b "$SUPER" ] || { info "rootfs-flash: $SUPER not present, skip"; return 0; }
 [ -b "$UD" ]    || { info "rootfs-flash: $UD not present, skip"; return 0; }
+
+# ═══ WHERE THE IMAGE GOES: whole `super`, or this slot's half ════════════════
+#
+# Both layouts have to work from one hook, because the same tooling updates
+# devices running either. The choice is made by looking, not by a flag:
+#
+#   90rootfs-slot   initqueue/settled 30   maps the active half as $SLOTDEV
+#   90rootfs-flash  pre-mount        50    (this hook)
+#
+# dracut runs initqueue/settled while it waits for root= to appear, and pre-mount
+# only once it has. So by the time we run, $SLOTDEV exists if and only if THIS
+# initramfs does rootfs A/B. That makes the two modules impossible to disagree:
+# an initramfs that maps halves also writes halves, one that does not, does not.
+# A build flag or an image marker could drift out of sync with the initramfs
+# actually running; this cannot.
+#
+# Writing through the mapper is also what makes the bound real. dm-linear only
+# maps `half` sectors, so an oversized image fails AT THE DEVICE instead of
+# running past the end of slot A and into slot B — i.e. into the copy that
+# rollback depends on. The fit check below then becomes an early, legible error
+# rather than the only thing standing between a too-big image and a destroyed
+# rollback target.
+#
+# Slot semantics come out right for free: the bootloader has already selected the
+# boot slot, 90rootfs-slot mapped THAT slot's half, so we write the half we are
+# about to boot from and leave the other one holding the previous rootfs. If this
+# boot fails, the bootloader's existing retry/rollback lands on the other slot and
+# finds it intact — which is the whole point, and needs nothing from pixel-bootctl.
+if [ -b "$SLOTDEV" ]; then
+    TARGET=$SLOTDEV
+    info "rootfs-flash: rootfs A/B active -- target is this slot's half ($TARGET)"
+else
+    TARGET=$SUPER
+    info "rootfs-flash: no slot mapping -- target is the whole partition ($TARGET)"
+fi
 
 mkdir -p "$MNT"
 if ! mount -t ext4 "$UD" "$MNT" 2>/dev/null; then
@@ -103,7 +143,7 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
         got=$(sha256sum "$MNT/$IMG" 2>/dev/null)
         got=${got%% *}
         if [ "$got" != "$want" ]; then
-            warn "rootfs-flash: DIGEST MISMATCH -- refusing to flash $SUPER"
+            warn "rootfs-flash: DIGEST MISMATCH -- refusing to flash $TARGET"
             warn "rootfs-flash:   staged: $want"
             warn "rootfs-flash:   actual: $got"
             # Clear the flag: a corrupt image will not become correct on retry,
@@ -126,7 +166,7 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
             return 0
         fi
         if [ "$got_sz" != "$want_sz" ]; then
-            warn "rootfs-flash: SIZE MISMATCH -- refusing to flash $SUPER"
+            warn "rootfs-flash: SIZE MISMATCH -- refusing to flash $TARGET"
             warn "rootfs-flash:   staged: $want_sz bytes"
             warn "rootfs-flash:   actual: $got_sz bytes"
             rm -f "$MNT/$PENDING"; sync 2>/dev/null
@@ -150,7 +190,7 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
 
     # FIT CHECK — the image must not be larger than what we are writing it onto.
     # Distinct from the integrity gate above: a digest proves the image is intact,
-    # not that it lands somewhere big enough to hold it. `cat img > $SUPER` stops
+    # not that it lands somewhere big enough to hold it. `cat img > $TARGET` stops
     # at ENOSPC having already overwritten the start of the partition, which
     # leaves a truncated filesystem — the same unbootable, no-rollback outcome
     # the digest gate exists to prevent, reached a different way.
@@ -161,13 +201,13 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
     # assuming the partition size) is what makes the check keep working once
     # 90rootfs-slot maps a half.
     isz=$(stat -c %s "$MNT/$IMG" 2>/dev/null) || isz=
-    dsz=$(blockdev --getsize64 "$SUPER" 2>/dev/null) || dsz=
+    dsz=$(blockdev --getsize64 "$TARGET" 2>/dev/null) || dsz=
     case "$isz:$dsz" in
         *[!0-9:]*|:*|*:)
-            warn "rootfs-flash: could not size image or $SUPER -- skipping fit check" ;;
+            warn "rootfs-flash: could not size image or $TARGET -- skipping fit check" ;;
         *)
             if [ "$isz" -gt "$dsz" ]; then
-                warn "rootfs-flash: image $isz > $SUPER $dsz -- REFUSING to write"
+                warn "rootfs-flash: image $isz > $TARGET $dsz -- REFUSING to write"
                 rm -f "$MNT/$PENDING"; sync 2>/dev/null
                 umount "$MNT" 2>/dev/null
                 return 0
@@ -175,13 +215,13 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
             info "rootfs-flash: fit ok ($isz <= $dsz)" ;;
     esac
 
-    info "rootfs-flash: pending flash -> writing $IMG onto $SUPER"
+    info "rootfs-flash: pending flash -> writing $IMG onto $TARGET"
     rm -f "$MNT/$PENDING"
     # Persist the flag removal first. This initramfs may lack sync(1); sysrq is
     # always-enabled via the kernel cmdline, and 's' syncs all filesystems.
     sync 2>/dev/null
     echo s > /proc/sysrq-trigger 2>/dev/null
-    if cat "$MNT/$IMG" > "$SUPER"; then
+    if cat "$MNT/$IMG" > "$TARGET"; then
         info "rootfs-flash: write complete"
     else
         warn "rootfs-flash: write FAILED -- super may be inconsistent"
