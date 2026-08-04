@@ -196,9 +196,16 @@ gzip -c -- "$ROOTFS_IMG" | sshc "sudo sh -c 'gzip -dc > \"$stage/rootfs.img\"'"
 # Written AFTER the image so the digest can never look valid for a partial file:
 # if the transfer above dies, no .sha256 exists and the hook flags the write as
 # unverified rather than silently trusting it.
-log "staging rootfs.img.sha256 (integrity gate for the flash hook)"
+log "staging rootfs.img.sha256 + .size (integrity gate for the flash hook)"
 rootfs_sha=$(sha256sum -- "$ROOTFS_IMG" | cut -d' ' -f1)
 printf '%s\n' "$rootfs_sha" | sshc "sudo sh -c 'cat > \"$stage/rootfs.img.sha256\"'"
+# Size is the FALLBACK the hook uses when sha256sum is unusable in the
+# initramfs. That happened for real on 35041FDHS0032G: sha256sum was installed
+# but produced nothing, the hook refused a good image, and the unit ended up
+# with a new kernel on the old rootfs. Size is weaker than a digest but catches
+# the failure that actually occurs here — a truncated staging transfer.
+rootfs_size=$(stat -c%s -- "$ROOTFS_IMG")
+printf '%s\n' "$rootfs_size" | sshc "sudo sh -c 'cat > \"$stage/rootfs.img.size\"'"
 # Verify the staged copy end-to-end before anything is armed.
 remote_sha=$(sshc "sudo sha256sum '$stage/rootfs.img' | cut -d' ' -f1")
 [ "$remote_sha" = "$rootfs_sha" ] || die "staged rootfs.img digest mismatch (local $rootfs_sha, remote $remote_sha)"

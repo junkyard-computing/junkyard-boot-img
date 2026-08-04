@@ -25,7 +25,11 @@ install() {
     # The hook needs these in the initramfs. The base image's busybox/util set
     # lacks sync(1); pull it in so the hook can flush without relying on sysrq.
     #
-    # sha256sum is required for the integrity check in flash-rootfs.sh. Without
-    # it the hook would fall back to writing an unverified image over `super`.
-    inst_multiple cat mount umount mkdir rm sync sha256sum
+    # sha256sum: primary integrity check in flash-rootfs.sh.
+    # stat: the SIZE fallback, used when sha256sum turns out to be unusable at
+    # runtime. That is not hypothetical — on 35041FDHS0032G sha256sum was
+    # installed here and still produced nothing, which made the hook refuse a
+    # good image and leave the unit on a mismatched kernel/rootfs pair. The
+    # fallback needs a tool that is NOT the one that just failed.
+    inst_multiple cat mount umount mkdir rm sync sha256sum stat
 }

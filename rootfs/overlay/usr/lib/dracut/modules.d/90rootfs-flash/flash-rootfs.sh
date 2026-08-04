@@ -43,21 +43,49 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
     # `super` is NOT slotted there is no rollback, so recovery means fastboot and
     # physical access to a unit whose whole point is that it has neither.
     #
-    # Protocol: the updater SHOULD stage `<img>.sha256` next to the image (the
-    # bare hex digest, as produced by `sha256sum <img> | cut -d' ' -f1`). If that
-    # file is present the digest MUST match or the flash is refused. If it is
-    # absent we proceed, so older updaters keep working — but we say so loudly,
-    # because an unverified write is exactly the failure mode above.
-    if [ -s "$MNT/$IMG.sha256" ]; then
+    # Protocol: the updater stages `<img>.sha256` (bare hex digest) and
+    # `<img>.size` (decimal byte count) next to the image.
+    #
+    # ★ TWO-TIER, because "cannot verify" MUST NOT mean "silently do nothing".
+    #
+    # The first version treated empty sha256sum output as "tool unavailable" and
+    # REFUSED. On 35041FDHS0032G (2026-08-04) that turned a perfectly good OTA
+    # into a no-op: the hook ran, printed "sha256sum unavailable -- REFUSING",
+    # cleared the flag, and left the unit with a NEW AOSP kernel on the OLD
+    # mainline rootfs — no matching /lib/modules, so no NIC, reachable only over
+    # the USB gadget with a physical cable. The binary was demonstrably PRESENT
+    # in that initramfs (usr/bin/sha256sum); it just produced nothing, and it
+    # did so in ~7s, far too fast to have hashed 8 GiB. So it ran and FAILED
+    # (most likely an unresolved library), and an empty result cannot be read as
+    # "missing".
+    #
+    # Now: self-test sha256sum against a known vector, keep its stderr, and fall
+    # back to a SIZE check when it is unusable. Size is weaker than a digest but
+    # it catches the failure that has actually happened twice here — a truncated
+    # staging transfer (a 1.06 GB fragment, and a 457 MB one) — and it is far
+    # better than either refusing a good image or writing an unchecked one.
+    verified=""
+
+    # Known vector: sha256 of the empty string.
+    _sha_empty=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    _sha_err=$(printf '' | sha256sum 2>&1 >/dev/null)
+    _sha_probe=$(printf '' | sha256sum 2>/dev/null | cut -d' ' -f1)
+    if [ "$_sha_probe" = "$_sha_empty" ]; then
+        _sha_ok=1
+    else
+        _sha_ok=0
+        if [ -x /usr/bin/sha256sum ] || [ -x /bin/sha256sum ]; then
+            warn "rootfs-flash: sha256sum is PRESENT but BROKEN (self-test failed)"
+        else
+            warn "rootfs-flash: sha256sum is NOT INSTALLED in the initramfs"
+        fi
+        [ -n "$_sha_err" ] && warn "rootfs-flash:   error: $_sha_err"
+    fi
+
+    if [ -s "$MNT/$IMG.sha256" ] && [ "$_sha_ok" = 1 ]; then
         want=$(cat "$MNT/$IMG.sha256" 2>/dev/null | tr -d ' \t\n\r')
         info "rootfs-flash: verifying $IMG against staged digest"
         got=$(sha256sum "$MNT/$IMG" 2>/dev/null | cut -d' ' -f1)
-        if [ -z "$got" ]; then
-            warn "rootfs-flash: sha256sum unavailable -- REFUSING to flash"
-            rm -f "$MNT/$PENDING"; sync 2>/dev/null
-            umount "$MNT" 2>/dev/null
-            return 0
-        fi
         if [ "$got" != "$want" ]; then
             warn "rootfs-flash: DIGEST MISMATCH -- refusing to flash $SUPER"
             warn "rootfs-flash:   staged: $want"
@@ -69,8 +97,39 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
             return 0
         fi
         info "rootfs-flash: digest OK"
-    else
-        warn "rootfs-flash: no $IMG.sha256 staged -- writing UNVERIFIED image"
+        verified=digest
+    fi
+
+    if [ -z "$verified" ] && [ -s "$MNT/$IMG.size" ]; then
+        want_sz=$(cat "$MNT/$IMG.size" 2>/dev/null | tr -d ' \t\n\r')
+        got_sz=$(stat -c%s "$MNT/$IMG" 2>/dev/null)
+        if [ -z "$got_sz" ]; then
+            warn "rootfs-flash: cannot stat $IMG -- REFUSING to flash"
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        if [ "$got_sz" != "$want_sz" ]; then
+            warn "rootfs-flash: SIZE MISMATCH -- refusing to flash $SUPER"
+            warn "rootfs-flash:   staged: $want_sz bytes"
+            warn "rootfs-flash:   actual: $got_sz bytes"
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        warn "rootfs-flash: digest unusable; SIZE check passed ($got_sz bytes) -- proceeding"
+        verified=size
+    fi
+
+    if [ -z "$verified" ]; then
+        if [ -s "$MNT/$IMG.sha256" ] || [ -s "$MNT/$IMG.size" ]; then
+            # The updater intended verification and we could not do any of it.
+            warn "rootfs-flash: verification requested but IMPOSSIBLE -- REFUSING to flash"
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        warn "rootfs-flash: no $IMG.sha256 / .size staged -- writing UNVERIFIED image"
     fi
 
     info "rootfs-flash: pending flash -> writing $IMG onto $SUPER"
