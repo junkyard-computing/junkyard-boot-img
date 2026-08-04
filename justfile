@@ -160,6 +160,18 @@ clone_kernel_source android_kernel_branch="android-gs-felix-6.1-android16":
     if [ ! -e custom_defconfig_mod ]; then \
         ln -s ../custom_defconfig_mod ./; \
     fi
+    # A sync reverts everything under kernel/source, including the tree patches
+    # in kernel/patches/. Drop their sentinel so the next build re-applies them
+    # instead of trusting a stale "already done" marker and quietly building an
+    # unpatched kernel.
+    #
+    # Deliberately NOT removing .build_kernel here. .build_kernel depends on
+    # .apply_kernel_patches, so re-applying patches already makes the kernel
+    # out of date and it rebuilds on its own. Deleting it outright forced a
+    # full kernel rebuild on EVERY `just all` (which always depends on this
+    # recipe) — expensive, and it is how the kernel/kernel_version blanking bug
+    # got triggered in the first place.
+    rm -f {{ justfile_directory() }}/.apply_kernel_patches
 
 # Lock the kernel source to its current per-project SHAs by regenerating
 # kernel/kernel-manifest.xml from the synced tree. Commit the result; thereafter
@@ -176,7 +188,8 @@ pin_kernel_source:
 [working-directory: 'kernel/source']
 clean_kernel: clone_kernel_source
     {{ _bazel }} clean --expunge
-    rm -f {{ justfile_directory() }}/.build_kernel
+    rm -f {{ justfile_directory() }}/.build_kernel \
+          {{ justfile_directory() }}/.apply_kernel_patches
 
 # Print a diff showing what the custom fragment would change vs. gki_defconfig.
 [group('kernel')]
@@ -191,6 +204,13 @@ config_kernel: clone_kernel_source
 [group('kernel')]
 build_kernel: clone_kernel_source
     {{ _make }} -C {{ justfile_directory() }} .build_kernel
+
+# Idempotent; .build_kernel already depends on this, so a normal build is
+# patched automatically. Use this to re-apply by hand after a `repo sync`.
+# A patch that neither applies nor is already applied aborts loudly.
+[group('kernel')]
+apply_kernel_patches:
+    {{ _make }} -C {{ justfile_directory() }} .apply_kernel_patches
 
 # Create the empty ext4 rootfs image.
 [group('rootfs')]

@@ -168,6 +168,7 @@ boot/vendor_boot.img
 # Build-pipeline sentinel files written by the Makefile.
 .create_image
 .debootstrap
+.apply_kernel_patches
 .build_kernel
 .sync_vendor_firmware
 .install_vendor_firmware

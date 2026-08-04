@@ -181,7 +181,62 @@ all:
 # and they abort with "FATAL: this action must be executed in a sandbox!".
 # NOTE: per the kleaf docs, run `tools/bazel clean` if you change --strategy/--config,
 # else stale cached action outputs cause confusing failures.
-.build_kernel: kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_defconfig_mod/custom_defconfig
+# Apply the tree patches under kernel/patches/ to the repo-managed checkout.
+#
+# WHY THIS STAGE EXISTS: `kernel/source/` is a `repo` checkout whose .gitignore
+# ignores everything, so nothing edited in there is tracked by this repo. A
+# `repo sync` / fresh `clone_kernel_source` silently reverts local kernel edits
+# and the build then succeeds against the UNPATCHED tree with no error at all —
+# the same silent-degradation shape as the sentinel and gitlink traps elsewhere
+# in this file. Kconfig already survives syncs via custom_defconfig_mod; device
+# tree and source changes had no such mechanism, so they live here as patches.
+#
+# LAYOUT: kernel/patches/<repo-project-path>/NNNN-*.patch, e.g.
+#   kernel/patches/private/devices/google/gs201/0001-....patch
+# `repo` makes each project its own git, so a single `git apply` cannot span
+# them; the directory under kernel/patches/ names the project the patch applies
+# inside, and each patch is -p1 relative to that project root.
+#
+# IDEMPOTENT + FAIL-LOUD: already-applied patches are detected with
+# `git apply --check --reverse` and skipped, so re-running is safe. A patch that
+# neither applies nor is already applied ABORTS the build — a kernel patch that
+# silently no-ops is exactly what this stage exists to prevent.
+# NOTE the -path prune: kernel/patches/rejected/ holds patches that were built,
+# flashed and MEASURED not to work. They are kept as documentation so nobody
+# re-derives them, and they must NOT be applied. Without this exclusion the
+# stage derives a project path of "kernel/source/rejected", which does not
+# exist, and aborts the whole build.
+PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune -o -name '*.patch' -print 2>/dev/null | sort)
+
+.apply_kernel_patches: $(PATCH_FILES)
+	@set -e; \
+	if [ -z "$(PATCH_FILES)" ]; then \
+		echo "No kernel patches to apply."; \
+	fi; \
+	for p in $(PATCH_FILES); do \
+		abs=$$(readlink -f "$$p"); \
+		rel=$${p#kernel/patches/}; \
+		proj=$$(dirname "$$rel"); \
+		tgt="$(KERNEL_SOURCE_DIR)/$$proj"; \
+		if [ ! -d "$$tgt" ]; then \
+			echo "ERROR: patch target project missing: $$tgt"; \
+			echo "       (run 'just clone_kernel_source' first)"; \
+			exit 1; \
+		fi; \
+		if (cd "$$tgt" && git apply --check --reverse "$$abs" >/dev/null 2>&1); then \
+			echo "already applied: $$rel"; \
+		elif (cd "$$tgt" && git apply --check "$$abs" >/dev/null 2>&1); then \
+			(cd "$$tgt" && git apply "$$abs"); \
+			echo "APPLIED: $$rel"; \
+		else \
+			echo "ERROR: $$rel does not apply to $$tgt and is not already applied."; \
+			echo "       The kernel tree may have moved; refresh the patch."; \
+			exit 1; \
+		fi; \
+	done
+	touch $@
+
+.build_kernel: .apply_kernel_patches kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_defconfig_mod/custom_defconfig
 	cd $(KERNEL_SOURCE_DIR); $(BAZEL) run \
 		--config=use_source_tree_aosp \
 		--config=stamp \
@@ -190,7 +245,36 @@ all:
 		--defconfig_fragment=//custom_defconfig_mod:custom_defconfig \
 		//private/devices/google/felix:gs201_felix_dist
 	@echo "Updating kernel version string"
-	strings $(KERNEL_BUILD_DIR)/Image | grep "Linux version" | head -n 1 | awk '{print $$3}' > kernel/kernel_version
+	# Derive KERNEL_VERSION from the module staging archive, NOT from `strings Image`.
+	#
+	# The old form was:
+	#     strings $(KERNEL_BUILD_DIR)/Image | grep "Linux version" | head -n1 | awk '{print $$3}' > kernel/kernel_version
+	# and it BLANKS the file in two silent ways, both observed 2026-08-03:
+	#  1. `Image` is an arm64 EFI zboot image (magic 4d5a = "MZ"), i.e. a
+	#     COMPRESSED kernel. It contains no "Linux version" banner at all, so
+	#     grep matches nothing — with or without `strings -a`.
+	#  2. `strings` (binutils) is not present in every build environment used
+	#     here. In a pipeline a missing `strings` still leaves the exit status
+	#     of `awk` (0), so make sees SUCCESS while `>` truncates the file.
+	# Either way kernel/kernel_version becomes EMPTY, every downstream path
+	# becomes `lib/modules//...`, and the build dies two stages later in
+	# .install_kernel with a confusing "modules.order: No such file" — after
+	# `find $(SYSROOT_DIR)/lib/modules/ -name '*.ko' -delete` has already run
+	# against the whole module tree.
+	#
+	# The staging archive is the right source: it is the same artifact
+	# .install_kernel unpacks, so the version can never disagree with the
+	# directory the modules actually land in. No binutils dependency.
+	@KVER=$$(tar tzf $(KERNEL_BUILD_DIR)/vendor_dlkm_staging_archive.tar.gz 2>/dev/null \
+	           | grep -oE 'lib/modules/[^/]+' | head -n 1 | cut -d/ -f3); \
+	if [ -z "$$KVER" ]; then \
+		echo "ERROR: could not determine kernel version from vendor_dlkm_staging_archive.tar.gz"; \
+		echo "       REFUSING to blank kernel/kernel_version (an empty value breaks"; \
+		echo "       every /lib/modules/<ver>/ path and wipes the module tree)."; \
+		exit 1; \
+	fi; \
+	echo "  kernel version: $$KVER"; \
+	printf '%s\n' "$$KVER" > kernel/kernel_version
 	touch $@
 
 .sync_vendor_firmware:
@@ -456,6 +540,33 @@ all:
 	# Without it, the AOC coprocessor retry-loops in dracut and starves
 	# UART RX, so emergency-shell keystrokes are dropped.
 	#
+	# rd.udev.children-max=4 is an EXPERIMENT against the add_uevent_var panic,
+	# not a settled fix. That panic fires on ~40% of boots (measured: 5 of 12 in
+	# one reboot campaign, including three consecutive), always at t~6-7s, always
+	# Comm: udevadm, always the same path:
+	#   uevent_store -> kobject_synth_uevent -> kobject_uevent_env
+	#     -> add_uevent_var -> vsnprintf -> string()
+	# dereferencing an UNMAPPED address while formatting SUBSYSTEM=%s.
+	#
+	# Two things point at a coldplug race rather than one bad device:
+	#   * it is NOT reproducible at runtime — writing add AND change to all 3286
+	#     /sys/.../uevent files never faults on a settled system
+	#   * it only happens inside the initramfs, where dracut force-loads 324
+	#     modules WHILE udev processes events concurrently
+	# The faulting address (0xffffffc00e1e3568) is constant across boots and days
+	# and lies in the general vmalloc area — NOT in module memory (modules live
+	# at 0xffffffd1e4xxxxxx here), so "a module unloaded and left a dangling
+	# name pointer" is ruled out.
+	#
+	# Limiting udev workers reduces that concurrency. If the panic rate collapses
+	# the race is confirmed and this is a usable mitigation; if it does not, the
+	# race hypothesis is wrong, which is equally worth knowing.
+	#
+	# 4, not 1, deliberately: rd.udev.children-max=1 previously serialized ~9,700
+	# coldplug events and took the initrd from 4.6s to 2m14s
+	# (see the "random boot hang" investigation). Measure boot time alongside the
+	# panic rate — a fix that trades a 40% panic for a 2-minute boot is not a fix.
+	#
 	# rd.shell=0 rd.emergency=reboot: a dracut failure must REBOOT, never wait
 	# at an interactive shell. The shipped configuration has no screen, no
 	# volume keys and no power button, and the initramfs has no networking, so
@@ -515,36 +626,41 @@ install_arm_blobs: .install_packages
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) ldconfig || true
 	just unmount_rootfs
 
-# usbcore.quirks=0bda:8153:k  ("k" = USB_QUIRK_NO_LPM) on the RTL8153 dongle.
+# NO usbcore.quirks here — see below.
 #
-# THIS IS THE FIX FOR THE DONGLE WEDGE, and it is on the cmdline rather than set
-# at runtime because USB quirks are applied at ENUMERATION — a runtime write to
-# /sys/module/usbcore/parameters/quirks only takes effect on the next enumerate.
+# RETIRED 2026-08-03: `usbcore.quirks=0bda:8153:k` (USB_QUIRK_NO_LPM) was added
+# believing the wedge was a failed U1/U2 low-power link-state exit on the
+# RTL8153. That premise is dead, twice over:
 #
-# Evidence (xhci tracepoints, 2026-08-02, 490k lines captured across a wedge):
+#  1. The host controller disables USB2 LPM on its own regardless — the boot log
+#     says `usb usb2: We don't know the algorithms for LPM for this host,
+#     disabling LPM` — and the AOSP DT already sets snps,dis-u1-entry-quirk and
+#     snps,dis-u2-entry-quirk, so U1/U2 ENTRY was never happening either.
+#  2. 8 GiB transferred cleanly with quirks=[] , and the wedge still reproduced
+#     with the quirk in place.
 #
-#   xhci_handle_port_status: port-0: Powered Connected Disabled
-#                            Link:Inactive PortSpeed:4 Change: PLC
-#   xhci_handle_event: ... status 'Stopped' ... slot 1 ep 7
+# ★ THE SS.Inactive EVIDENCE WAS RIGHT; ONLY THE FIX WAS WRONG.
+# Tracepoints captured 2026-08-03 across a real failure show the SuperSpeed LINK
+# dying FIRST, and the controller trouble following 140ms later:
+#     329.981  xhci_handle_port_status: port-0: Powered Connected Disabled
+#                                       Link:Inactive PortSpeed:4 Change: PLC
+#     330.121  xhci_urb_dequeue: ep3in-intr
+#     330.121  xhci_handle_command: Stop Ring Command  <- this one COMPLETED
+#     330.123  xhci_urb_dequeue: ep2out-bulk
+#              ... a later Stop Ring never retires -> 5s -> xhci_halt + hc_died
+# So the order is: SS link fails recovery (SS.Inactive) -> URBs cancelled ->
+# Stop Endpoint issued against a dead port -> command hangs -> "HC died", with
+# `r8152: Tx status -2` last of all. The xHCI messages name the VICTIM.
 #
-# Link:Inactive is SS.Inactive — the state a USB3 link enters when link recovery
-# FAILS. The port stays "Powered Connected", which is exactly why the interface
-# kept carrier=1 and NetworkManager reported it activated with an address while
-# nothing moved: both TX and RX counters froze with rxe=0 txe=0 rxd=0, then the
-# driver tore the netdev down ~4s later. The rest of the trace is clean —
-# 127k 'Short Packet', 120k 'Success', 25 stopped events, all at the transitions.
-#
-# The classic trigger for SS.Inactive under load is a failed U1/U2 low-power
-# link-state exit, and NO_LPM disables exactly that for this device. It is
-# scoped to 0bda:8153 so nothing else on the bus is affected.
-#
-# NOT the same thing as the earlier usbcore autosuspend fix (that is DEVICE
-# power management, /sys/.../power/control, and is still needed — see
-# 99-usb-no-autosuspend.rules). This is LINK power management.
+# NO_LPM is still correctly removed: U1/U2 ENTRY is already disabled in the DT
+# (snps,dis-u1-entry-quirk / snps,dis-u2-entry-quirk) so there was no LPM
+# transition for the quirk to prevent. The real question is why SuperSpeed link
+# RECOVERY fails, which is a PHY/signal-integrity matter, not an LPM one.
+# (snps,parkmode-disable-ss-quirk is also NOT a fix — failures recur with it.)
 .build_boot: .install_initramfs .install_vendor_firmware
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
-		--cmdline "root=/dev/disk/by-partlabel/super usbcore.quirks=0bda:8153:k" \
+		--cmdline "root=/dev/disk/by-partlabel/super" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
