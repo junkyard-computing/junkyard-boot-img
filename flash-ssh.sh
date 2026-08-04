@@ -9,12 +9,11 @@
 # of an OTA. Meant for fleet use, so it is non-interactive.
 #
 # What it does, in order:
-#   1. Preflight (NO changes): ssh reachable, passwordless sudo, /bin/busybox
-#      present, AND — because the rootfs reflash must stage onto a persistent,
-#      non-`super` partition — that userdata is mounted with room for the image.
-#      The deployed fleet image mounts userdata (/dev/sda31) at /userdata via its
-#      setup.sh; we query the device for that mount and, if it is NOT mounted,
-#      FAIL here before touching anything (we do not format/mount it ourselves).
+#   1. Preflight: ssh reachable, passwordless sudo, /bin/busybox present, AND —
+#      because the rootfs reflash must stage onto a persistent, non-`super`
+#      partition — a mounted userdata with room for the image. If userdata is not
+#      mounted we MOUNT IT (see the automount block below); we never format it
+#      unless USERDATA_MKFS=1 is passed explicitly.
 #   2. Ensure pixel-bootctl + pixel-ota are on the device. The running fleet
 #      image predates both tools, so we assume NEITHER is present: we CHECK each
 #      and scp+install only the ones that are missing.
@@ -39,6 +38,10 @@
 # Usage: ./flash-ssh.sh [user@]host
 #   Env: SSH_OPTS                       extra ssh/scp options (e.g. "-i key")
 #        USERDATA_MNT                   device staging mountpoint (default /userdata)
+#        USERDATA_DEV                   staging partition (default: the GPT
+#                                       partition labelled `userdata`)
+#        USERDATA_MKFS=1                allow mkfs.ext4 on it if it is not ext4.
+#                                       DESTRUCTIVE — erases the 229 GB partition.
 #        BOOT_IMG / VENDOR_BOOT_IMG / DTBO_IMG / ROOTFS_IMG / PIXEL_OTA_BIN /
 #        PIXEL_BOOTCTL_BIN              override artifact paths
 set -euo pipefail
@@ -136,17 +139,85 @@ sshc true 2>/dev/null      || die "cannot ssh to $HOST"
 sshc sudo -n true 2>/dev/null || die "passwordless sudo not available on $HOST"
 sshc 'test -x /bin/busybox'   || die "/bin/busybox missing on $HOST (pixel-ota flash-rootfs needs it)"
 
-# userdata must already be mounted: the rootfs reflash stages the image on a
-# persistent partition that is NOT `super`, and pixel-ota --staged refuses to
-# stage on the target partition. The fleet image's setup.sh formats /dev/sda31
-# and mounts it at /userdata — we query THAT mount (not a by-partlabel symlink,
-# which the deployed image doesn't rely on). If it isn't mounted we fail; we do
-# not format/mount it ourselves, that's setup.sh's job.
+# userdata must be mounted: the rootfs reflash stages the image on a persistent
+# partition that is NOT `super`, and pixel-ota --staged refuses to stage on the
+# target partition.
 ud_mnt="${USERDATA_MNT:-/userdata}"
 # Exact-mountpoint match (no --target): findmnt returns the SOURCE only if
 # $ud_mnt is *itself* a mountpoint; a bare non-mounted directory yields nothing.
 ud_src=$(sshc "findmnt -fnro SOURCE --mountpoint '$ud_mnt' 2>/dev/null" || true)
-[ -n "$ud_src" ] || die "$ud_mnt is not a mountpoint on $HOST — run the fleet setup.sh there first; rootfs staging needs a persistent non-super partition. Aborting before any changes."
+
+# AUTOMOUNT — this used to be a hard failure ("run setup.sh there first"), which
+# made the common case fail: THIS SCRIPT REPLACES THE WHOLE ROOTFS, so whatever
+# mounted /userdata (an fstab entry, the fleet setup.sh) is gone the moment the
+# OTA lands. Every device is therefore un-stageable on its *second* flash-ssh run
+# unless someone re-mounts by hand — on units whose only access is the network.
+# Mounting is also cheap and non-destructive: it is a read of the GPT plus a
+# mount(2), on a partition this script is about to write a staging file into
+# anyway. Formatting is the destructive part, and that stays opt-in.
+if [ -z "$ud_src" ]; then
+	log "$ud_mnt is not a mountpoint on $HOST — mounting userdata"
+	# Run it as one remote root script: locating the partition, checking the
+	# filesystem and mounting have to be a single atomic decision, and a heredoc
+	# beats three layers of ssh quoting.
+	#
+	# ext4 is REQUIRED, not merely preferred: the 90rootfs-flash dracut hook
+	# mounts the staging partition with a hard `mount -t ext4` (it runs before
+	# root is up, with no filesystem autodetect and no f2fs module loaded). A
+	# staged image on an f2fs userdata would be invisible to the hook — i.e. the
+	# silent half-flash this script exists to prevent. So we refuse a non-ext4
+	# userdata rather than stage into a partition the flash hook cannot read.
+	mount_out=$(sshc "sudo sh -s -- '$ud_mnt' '${USERDATA_DEV:-}' '${USERDATA_MKFS:-0}'" <<'REMOTE' || true
+set -u
+mnt="$1"; dev="$2"; allow_mkfs="$3"
+
+if [ -z "$dev" ]; then
+	# by-partlabel is the authoritative name; sda31 is only where it happens to
+	# land today, and the label survives a repartition that renumbers it.
+	if [ -b /dev/disk/by-partlabel/userdata ]; then
+		dev=$(readlink -f /dev/disk/by-partlabel/userdata)
+	else
+		dev=$(lsblk -rno PATH,PARTLABEL 2>/dev/null | awk '$2=="userdata"{print $1; exit}')
+	fi
+fi
+[ -n "$dev" ] && [ -b "$dev" ] || {
+	echo "ERR no GPT partition labelled 'userdata' found (set USERDATA_DEV=/dev/...)"; exit 1; }
+
+fstype=$(blkid -o value -s TYPE "$dev" 2>/dev/null || true)
+if [ "$fstype" != ext4 ]; then
+	if [ "$allow_mkfs" = 1 ]; then
+		echo "MKFS $dev was '${fstype:-unformatted}' — reformatting ext4 (USERDATA_MKFS=1)"
+		mkfs.ext4 -F -L userdata "$dev" >/dev/null 2>&1 || { echo "ERR mkfs.ext4 failed on $dev"; exit 1; }
+	else
+		echo "ERR $dev is '${fstype:-unformatted}', not ext4 — the 90rootfs-flash dracut hook mounts it with 'mount -t ext4' and would not see the staged image. Re-run with USERDATA_MKFS=1 to reformat it (DESTRUCTIVE: erases userdata)."
+		exit 1
+	fi
+fi
+
+# Already mounted somewhere else (a leftover /data, a different USERDATA_MNT on a
+# previous run): adopt that mountpoint rather than fail on "already mounted". One
+# partition, one staging directory — mounting it twice would just as easily leave
+# the image on the copy the flash hook doesn't read.
+cur=$(findmnt -fnro TARGET --source "$dev" 2>/dev/null | head -n1)
+if [ -n "$cur" ]; then
+	echo "MOUNTED $dev $cur"
+	exit 0
+fi
+
+mkdir -p "$mnt"
+mount -t ext4 "$dev" "$mnt" || { echo "ERR mount $dev -> $mnt failed"; exit 1; }
+echo "MOUNTED $dev $mnt"
+REMOTE
+	)
+	printf '%s\n' "$mount_out" | sed 's/^/    /'
+	mounted_line=$(printf '%s\n' "$mount_out" | grep '^MOUNTED ' | tail -n1)
+	[ -n "$mounted_line" ] || die "could not mount userdata on $HOST (see above). Aborting before any changes."
+	# The remote side reports where it ACTUALLY ended up, which is not always
+	# $ud_mnt (it adopts an existing mount of the same partition). Stage there.
+	ud_mnt=${mounted_line##* }
+	ud_src=$(sshc "findmnt -fnro SOURCE --mountpoint '$ud_mnt' 2>/dev/null" || true)
+	[ -n "$ud_src" ] || die "$ud_mnt still not a mountpoint on $HOST after mounting"
+fi
 log "userdata mounted at $ud_mnt ($ud_src)"
 
 avail=$(sshc "df -B1 --output=avail '$ud_mnt' | tail -1 | tr -d ' '" || true)
@@ -223,6 +294,55 @@ if [ -n "$DTBO_IMG" ]; then
 else
 	log "no DTBO_IMG — leaving the device's existing dtbo in place"
 fi
+# ★ Normalise the TARGET slot's AVB flags BEFORE pixel-ota switches to it.
+#
+# `fastboot oem disable-verity` / `oem disable-verification` (flash-fastboot.sh)
+# apply ONLY to the slot that was active when they ran. The other slot keeps AVB
+# enforcement on, so our unsigned/repacked boot chain fails verification there,
+# the slot never reaches earlycon, all 7 retries burn in a SINGLE reboot cycle,
+# and the bootloader rolls back.
+#
+# Measured on 35071FDHS0017C (2026-08-04), after a run that reported complete
+# success and wrote byte-perfect images to slot B:
+#     vbmeta_a  flags=0x00000003   <- HASHTREE_DISABLED|VERIFICATION_DISABLED
+#     vbmeta_b  flags=0x00000000   <- still enforcing
+# The device came back on slot A running the OLD image. Nothing on the host side
+# indicates a problem: FLASH_SSH_EXIT=0, and boot_b/vendor_boot_b/dtbo_b all
+# hashed identical to the local images. The only tells are `pixel-bootctl status`
+# showing the target at `retry count: 0, successful: false` and pstore being empty
+# (felix has no dmesg-ramoops), so the failed attempts leave no log at all.
+#
+# AVB vbmeta header: flags is u32 BE at offset 0x78 (=120). Bit0 HASHTREE_DISABLED,
+# bit1 VERIFICATION_DISABLED. Writing it by hand is exactly what
+# `fastboot --disable-verification flash vbmeta` does to the image before flashing;
+# it works because an UNLOCKED device does not enforce the vbmeta signature (slot A
+# already boots with verifiedbootstate=orange / verifyerrorpart=vbmeta). Only the
+# top-level vbmeta needs it — VERIFICATION_DISABLED makes libavb skip the chained
+# vbmeta_system/vbmeta_vendor, which is why those read 0x00 on the slot that works.
+#
+# Safe from the running OS: this touches only the INACTIVE slot, and it is
+# reversible (the original value is 0x00000000).
+log "normalising AVB flags on the target slot (else it fails verification and rolls back)"
+# Sent as a quoted here-doc so the remote script needs no shell escaping.
+sshc 'sudo sh -s' <<'AVBFIX' || die "could not normalise the target slot's AVB flags"
+set -e
+act=$(grep -o 'slot_suffix = "[^"]*"' /proc/bootconfig | cut -d'"' -f2)
+case "$act" in
+	_a) tgt=b ;;
+	_b) tgt=a ;;
+	*)  echo "cannot determine active slot (got '$act')" >&2; exit 1 ;;
+esac
+dev=/dev/disk/by-partlabel/vbmeta_$tgt
+[ -b "$dev" ] || { echo "no such partition: $dev" >&2; exit 1; }
+rd() { dd if="$dev" bs=1 skip=120 count=4 2>/dev/null | od -An -tx1 | tr -d ' \n'; }
+before=$(rd)
+printf '\000\000\000\003' | dd of="$dev" bs=1 seek=120 count=4 conv=notrunc 2>/dev/null
+sync
+after=$(rd)
+echo "    active=$act  target=vbmeta_$tgt  flags: 0x$before -> 0x$after"
+[ "$after" = "00000003" ] || { echo "vbmeta_$tgt flags did not take" >&2; exit 1; }
+AVBFIX
+
 sshc "sudo pixel-ota update '$rdir'"
 
 # 6) Arm the in-place rootfs reflash (no reboot) -----------------------------
