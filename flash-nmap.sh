@@ -251,6 +251,47 @@ if [ -z "$EXPECT_VER" ] && [ -f "$ROOTFS_IMG_LOCAL" ] && command -v debugfs >/de
 	EXPECT_VER="${EXPECT_VER//[[:space:]]/}"
 fi
 
+# ★ REFUSE TO FLASH BLIND. Everything downstream that makes a fleet sweep safe is
+# a comparison against $EXPECT_VER, and both comparisons were written to DEGRADE
+# PERMISSIVELY when it is empty:
+#
+#   * the idempotence skip is guarded by [ -n "$EXPECT_VER" ], so nothing is ever
+#     "already up to date" — a re-run reflashes the whole fleet, and each reflash
+#     overwrites `super` in place, destructively and with no rollback.
+#   * post-flash verification reads
+#         [ -z "$EXPECT_VER" ] || [ "${IMGVER_OF[$h]}" = "$EXPECT_VER" ]
+#     which with an empty value is TRUE for any device that answers. The canary —
+#     "every one must come back ON THE NEW IMAGE VERSION or the run stops" —
+#     silently becomes "did it come back at all".
+#
+# That second one is not theoretical. A device whose target slot fails AVB rolls
+# back and returns on the OLD image, reachable and healthy-looking (that is
+# exactly the bug flash-ssh.sh's vbmeta normalisation fixes). A reachability-only
+# canary passes it, reports the wave green, and the run proceeds to push the same
+# broken update across the fleet — the precise scenario the canary exists to stop.
+#
+# The comment above claims verification can still detect that the version
+# CHANGED. It cannot: classify_all() resets IMGVER_OF on every rescan, so the
+# pre-flash value is gone by the time we compare, and no before/after snapshot is
+# kept anywhere. Treat that as intent, not behaviour.
+#
+# Survey mode is unaffected and still works without debugfs — it makes no such
+# comparisons. Only --flash needs the anchor, so only --flash insists on it.
+if [ "$DO_FLASH" = 1 ] && [ -z "$EXPECT_VER" ]; then
+	die "cannot determine the target image version, and --flash needs it.
+
+  Every safety comparison in a sweep is made against it: without it, devices
+  already up to date are reflashed anyway (a destructive, non-rollback-safe
+  write to 'super'), and post-flash verification degrades to a reachability
+  check that would pass a device which rolled back to the OLD image.
+
+  Fix either way:
+    * install e2fsprogs so debugfs can read /etc/image-version out of
+      $ROOTFS_IMG_LOCAL directly (preferred — the anchor then comes from the
+      artifact you are shipping, not from a number someone typed), or
+    * pass --expect-version <version> explicitly."
+fi
+
 # SSH options for the PROBE. BatchMode is load-bearing, not a convenience: it is
 # what makes "we got in" mean "our key is authorized" instead of "someone typed a
 # password". Never remove it.
