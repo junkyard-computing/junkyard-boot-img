@@ -24,6 +24,7 @@ KMSCON_SHA256 ?= 5a200898513a82cac4f9262f7c20fe4b2bfc6d1d57045ab5f7d9ee0b9ca07a4
 # margin so fastboot doesn't reject on a slightly-oversized image.
 SIZE ?= 8100M
 SYSROOT_DIR ?= rootfs/sysroot
+
 KERNEL_SOURCE_DIR ?= kernel/source
 KERNEL_BUILD_DIR ?= $(KERNEL_SOURCE_DIR)/out/felix/dist
 APT_PACKAGES_FILE ?= rootfs/packages.txt
@@ -209,6 +210,50 @@ all:
 PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune -o -name '*.patch' -print 2>/dev/null | sort)
 
 .apply_kernel_patches: $(PATCH_FILES)
+	# ⚠ TEMPORARY — REMOVE BEFORE SHIPPING (see below).
+	#
+	# Pin the scm version BEFORE patching. Patching the `aosp` project dirties
+	# the git tree that CONFIG_LOCALVERSION_AUTO derives the version from, so
+	# the kernel becomes 6.1.124-android14-11-g8769cc47188c-DIRTY. That renames
+	# every /lib/modules/<ver>/ path, which means the patched kernel can no
+	# longer be flashed boot-only: modules + initramfs must be rebuilt in
+	# lockstep or the kernel finds no modules at all — no dongle, no network,
+	# which is exactly what bricked slot B once already.
+	#
+	# `setlocalversion --save-scmversion` writes .scmversion, and only when the
+	# file is absent — so running it here, before `git apply`, captures the
+	# CLEAN version and later idempotent re-runs keep it. A repo sync removes
+	# .scmversion and leaves a clean tree, so the next build re-captures it
+	# correctly.
+	#
+	# ⚠ This deliberately makes a PATCHED kernel advertise an UNPATCHED version
+	# string. That is a real hazard — this session lost time twice to a version
+	# string that did not reflect the binary — and it is accepted only to keep
+	# the boot-only flash path usable while iterating on the uevent panic.
+	# Before shipping, DELETE this block so the image carries an honest
+	# "-dirty" and do the full rebuild + rootfs cutover that implies.
+	# Hide patched files from git's dirty check with --assume-unchanged.
+	#
+	# NOT `.scmversion`: kleaf already supplies "-android14-11-g8769cc47188c" by
+	# its own mechanism and APPENDS .scmversion on top, producing
+	#   6.1.124-android14-11-g8769cc47188c-dirty-android14-11-g8769cc47188c
+	# which the build rejects outright ("exceeds 64 characters"). Tried, failed.
+	#
+	# NOT a local commit either: that changes the SHA, so the version moves
+	# anyway — the very thing we are avoiding.
+	#
+	# setlocalversion appends "-dirty" based on git seeing modified files;
+	# --assume-unchanged makes those files invisible to that check while leaving
+	# the patch fully applied on disk. Reverse with --no-assume-unchanged.
+	@for p in $(PATCH_FILES); do \
+		rel=$${p#kernel/patches/}; proj=$$(dirname "$$rel"); \
+		tgt="$(KERNEL_SOURCE_DIR)/$$proj"; \
+		[ -d "$$tgt" ] || continue; \
+		grep -oE '^\+\+\+ b/[^[:space:]]+' "$$p" | sed 's|^+++ b/||' | while read -r f; do \
+			( cd "$$tgt" && git update-index --assume-unchanged "$$f" 2>/dev/null ) || true; \
+		done; \
+	done
+	@echo "patched files hidden from git dirty check (keeps kernel_version stable)"
 	@set -e; \
 	if [ -z "$(PATCH_FILES)" ]; then \
 		echo "No kernel patches to apply."; \
@@ -249,13 +294,21 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	#
 	# The old form was:
 	#     strings $(KERNEL_BUILD_DIR)/Image | grep "Linux version" | head -n1 | awk '{print $$3}' > kernel/kernel_version
-	# and it BLANKS the file in two silent ways, both observed 2026-08-03:
-	#  1. `Image` is an arm64 EFI zboot image (magic 4d5a = "MZ"), i.e. a
-	#     COMPRESSED kernel. It contains no "Linux version" banner at all, so
-	#     grep matches nothing — with or without `strings -a`.
-	#  2. `strings` (binutils) is not present in every build environment used
+	# and it BLANKS the file silently:
+	#     `strings` (binutils) is not present in every build environment used
 	#     here. In a pipeline a missing `strings` still leaves the exit status
 	#     of `awk` (0), so make sees SUCCESS while `>` truncates the file.
+	#
+	# CORRECTION (2026-08-04): an earlier version of this comment also blamed
+	# `Image` being "an arm64 EFI zboot (compressed) image with no Linux
+	# version banner". THAT WAS WRONG. Every arm64 Image carries an MZ header
+	# for the EFI stub — MZ magic does NOT imply zboot compression. This Image
+	# is uncompressed and greppable:
+	#     grep -ac 'Linux version' Image   -> 2
+	#     grep -ao 'Linux version [^ ]*'   -> Linux version 6.1.124-...-dirty
+	# The missing binutils was the whole cause. Keep the archive-based method
+	# anyway: it has no binutils dependency and cannot disagree with the
+	# directory the modules actually install into.
 	# Either way kernel/kernel_version becomes EMPTY, every downstream path
 	# becomes `lib/modules//...`, and the build dies two stages later in
 	# .install_kernel with a confusing "modules.order: No such file" — after
