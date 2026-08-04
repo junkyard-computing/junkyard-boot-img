@@ -9,6 +9,21 @@ ROOT_PW ?= 0000
 USER_LOGIN ?= kalm
 USER_PW ?= 0000
 HOSTNAME ?= fold
+# Public SSH keys baked into the image for $(USER_LOGIN), one per line.
+#
+# ★ This is not a convenience — without it the OTA path destroys its own access.
+# The rootfs cutover replaces the WHOLE filesystem, so any key added by hand on a
+# running device is gone the moment that device is updated. Observed on
+# 35071FDHS0017C (2026-08-04): the OTA succeeded and the unit came back rejecting
+# our key ("Permission denied (publickey,password)"), leaving it password-only.
+# flash-ssh.sh authenticates with BatchMode key auth, so such a device can be
+# updated exactly ONCE and never again over the network. On fielded units — no
+# screen, no buttons, no battery, network-only — that is unrecoverable remotely.
+#
+# Keys must therefore come from the IMAGE, not from the device. Deliberately an
+# explicit file rather than a scrape of the builder's ~/.ssh/*.pub: which key can
+# log into a fleet is not something a build should infer from whoever ran it.
+SSH_AUTHORIZED_KEYS ?= rootfs/authorized_keys
 # kmscon isn't in trixie, so we fetch the arm64 .deb out of the Debian archive.
 # The plain pool path (ftp.*/debian/pool/...) gets purged once a package is
 # superseded, so we use snapshot.debian.org's permanent content-addressed
@@ -109,6 +124,17 @@ GIT_REV := $(shell git rev-parse --short HEAD 2>/dev/null || echo unknown)
 GIT_DIRTY := $(shell test -n "$$(git status --porcelain 2>/dev/null)" && echo -dirty)
 IMAGE_VERSION ?= $(IMAGE_BASE_VERSION)-g$(GIT_REV)$(GIT_DIRTY)$(if $(KERNEL_VERSION),+k$(KERNEL_VERSION),)
 BUILD_DATE ?= $(shell date -u +%Y-%m-%d)
+
+# Fleet stamp: an explicit, build-time answer to "is this device one of ours?".
+# IMAGE_VERSION already identifies WHAT a device runs, which is what flash-nmap.sh
+# keys on by default (`--from-version`), but that string necessarily changes with
+# every build — so it cannot also say WHOSE the device is. FLEET_ID is the stable
+# half: set it (e.g. `just all fleet_id=krg-lab`) and every image carries
+# /etc/junkyard-fleet, which `flash-nmap.sh --fleet krg-lab` requires before it
+# will write to a device. Matters when two fleets of our own images share a
+# network — the version filter alone cannot separate those. Empty by default: no
+# variable set, no file, and the marker-count identity check still applies.
+FLEET_ID ?=
 
 # Wrap nspawn invocations through tools/nspawn-wrap.sh so each one starts
 # from a known-good sysroot/dev (no leftover mounts, no stale /dev/pts).
@@ -370,7 +396,11 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	install -m 0755 $(PIXEL_OTA_BIN) $(PIXEL_OTA_OVERLAY)
 	touch $@
 
-.install_packages: .debootstrap .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt
+# $(wildcard ...) on the key file: it is a real dependency when present (editing
+# the fleet's keys must rebuild the image) but must not be a hard prerequisite
+# when absent, or a fresh checkout without one would fail with "No rule to make
+# target". The absent case is handled with a loud warning in the recipe instead.
+.install_packages: .debootstrap .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt $(wildcard $(SSH_AUTHORIZED_KEYS))
 	just mount_rootfs
 	# apt tuning for the snapshot.debian.org mirror (all harmless on the live
 	# mirror, so written unconditionally):
@@ -427,6 +457,29 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"echo '%sudo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-sudo-nopasswd \
 		&& chmod 0440 /etc/sudoers.d/99-sudo-nopasswd"
+	# Bake in the fleet's SSH public keys. Must live in the image: the rootfs
+	# cutover wipes anything added on a running device, so a hand-copied key
+	# survives exactly until that device's first OTA (see SSH_AUTHORIZED_KEYS).
+	# Written here rather than via the overlay because git cannot track the 0600
+	# mode bit or the non-root ownership, same reason as 99-sudo-nopasswd above.
+	@if [ -s "$(SSH_AUTHORIZED_KEYS)" ]; then \
+		echo "  installing SSH keys from $(SSH_AUTHORIZED_KEYS)"; \
+		sudo mkdir -p "$(SYSROOT_DIR)/home/$(USER_LOGIN)/.ssh"; \
+		sudo cp "$(SSH_AUTHORIZED_KEYS)" \
+			"$(SYSROOT_DIR)/home/$(USER_LOGIN)/.ssh/authorized_keys"; \
+		$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+			"chown -R $(USER_LOGIN):$(USER_LOGIN) /home/$(USER_LOGIN)/.ssh \
+			&& chmod 0700 /home/$(USER_LOGIN)/.ssh \
+			&& chmod 0600 /home/$(USER_LOGIN)/.ssh/authorized_keys"; \
+		echo "  $$(grep -cvE '^[[:space:]]*(#|$$)' "$(SSH_AUTHORIZED_KEYS)") key(s) installed for $(USER_LOGIN)"; \
+	else \
+		echo "  ****************************************************************"; \
+		echo "  WARNING: no $(SSH_AUTHORIZED_KEYS) — image ships with NO SSH keys."; \
+		echo "  This image is PASSWORD-ONLY, so flash-ssh.sh (BatchMode key auth)"; \
+		echo "  cannot update a device built from it. Fine for bench work; for"; \
+		echo "  fielded units it means the FIRST OTA is also the LAST one."; \
+		echo "  ****************************************************************"; \
+	fi
 	# Explicitly enable a getty on felix's UART console. The compiled-in
 	# `console=ttynull` in CONFIG_CMDLINE masks ttySAC0 from /sys/class/tty/
 	# console/active, so systemd-getty-generator won't spawn one on its own.
@@ -659,6 +712,15 @@ stamp_version: .install_packages
 		echo 'IMAGE_VERSION=\"$(IMAGE_VERSION)\"' >> /etc/os-release; \
 		echo 'IMAGE_BUILD_DATE=\"$(BUILD_DATE)\"' >> /etc/os-release; \
 		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version"
+	# Fleet stamp — see FLEET_ID. Removed when unset, so an image never keeps a
+	# stale claim to a fleet it was rebuilt out of (this stage is PHONY and reruns
+	# on every build, so the file always reflects THIS build's variables).
+ifneq ($(strip $(FLEET_ID)),)
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "printf '%s\n' '$(FLEET_ID)' > /etc/junkyard-fleet"
+	@echo "stamped FLEET_ID=$(FLEET_ID)"
+else
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "rm -f /etc/junkyard-fleet"
+endif
 	just unmount_rootfs
 	@echo "stamped IMAGE_VERSION=$(IMAGE_VERSION)"
 
