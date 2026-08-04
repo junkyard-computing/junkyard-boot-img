@@ -1,0 +1,19 @@
+# Start a login console on the gadget's ACM serial port when it appears.
+#
+# The CDC-ACM function gives the host a /dev/ttyACM* that is already bound and
+# idle — but nothing listens on our end, so it is dead weight. A getty there is
+# a second, independent way into the device that needs no IP, no dongle and no
+# UART adapter. During a reboot loop on 35071FDHS0017C there was no way in at
+# all; this is that missing door.
+#
+# Started from udev rather than enabled via a .wants symlink ON PURPOSE.
+# serial-getty@.service has BindsTo=/After=dev-%i.device, so an enabled
+# serial-getty@ttyGS0 instance blocks boot ~90s waiting on dev-ttyGS0.device
+# whenever the gadget isn't up (the default dongle/host-mode cable). That is why
+# the mainline track disabled its instance outright. Triggering on the device
+# node instead means it starts exactly when /dev/ttyGS0 exists and never delays
+# a boot where it doesn't — the same condition-gating usb-gadget.service uses.
+#
+# BindsTo also means systemd stops the getty when the node goes away, so moving
+# the cable back to the dongle cleans up after itself.
+SUBSYSTEM=="tty", KERNEL=="ttyGS0", TAG+="systemd", ENV{SYSTEMD_WANTS}="serial-getty@ttyGS0.service"

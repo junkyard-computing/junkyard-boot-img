@@ -1,0 +1,22 @@
+[Unit]
+Description=Recover a USB-Ethernet dongle that failed to re-attach after reboot
+# Must run even when there is no network — that is the whole point. Ordered
+# after basic.target so sysfs and udev are up, but NOT after network targets,
+# which would deadlock: the network is exactly what is missing.
+After=basic.target systemd-udev-settle.service
+Before=netcheck-recover.timer
+DefaultDependencies=no
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/dongle-rehost
+# Exit 1 means "tried and the dongle still did not come back" — real, but not a
+# reason to mark the unit failed and alarm; netcheck-recover escalates from here.
+SuccessExitStatus=0 1
+RemainAfterExit=no
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

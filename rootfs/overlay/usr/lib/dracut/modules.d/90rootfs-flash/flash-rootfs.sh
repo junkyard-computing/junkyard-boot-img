@@ -6,25 +6,12 @@
 # which makes it the portable rootfs cutover / OTA primitive.
 #
 # Trigger (set by the userspace updater, e.g. pixel-ota, then `reboot`):
-#   userdata:/pixel-ota/rootfs.img         the raw rootfs image to write to super
-#   userdata:/pixel-ota/rootfs.img.sha256  REQUIRED: lowercase hex sha256 of it
-#   userdata:/pixel-ota/flash-pending      presence = "do it on next boot"
-#
-# The sha256 sidecar is MANDATORY and is checked before anything is written. The
-# staging transfer is the fail-prone step (a ~GB image over the network), and an
-# unverified write here destroys the live root with fastboot as the only recovery
-# — which, on a fleet with no hands on the devices, is the worst outcome in the
-# system. A missing or mismatched sidecar is therefore treated as "do not flash",
-# NOT as "flash anyway": an image staged by an updater too old to write a sidecar
-# will be refused. Failing to update is always recoverable; a destroyed root is not.
+#   userdata:/pixel-ota/rootfs.img      the raw rootfs image to write to super
+#   userdata:/pixel-ota/flash-pending   presence = "do it on next boot"
 #
 # Write-once semantics: the flag is cleared (and flushed) BEFORE the write, so a
 # crash mid-write cannot loop-flash forever — a half-written super is recovered
 # by re-staging + fastboot, an infinite reflash loop is not recoverable at all.
-# Verification runs BEFORE the flag is cleared, though: a crash while hashing has
-# written nothing, so retrying on the next boot is free. A verification FAILURE
-# does clear the flag — re-reading the same bad image every boot cannot fix it,
-# the updater has to re-stage.
 command -v info >/dev/null 2>&1 || . /lib/dracut-lib.sh
 
 SUPER=/dev/disk/by-partlabel/super
@@ -32,25 +19,6 @@ UD=/dev/disk/by-partlabel/userdata
 MNT=/rootfs-flash
 PENDING=pixel-ota/flash-pending
 IMG=pixel-ota/rootfs.img
-SHA=pixel-ota/rootfs.img.sha256
-
-# Persist pending metadata changes. This initramfs may lack sync(1); sysrq is
-# always-enabled via the kernel cmdline, and 's' syncs all filesystems.
-# Both are best-effort. The sysrq write is wrapped so a failed *redirection* is
-# swallowed too — `cmd > file 2>/dev/null` still lets the shell report that one.
-flush() {
-    sync 2>/dev/null
-    { echo s > /proc/sysrq-trigger; } 2>/dev/null
-}
-
-# Disarm and give up without writing. Callers must `return 0` after this — we are
-# inside a function, so `return` here would only leave the function, not the hook.
-refuse() {  # <reason...>
-    warn "rootfs-flash: $*"
-    rm -f "$MNT/$PENDING"
-    flush
-    umount "$MNT" 2>/dev/null
-}
 
 info "rootfs-flash: hook invoked"
 # Make sure the partition symlinks exist this early in boot.
@@ -65,49 +33,161 @@ if ! mount -t ext4 "$UD" "$MNT" 2>/dev/null; then
 fi
 
 if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
-    info "rootfs-flash: pending flash -> verifying $IMG"
+    # INTEGRITY GATE — `[ -s ]` above only proves the file is non-empty, which is
+    # nowhere near enough to bet the rootfs on. Staging is a long network
+    # transfer and is interruptible; setting the flag is a SEPARATE action, so a
+    # partial image plus a flag is an entirely reachable state. Observed for real
+    # on 2026-08-03: a 1.06 GB fragment of a 7.9 GiB image sat in the staging dir
+    # from an interrupted transfer days earlier. Writing that over `super`
+    # produces a truncated filesystem and a device that cannot boot — and since
+    # `super` is NOT slotted there is no rollback, so recovery means fastboot and
+    # physical access to a unit whose whole point is that it has neither.
+    #
+    # Protocol: the updater stages `<img>.sha256` (bare hex digest) and
+    # `<img>.size` (decimal byte count) next to the image.
+    #
+    # ★ TWO-TIER, because "cannot verify" MUST NOT mean "silently do nothing".
+    #
+    # The first version treated empty sha256sum output as "tool unavailable" and
+    # REFUSED. On 35041FDHS0032G (2026-08-04) that turned a perfectly good OTA
+    # into a no-op: the hook ran, printed "sha256sum unavailable -- REFUSING",
+    # cleared the flag, and left the unit with a NEW AOSP kernel on the OLD
+    # mainline rootfs — no matching /lib/modules, so no NIC, reachable only over
+    # the USB gadget with a physical cable. The binary was demonstrably PRESENT
+    # in that initramfs (usr/bin/sha256sum); it just produced nothing, and it
+    # did so in ~7s, far too fast to have hashed 8 GiB. So it ran and FAILED
+    # (most likely an unresolved library), and an empty result cannot be read as
+    # "missing".
+    #
+    # Now: self-test sha256sum against a known vector, keep its stderr, and fall
+    # back to a SIZE check when it is unusable. Size is weaker than a digest but
+    # it catches the failure that has actually happened twice here — a truncated
+    # staging transfer (a 1.06 GB fragment, and a 457 MB one) — and it is far
+    # better than either refusing a good image or writing an unchecked one.
+    #
+    # ★ The "unresolved library" guess above was WRONG, and the way it was wrong
+    # is the lesson. On 35071FDHS0017C (2026-08-04) this hook again reported
+    # "PRESENT but BROKEN" and fell through to the size check — but sha256sum was
+    # fine. `cut` was simply NOT in the initramfs, so `... | cut -d' ' -f1`
+    # produced nothing and the self-test could never match. `tr` *was* present,
+    # which is why the size branch worked and hid the real cause. The self-test
+    # was measuring its own pipeline, not sha256sum.
+    #
+    # So parse with shell parameter expansion instead: no external command, no
+    # second tool that can silently be absent. Anything the integrity gate itself
+    # depends on has to be as close to zero-dependency as possible, because when
+    # it fails it fails toward "cannot verify" — and that is the branch that
+    # decides whether an unverified image gets written over the only rootfs.
+    verified=""
 
-    # --- verify (nothing written yet; safe to bail at any point) -------------
-    expect=
-    if [ -s "$MNT/$SHA" ]; then
-        # Accepts a bare hex digest or `sha256sum` output ("<hex>  <name>").
-        read -r expect _rest < "$MNT/$SHA" 2>/dev/null || expect=
+    # Known vector: sha256 of the empty string.
+    _sha_empty=e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+    _sha_err=$(printf '' | sha256sum 2>&1 >/dev/null)
+    _sha_probe=$(printf '' | sha256sum 2>/dev/null)
+    _sha_probe=${_sha_probe%% *}
+    if [ "$_sha_probe" = "$_sha_empty" ]; then
+        _sha_ok=1
+    else
+        _sha_ok=0
+        if [ -x /usr/bin/sha256sum ] || [ -x /bin/sha256sum ]; then
+            warn "rootfs-flash: sha256sum is PRESENT but BROKEN (self-test failed)"
+        else
+            warn "rootfs-flash: sha256sum is NOT INSTALLED in the initramfs"
+        fi
+        [ -n "$_sha_err" ] && warn "rootfs-flash:   error: $_sha_err"
     fi
-    if [ -z "$expect" ]; then
-        refuse "no sha256 sidecar ($SHA) -- REFUSING to write $SUPER"
-        return 0
-    fi
-    actual=$(sha256sum < "$MNT/$IMG" 2>/dev/null) || actual=
-    actual=${actual%% *}
-    if [ "$actual" != "$expect" ]; then
-        refuse "sha256 MISMATCH: want $expect, got ${actual:-<none>} -- REFUSING $SUPER"
-        return 0
-    fi
-    info "rootfs-flash: sha256 ok ($actual)"
 
-    # --- fit check: a short write would leave super truncated ----------------
+    if [ -s "$MNT/$IMG.sha256" ] && [ "$_sha_ok" = 1 ]; then
+        want=$(cat "$MNT/$IMG.sha256" 2>/dev/null | tr -d ' \t\n\r')
+        info "rootfs-flash: verifying $IMG against staged digest"
+        got=$(sha256sum "$MNT/$IMG" 2>/dev/null)
+        got=${got%% *}
+        if [ "$got" != "$want" ]; then
+            warn "rootfs-flash: DIGEST MISMATCH -- refusing to flash $SUPER"
+            warn "rootfs-flash:   staged: $want"
+            warn "rootfs-flash:   actual: $got"
+            # Clear the flag: a corrupt image will not become correct on retry,
+            # and leaving it armed would re-attempt this every single boot.
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        info "rootfs-flash: digest OK"
+        verified=digest
+    fi
+
+    if [ -z "$verified" ] && [ -s "$MNT/$IMG.size" ]; then
+        want_sz=$(cat "$MNT/$IMG.size" 2>/dev/null | tr -d ' \t\n\r')
+        got_sz=$(stat -c%s "$MNT/$IMG" 2>/dev/null)
+        if [ -z "$got_sz" ]; then
+            warn "rootfs-flash: cannot stat $IMG -- REFUSING to flash"
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        if [ "$got_sz" != "$want_sz" ]; then
+            warn "rootfs-flash: SIZE MISMATCH -- refusing to flash $SUPER"
+            warn "rootfs-flash:   staged: $want_sz bytes"
+            warn "rootfs-flash:   actual: $got_sz bytes"
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        warn "rootfs-flash: digest unusable; SIZE check passed ($got_sz bytes) -- proceeding"
+        verified=size
+    fi
+
+    if [ -z "$verified" ]; then
+        if [ -s "$MNT/$IMG.sha256" ] || [ -s "$MNT/$IMG.size" ]; then
+            # The updater intended verification and we could not do any of it.
+            warn "rootfs-flash: verification requested but IMPOSSIBLE -- REFUSING to flash"
+            rm -f "$MNT/$PENDING"; sync 2>/dev/null
+            umount "$MNT" 2>/dev/null
+            return 0
+        fi
+        warn "rootfs-flash: no $IMG.sha256 / .size staged -- writing UNVERIFIED image"
+    fi
+
+    # FIT CHECK — the image must not be larger than what we are writing it onto.
+    # Distinct from the integrity gate above: a digest proves the image is intact,
+    # not that it lands somewhere big enough to hold it. `cat img > $SUPER` stops
+    # at ENOSPC having already overwritten the start of the partition, which
+    # leaves a truncated filesystem — the same unbootable, no-rollback outcome
+    # the digest gate exists to prevent, reached a different way.
+    #
+    # This matters more under rootfs A/B than it did before it: the write target
+    # becomes one HALF of `super`, so an image that comfortably fitted the whole
+    # partition can overflow its half. Sizing the target at runtime (rather than
+    # assuming the partition size) is what makes the check keep working once
+    # 90rootfs-slot maps a half.
     isz=$(stat -c %s "$MNT/$IMG" 2>/dev/null) || isz=
     dsz=$(blockdev --getsize64 "$SUPER" 2>/dev/null) || dsz=
     case "$isz:$dsz" in
         *[!0-9:]*|:*|*:)
-            warn "rootfs-flash: could not size image/$SUPER -- skipping fit check" ;;
+            warn "rootfs-flash: could not size image or $SUPER -- skipping fit check" ;;
         *)
             if [ "$isz" -gt "$dsz" ]; then
-                refuse "image $isz > $SUPER $dsz -- REFUSING to write"
+                warn "rootfs-flash: image $isz > $SUPER $dsz -- REFUSING to write"
+                rm -f "$MNT/$PENDING"; sync 2>/dev/null
+                umount "$MNT" 2>/dev/null
                 return 0
-            fi ;;
+            fi
+            info "rootfs-flash: fit ok ($isz <= $dsz)" ;;
     esac
 
-    info "rootfs-flash: writing $IMG onto $SUPER"
-    # Disarm before writing, and persist that first — see the write-once note above.
+    info "rootfs-flash: pending flash -> writing $IMG onto $SUPER"
     rm -f "$MNT/$PENDING"
-    flush
+    # Persist the flag removal first. This initramfs may lack sync(1); sysrq is
+    # always-enabled via the kernel cmdline, and 's' syncs all filesystems.
+    sync 2>/dev/null
+    echo s > /proc/sysrq-trigger 2>/dev/null
     if cat "$MNT/$IMG" > "$SUPER"; then
         info "rootfs-flash: write complete"
     else
         warn "rootfs-flash: write FAILED -- super may be inconsistent"
     fi
-    flush
+    sync 2>/dev/null
+    echo s > /proc/sysrq-trigger 2>/dev/null
 else
     info "rootfs-flash: no pending flash (looked for $MNT/$PENDING + $MNT/$IMG)"
 fi

@@ -1,14 +1,193 @@
 #!/bin/sh
-mkdir /sys/kernel/config/usb_gadget/g1
-mkdir /sys/kernel/config/usb_gadget/g1/strings/0x409
-echo 0x18D1 > /sys/kernel/config/usb_gadget/g1/idVendor
-echo 0xD001 > /sys/kernel/config/usb_gadget/g1/idProduct
-echo "Google" > /sys/kernel/config/usb_gadget/g1/strings/0x409/manufacturer
-echo "DEADC0FFE" > /sys/kernel/config/usb_gadget/g1/strings/0x409/serialnumber
-echo "Fold" > /sys/kernel/config/usb_gadget/g1/strings/0x409/product
-mkdir /sys/kernel/config/usb_gadget/g1/functions/ncm.usb0
-mkdir /sys/kernel/config/usb_gadget/g1/configs/c.1
-mkdir -p /sys/kernel/config/usb_gadget/g1/configs/c.1/strings/0x409
-echo "USB network" > /sys/kernel/config/usb_gadget/g1/configs/c.1/strings/0x409/configuration
-ln -s /sys/kernel/config/usb_gadget/g1/functions/ncm.usb0 /sys/kernel/config/usb_gadget/g1/configs/c.1/
-echo 11210000.dwc3 > /sys/kernel/config/usb_gadget/g1/UDC
+# Configure/bind the CDC-NCM(+ACM) gadget, so the device is reachable over
+# USB-Ethernet (and a USB serial console) when cabled to a host — SSH without
+# needing the wired dongle or a UART adapter.
+#
+# Idempotent against a pre-existing g1: if the gadget tree already exists we do
+# NOT rewrite locked descriptor attrs (idVendor etc. return -EIO once functions
+# are linked) — we just (re)bind the UDC. The previous version of this script
+# unconditionally mkdir'd and wrote every attribute, so a second invocation
+# (e.g. on cable re-plug) failed noisily partway through.
+#
+# The UDC is discovered from /sys/class/udc rather than hardcoded, so this
+# doesn't depend on the dwc3 node address staying 11210000.
+set -u
+GADGET=/sys/kernel/config/usb_gadget/g1
+
+log() { printf "[USB-GADGET] %s\n" "$*" | tee -a /dev/kmsg >/dev/null 2>&1 || true; }
+
+# We bind UNCONDITIONALLY — there is deliberately no host/device role gate here.
+#
+# The history matters, because the obvious guard is the wrong one. Binding the
+# gadget really did used to take the wired dongle's link down: the device would
+# boot fine but have NO network, showing only usb0's static 10.42.0.1 on the
+# console banner, and disabling this service brought the same unit straight back
+# on 192.168.1.108. The apparent culprit was that usb-gadget.service gates on
+# ConditionPathExistsGlob=/sys/class/udc/*, which is NOT a host/device
+# discriminator — measured on 34291FDHS000WV while it was live on the wired
+# network, /sys/class/udc/11210000.dwc3 was present while data_role read
+# "[host] device". So the fix looked like "only bind when the port is
+# positively [device]".
+#
+# That gate was the wrong fix for the right problem, and it never worked. Read
+# at boot the role has not resolved yet, so a dongle boot could still be caught
+# mid-settle reading [device], bind, and lose the dongle anyway — which is
+# exactly what stranded 34291FDHS000WV. Adding a settle-poll made it worse: it
+# binds the instant it sees [device] on a port that is on its way to host.
+#
+# The actual culprit was the soft_connect toggle (see below), which is now gone.
+# With it removed there is nothing to gate: binding merely attaches a gadget
+# driver to the UDC, and it sits idle until the port genuinely becomes a device.
+# That is why the ../image reference binds unconditionally at boot and is fine
+# on a dongle. Binding early is also what makes cable moves work with no
+# hot-plug trigger at all — the gadget is already bound and simply enumerates
+# when a host appears, which is the "automatically switch between dongle and
+# gadget" behaviour the shipped configuration depends on.
+
+# Already bound? nothing to do.
+# Already bound? Skip building and binding — but do NOT exit. Addressing usb0
+# and running the DHCP server are separate concerns, and an early exit here made
+# the script unable to repair either: on a device whose dnsmasq had died, every
+# re-run (udev trigger, manual invocation) returned immediately because the UDC
+# was still bound, and nothing ever restarted the server. Fall through instead;
+# the steps below are individually idempotent.
+ALREADY_BOUND=0
+if [ -f "$GADGET/UDC" ] && [ -n "$(cat "$GADGET/UDC" 2>/dev/null)" ]; then
+	ALREADY_BOUND=1
+	log "already bound to $(cat "$GADGET/UDC" 2>/dev/null); re-checking address + DHCP"
+fi
+
+# Build the tree only if it isn't there yet (fresh boot). A partial/leftover g1
+# is left as-is; writing descriptor attrs on it returns -EIO.
+if [ ! -d "$GADGET/functions/ncm.usb0" ]; then
+	mkdir -p "$GADGET"
+	echo 0x18D1 > "$GADGET/idVendor"
+	echo 0xD001 > "$GADGET/idProduct"
+	echo 0x0100 > "$GADGET/bcdDevice"
+	echo 0x0200 > "$GADGET/bcdUSB"
+	mkdir -p "$GADGET/strings/0x409"
+	echo "Google" > "$GADGET/strings/0x409/manufacturer"
+	echo "Fold" > "$GADGET/strings/0x409/product"
+	echo "DEADC0FFE" > "$GADGET/strings/0x409/serialnumber"
+	mkdir -p "$GADGET/functions/ncm.usb0"
+	mkdir -p "$GADGET/functions/acm.usb0"
+	mkdir -p "$GADGET/configs/c.1/strings/0x409"
+	echo "NCM + ACM" > "$GADGET/configs/c.1/strings/0x409/configuration"
+	echo 250 > "$GADGET/configs/c.1/MaxPower"
+fi
+
+# Ensure the function links exist (harmless if already linked).
+[ -e "$GADGET/configs/c.1/ncm.usb0" ] || ln -s "$GADGET/functions/ncm.usb0" "$GADGET/configs/c.1/ncm.usb0"
+[ -d "$GADGET/functions/acm.usb0" ] && [ ! -e "$GADGET/configs/c.1/acm.usb0" ] && ln -s "$GADGET/functions/acm.usb0" "$GADGET/configs/c.1/acm.usb0"
+
+if [ "$ALREADY_BOUND" = 0 ]; then
+	UDC=$(ls /sys/class/udc/ 2>/dev/null | head -n1)
+	if [ -z "$UDC" ]; then
+		log "no UDC available under /sys/class/udc/"
+		exit 1
+	fi
+	log "binding UDC=$UDC"
+	echo "$UDC" > "$GADGET/UDC" || { log "bind failed"; exit 1; }
+else
+	UDC=$(cat "$GADGET/UDC" 2>/dev/null)
+fi
+
+# NOTE: no soft_connect toggle here, deliberately.
+#
+# An earlier version forced the D+ pullup via /sys/class/udc/*/soft_connect,
+# carried over from the mainline track where it works around a dwc3 quirk. It
+# does not apply here and it is actively dangerous: it is the only step that
+# forcibly drives the controller's connect state, so running it while the port
+# is operating as HOST can pull the controller out of host mode and take an
+# attached USB-Ethernet dongle's link down with it.
+#
+# Measured on 34291FDHS000WV: unbind then plain rebind, no soft_connect, reaches
+# state=configured in ~5s and SSH over the gadget returns. Neither known-good
+# implementation uses it either — not the ../image reference, not the original
+# 14-line main-track script.
+log "bound: state=$(cat "/sys/class/udc/$UDC/state" 2>/dev/null)"
+
+# Bring the NCM link up and address it ourselves.
+#
+# This has to be explicit, and it has to NOT go through NetworkManager. For
+# CDC-NCM the host only sees carrier once *this* end's usb0 is administratively
+# up — but NM will not autoconnect a device that has no carrier yet. That is
+# circular, and the observed result is that usb0 never comes up at all: measured
+# on the host across a 60s sample, carrier stayed 0 the entire time and never
+# so much as flickered, so the device was not even attempting DHCP.
+#
+# A static address also matches what this link is: a point-to-point cable to one
+# host PC. There is no DHCP server on it and there never will be, so asking for
+# a lease can only ever time out. usb0 is marked unmanaged in
+# /etc/NetworkManager/conf.d/10-unmanage-usb0.conf so NM's wildcard
+# default_connection cannot claim it and flush this address out from under us.
+#
+# Host side: give the peer 10.42.0.2/24 and ssh to 10.42.0.1.
+IFACE=usb0
+GADGET_IP=10.42.0.1/24
+if [ ! -e "/sys/class/net/$IFACE" ]; then
+	log "no $IFACE netdev; NCM function missing?"
+	exit 0
+fi
+ip link set "$IFACE" up 2>/dev/null || log "failed to bring $IFACE up"
+# `replace` so a re-run (cable moved, udev re-trigger) is idempotent.
+ip addr replace "$GADGET_IP" dev "$IFACE" 2>/dev/null || log "failed to set $GADGET_IP"
+log "$IFACE up: $(ip -4 -o addr show dev "$IFACE" 2>/dev/null | awk '{print $4}')"
+
+# Serve DHCP on the link, so the host needs no configuration at all.
+#
+# The static address alone put the burden on the wrong end. The host's peer
+# interface is named after the USB bus position, and the gadget moves: in one
+# session it came up as enp5s0u1u1, then usb0, then enp0s20f0u3 — each time
+# needing a fresh hand-built NetworkManager profile before anything was
+# reachable. Handing out a lease moves that decision to the side that knows the
+# answer: plug in any machine and it can reach 10.42.0.1 immediately.
+#
+# --interface + --bind-interfaces is LOAD-BEARING. Without it dnsmasq binds the
+# wildcard address and would answer DHCP on the WIRED network too — a rogue DHCP
+# server on the lab/fleet LAN. The packaged dnsmasq.service is disabled in
+# .install_packages for the same reason; this ad-hoc instance is the only one.
+#
+# Empty --dhcp-option=3 and =6 suppress the router and DNS options. The image we
+# copied this idea from advertises the device as both, which hijacks the host's
+# default route and resolver for the lifetime of the cable — fine on a dedicated
+# rig, hostile on a laptop with real connectivity. A bare address is all that is
+# needed to reach the device.
+DNSMASQ=$(command -v dnsmasq 2>/dev/null || { [ -x /usr/sbin/dnsmasq ] && echo /usr/sbin/dnsmasq; })
+if [ -n "${DNSMASQ:-}" ]; then
+	# Launch it in its OWN transient unit, NOT as a child of this script.
+	#
+	# usb-gadget.service is Type=oneshot with the default KillMode=control-group.
+	# dnsmasq daemonises, so forking it from here put it in this unit's cgroup —
+	# and the moment ExecStart finished, systemd tore that cgroup down and killed
+	# it ("usb-gadget.service: Deactivated successfully" ~0s after the start).
+	# The fork also meant the parent exited 0 regardless, so the old check logged
+	# "serving DHCP" for a server that was already dead. Verified on
+	# 34291FDHS000WV: script logged success at t=20.4s, nothing listening after
+	# boot, and the identical command run by hand worked fine.
+	#
+	# systemd-run gives it a lifetime independent of this oneshot;
+	# --keep-in-foreground makes it a normal supervised Type=simple service.
+	systemctl stop "dnsmasq-$IFACE.service" 2>/dev/null || true
+	systemd-run --unit="dnsmasq-$IFACE" --collect \
+		--property=Restart=on-failure --property=RestartSec=5 \
+		"$DNSMASQ" --keep-in-foreground \
+		--interface="$IFACE" --bind-interfaces \
+		--dhcp-range=10.42.0.10,10.42.0.100,12h \
+		--dhcp-option=3 \
+		--dhcp-option=6 >/dev/null 2>&1
+
+	# VERIFY it is actually serving. Never infer this from an exit status again.
+	i=0
+	while [ "$i" -lt 5 ]; do
+		if pgrep -f "dnsmasq.*--interface=$IFACE" >/dev/null 2>&1; then
+			log "dnsmasq serving DHCP on $IFACE (10.42.0.10-100, no router/DNS pushed)"
+			exit 0
+		fi
+		i=$((i + 1)); sleep 1
+	done
+	log "dnsmasq did NOT stay up on $IFACE; host must set 10.42.0.2/24 by hand"
+else
+	log "dnsmasq absent; host must set 10.42.0.2/24 by hand"
+fi
+exit 0

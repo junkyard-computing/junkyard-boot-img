@@ -1,0 +1,261 @@
+#!/bin/sh
+# Network-loss recovery. Run PERIODICALLY by netcheck-recover.timer.
+#
+# This is the only recovery path on the shipped configuration: no screen, no
+# volume keys, no power button. If the device becomes unreachable over the
+# network there is nobody to press anything, so it has to rescue itself.
+#
+# The policy is deliberately asymmetric, because the two failure modes have
+# very different costs:
+#
+#   a slot that has NEVER proven network   -> probably a bad image. Reboot a
+#                                             few times, then mark it
+#                                             unbootable so the bootloader
+#                                             falls back to the other slot.
+#   a slot that HAS proven network before  -> the image is known good, so the
+#                                             fault is outside it (cable,
+#                                             switch, wedged dongle). Reboot,
+#                                             but NEVER roll back.
+#
+# That second rule is the important one. An earlier version escalated to
+# rollback purely on elapsed failures, which meant unplugging a working,
+# already-commissioned device for ~20 minutes would silently mark its good slot
+# unbootable and flip it to whatever the other slot happens to hold (an older
+# image, or stock Android). Losing a cable must not re-image the device.
+#
+# And if a proven slot has had no address since boot at all, we do not reboot
+# either: the overwhelmingly likely cause is that nothing is plugged in, and
+# rebooting will not plug anything in. Once it HAS held an address this boot,
+# losing it is a real fault and does get a reboot.
+#
+# For bench use, create /etc/netcheck-recover.disable and this exits at once.
+set -u
+DEADLINE=${DEADLINE:-60}          # seconds to wait for an address before acting
+REBOOT_BEFORE_ROLLBACK=${REBOOT_BEFORE_ROLLBACK:-3}
+GADGET_IF=${GADGET_IF:-usb0}
+BOOTCTL=/usr/local/bin/pixel-bootctl
+STATE=/var/lib/netcheck-recover
+COUNTER="$STATE/attempts"
+HADIP=/run/netcheck-recover.had-ip   # tmpfs: per-boot, cleared by a reboot
+
+log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg 2>/dev/null; }
+
+[ -e /etc/netcheck-recover.disable ] && { log "disabled by /etc/netcheck-recover.disable"; exit 0; }
+
+# REACHABILITY, not address presence.
+#
+# The previous version asked "is there a global IPv4 on a non-gadget interface?"
+# and "is there anything in dnsmasq.leases?". Both were wrong, and on
+# 2026-08-02 they let a device sit unreachable for ~7 minutes without the
+# recovery logic ever firing once:
+#
+#   * A WEDGED LINK KEEPS ITS ADDRESS. The r8152 dongle stopped passing traffic
+#     in both directions while NetworkManager still reported the connection
+#     `activated` with 192.168.1.108, carrier up, and the kernel logged nothing
+#     at all. `wired_ip()` returned true throughout a total outage.
+#   * THE LEASE FILE IS NEVER PRUNED. dnsmasq.leases had 30 stale entries, so
+#     `[ -s ... ]` was true forever — on any unit that has ever been cabled to a
+#     PC, that single line made healthy() unconditionally true.
+#
+# `journalctl -t netcheck-recover` showed no entries for the whole outage: the
+# timer ran every 5 minutes and concluded "healthy" every time. On a device
+# whose only access is the network, that disables the entire safety net.
+#
+# So: prove we can actually exchange packets with a peer. Ping first; if ICMP is
+# filtered, fall back to whether the neighbour resolved (ARP), which is a weaker
+# but still real proof that L2 works and something answered.
+peer_reachable() {
+    _p="$1"
+    [ -n "$_p" ] || return 1
+    # ICMP is the strong test.
+    ping -c1 -W2 "$_p" >/dev/null 2>&1 && return 0
+    # ICMP may be filtered. Fall back to L2: FLUSH the neighbour entry first,
+    # then let the failed ping above have re-triggered resolution — an entry
+    # that comes back with an lladdr and is not FAILED/INCOMPLETE means the peer
+    # answered ARP, so the link really does pass packets.
+    #
+    # The flush matters: without it this is circular, because some targets are
+    # themselves discovered FROM the ARP table and a leftover STALE entry would
+    # "prove" reachability of a link that is wedged. STALE only means we knew
+    # the mapping once.
+    ip neigh flush to "$_p" 2>/dev/null
+    ping -c1 -W2 "$_p" >/dev/null 2>&1
+    ip neigh show to "$_p" 2>/dev/null \
+        | grep -q 'lladdr' \
+        && ! ip neigh show to "$_p" 2>/dev/null | grep -qE 'FAILED|INCOMPLETE' \
+        && return 0
+    return 1
+}
+
+# Build the wired probe target list at RUN TIME. Nothing here is hardcoded and
+# nothing is a single point of false failure:
+#
+#   * the default gateway(s) from the routing table
+#   * the DNS servers we were actually handed (resolv.conf)
+#   * the DHCP server that gave us the lease
+#   * anything already in the ARP table on a wired link
+#
+# Deliberately NOT just the gateway. Plenty of gateways drop ICMP, a gateway can
+# be down while the rest of the LAN is fine, and in the datacenter the peer that
+# matters is the controller rather than the router — so any one target being
+# unreachable must not read as "this device is off the network".
+#
+# Operators can pin their own targets (one IP per line) in
+#   /etc/netcheck-recover.targets
+# which REPLACES the discovered set — e.g. point a fleet at its control plane.
+wired_targets() {
+    if [ -s /etc/netcheck-recover.targets ]; then
+        grep -vE '^[[:space:]]*(#|$)' /etc/netcheck-recover.targets
+        return
+    fi
+    ip -4 route show default 2>/dev/null | awk -v g="$GADGET_IF" '$5 != g {print $3}'
+    awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^[0-9]+\.'
+    # DHCP server for any non-gadget lease NM recorded
+    grep -sh '^SERVER_ADDRESS=' /var/lib/NetworkManager/*.lease 2>/dev/null | cut -d= -f2
+    # neighbours already known on a wired link (excludes the gadget subnet)
+    ip -4 neigh show 2>/dev/null | awk -v g="$GADGET_IF" '$3 != g && $1 ~ /^[0-9]/ {print $1}'
+}
+
+# Reachable = ANY discovered peer answers. Not "we hold an address".
+wired_reachable() {
+    for _t in $(wired_targets | sort -u); do
+        peer_reachable "$_t" && return 0
+    done
+    return 1
+}
+
+# Gadget path: the gadget's 10.42.0.1 is assigned unconditionally by
+# usb_gadget, so its presence proves nothing. Require carrier (for CDC-NCM the
+# device side only sees carrier once a host has configured the link) AND a peer
+# that actually answers — validated live, so a stale lease cannot vote.
+gadget_reachable() {
+    [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ] || return 1
+    for _l in $(awk '{print $3}' /var/lib/misc/dnsmasq.leases 2>/dev/null); do
+        peer_reachable "$_l" && return 0
+    done
+    return 1
+}
+
+# A wired network with NO default gateway (isolated bench switch) cannot be
+# proven either way by pinging a gateway that does not exist. Treat that as
+# healthy-but-unverified rather than escalating: a false "unhealthy" reboot-loops
+# a working device, which is strictly worse than a false "healthy" that merely
+# fails to rescue one. Logged so it is visible rather than silent.
+wired_unverifiable() {
+    [ -z "$(ip -4 route show default 2>/dev/null | awk -v g="$GADGET_IF" '$5 != g {print $3}')" ] || return 1
+    ip -4 -o addr show scope global 2>/dev/null \
+        | awk -v g="$GADGET_IF" '$2 != g {print $4}' | grep -qv '^169\.254\.'
+}
+
+healthy() {
+    wired_reachable && return 0
+    gadget_reachable && return 0
+    if wired_unverifiable; then
+        log "wired address present but no default gateway to probe — cannot verify reachability, not escalating"
+        return 0
+    fi
+    return 1
+}
+
+slot_field() {  # slot_field <field>  -> value for the ACTIVE slot
+    "$BOOTCTL" status 2>/dev/null | awk -v f="$1:" '
+        tolower($1)=="slot:" {s=tolower($2); next}
+        $1=="active:" && $2=="true" {want=s}
+        {v[s FS $1]=$2}
+        END {print v[want FS f]}'
+}
+
+cur_slot() {
+    "$BOOTCTL" status 2>/dev/null | awk '
+        tolower($1)=="slot:" {s=tolower($2)}
+        $1=="active:" && $2=="true" {print s; exit}'
+}
+
+# Give a transient blip a chance to clear before acting on it.
+i=0
+while [ "$i" -lt "$DEADLINE" ]; do
+    if healthy; then
+        # Healthy. Commit this slot — this is what marks a slot good, and
+        # nothing else does, deliberately: a slot must PROVE it has network
+        # before the bootloader loses the ability to roll it back.
+        s=$(cur_slot)
+        "$BOOTCTL" mark-successful ${s:+--slot "$s"} >/dev/null 2>&1 || true
+        : > "$HADIP" 2>/dev/null
+        rm -f "$COUNTER"
+        exit 0
+    fi
+    i=$((i + 1)); sleep 1
+done
+
+proven=$(slot_field successful)
+[ "$proven" = true ] || proven=false
+
+# Is there any PHYSICAL wired NIC attached at all? This is the discriminator for
+# "nothing is plugged in", and it must be hardware presence — NOT address
+# history.
+#
+# Getting this wrong stranded a device on 2026-08-02. The rule used to be "a
+# proven slot that never held an address since boot must have nothing plugged
+# in, so don't reboot". But the dongle WAS plugged in; it had wedged and come up
+# dead, so no address was ever obtained. netcheck then logged
+#   "no address since boot ... assuming nothing is plugged in; not rebooting"
+# every 5 minutes while the device sat unreachable, and it took a manual reboot
+# to recover — on a unit whose only access is the network, that is the whole
+# failure.
+#
+# A NIC that is present but cannot reach anything is exactly the case we must
+# reboot for. Only genuine absence means "nobody plugged anything in".
+# Requires: a real device symlink (filters the ~44 virtual rmnet/gre/sit
+# interfaces this kernel creates), ARPHRD_ETHER, and not the gadget itself.
+wired_nic_present() {
+    for _d in /sys/class/net/*; do
+        _n=$(basename "$_d")
+        [ "$_n" = "lo" ] && continue
+        [ "$_n" = "$GADGET_IF" ] && continue
+        [ -e "$_d/device" ] || continue
+        [ "$(cat "$_d/type" 2>/dev/null)" = "1" ] || continue
+        return 0
+    done
+    return 1
+}
+
+# Nothing physically attached: sit still and stay debuggable rather than
+# reboot-looping a device that nobody has cabled. Gated on HARDWARE PRESENCE,
+# not on address history — see wired_nic_present() above for why. If a NIC is
+# present but dead, we fall through and reboot, which is the case that matters.
+if [ "$proven" = true ] && [ ! -e "$HADIP" ] && ! wired_nic_present; then
+    log "no wired NIC attached and no address since boot — nothing plugged in; not rebooting"
+    exit 0
+fi
+if [ ! -e "$HADIP" ] && wired_nic_present; then
+    log "wired NIC present but never reachable this boot — treating as a dead link, escalating"
+fi
+
+mkdir -p "$STATE" 2>/dev/null
+attempts=$(cat "$COUNTER" 2>/dev/null)
+case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
+attempts=$((attempts + 1))
+echo "$attempts" > "$COUNTER" 2>/dev/null
+sync
+
+if [ "$proven" = true ]; then
+    log "lost network after having it (attempt $attempts); slot proven good, rebooting without rollback"
+elif [ "$attempts" -gt "$REBOOT_BEFORE_ROLLBACK" ]; then
+    s=$(cur_slot)
+    other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
+        tolower($1)=="slot:" {s=$2}
+        $1=="active:"     {a[s]=$2}
+        $1=="unbootable:" {ub[s]=$2}
+        END { for (x in a) if (a[x]=="false" && ub[x]=="false") print "yes" }')
+    if [ "$other_ok" = "yes" ]; then
+        log "no network after ${DEADLINE}s (attempt $attempts) and this slot never proved network; marking slot ${s:-?} unbootable -> rollback"
+        "$BOOTCTL" mark-unbootable ${s:+--slot "$s"} >/dev/null 2>&1 || true
+    else
+        log "no network after ${DEADLINE}s (attempt $attempts); no usable fallback slot, plain reboot"
+    fi
+else
+    log "no network after ${DEADLINE}s (attempt $attempts/$REBOOT_BEFORE_ROLLBACK); rebooting"
+fi
+
+sync
+systemctl reboot -f 2>/dev/null || /sbin/reboot -f

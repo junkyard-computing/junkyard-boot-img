@@ -1,0 +1,41 @@
+--- a/dts/gs201-common.dtsi
++++ b/dts/gs201-common.dtsi
+@@ -78,7 +78,37 @@
+ 
+ 	usbdrd_dwc3: dwc3 {
+ 		dr_mode = "peripheral";
+-		maximum-speed = "super-speed-plus";
++		/*
++		 * MITIGATION, NOT A FIX: cap the link at High Speed.
++		 *
++		 * The traced root event behind the "dongle wedge" is the SuperSpeed
++		 * link failing RECOVERY. Tracepoints across a live failure show
++		 *   xhci_handle_port_status: port-0: Powered Connected Disabled
++		 *                            Link:Inactive PortSpeed:4 Change: PLC
++		 * 140ms BEFORE any xHCI trouble. The driver then cancels URBs, a Stop
++		 * Endpoint is queued against a port whose link is already gone, it
++		 * never retires, and xhci_handle_command_timeout() takes its
++		 * unconditional xhci_halt()+xhci_hc_died() branch -- killing the whole
++		 * bus. "HC died" and "Tx status -2" are downstream fallout.
++		 *
++		 * On a fielded unit the dongle is the ONLY route in, so losing the bus
++		 * means losing the device: no ssh, no OTA, and a reboot does not
++		 * reliably bring the dongle back. That is not survivable for a
++		 * headless, buttonless, battery-less deployment.
++		 *
++		 * At high-speed there is no SuperSpeed link to fail recovery, so this
++		 * specific failure mode becomes structurally impossible. 480 Mb/s is
++		 * still ~6x what the OTA path needs (an 8 GB rootfs in ~2.5 min), and
++		 * measured throughput was never the problem -- 923 Mb/s ran clean for
++		 * 89 GiB across 10 trials while slower transfers still died.
++		 *
++		 * COST: no SuperSpeed, for host or gadget. CDC-NCM does not need it.
++		 * Drop this patch if the link/PHY issue is ever properly fixed.
++		 * Ruled out and NOT worth retrying first: throughput limits, traffic
++		 * source, PD topology, snps,parkmode-disable-ss-quirk, NO_LPM,
++		 * rtl8152 tx_timeout, bus/port suspend.
++		 */
++		maximum-speed = "high-speed";
+ 		usb-psy-name = "usb";
+ 		snps,quirk-frame-length-adjustment = <0x20>;
+ 

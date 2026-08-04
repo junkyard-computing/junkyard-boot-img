@@ -130,8 +130,15 @@ cmd_install() {
 	fi
 	info "installing $n ARM NDA GPU file(s) into rootfs:"
 	(cd "$tmp" && find . -type f | sed 's/^\./  /') >&2
-	# Root-owned mounted sysroot, same pattern as the overlay rsync in the Makefile.
-	sudo rsync -a "$tmp"/ "$sysroot"/
+	# --chown=root:root, same as the overlay and vendor-firmware rsyncs in the
+	# Makefile. The tarball is packed with --owner=0 --group=0, but it is
+	# EXTRACTED as the unprivileged build user above, which cannot chown — so by
+	# the time we get here $tmp is owned by uid 1000, and `rsync -a` would
+	# faithfully carry that onto the device, where 1000 is the login user. That
+	# would leave an unprivileged user owning the Mali/OpenCL/Vulkan libraries
+	# and the directories holding them (/usr/lib/aarch64-linux-gnu,
+	# /usr/share/vulkan/icd.d, /etc/OpenCL/vendors).
+	sudo rsync -a --chown=root:root "$tmp"/ "$sysroot"/
 	rm -rf "$tmp"
 	info "ARM NDA GPU drivers installed."
 }

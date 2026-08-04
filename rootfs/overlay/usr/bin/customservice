@@ -20,15 +20,18 @@ format_userdata() {
   fi
 }
 
-setup_usb_gadget() {
-  # Bring up a USB NCM gadget so the device is reachable over USB-Ethernet
-  # when plugged into a host — gives SSH access (port 22, kalm/kalm) without
-  # needing a serial cable or wired ethernet dongle.
-  if [ ! -e /sys/kernel/config/usb_gadget/g1 ]; then
-    /usr/local/sbin/usb_gadget || true
-  fi
-}
+# NOTE: the USB gadget used to be brought up from here. It is now owned by
+# usb-gadget.service, which is gated on a UDC actually existing and is also
+# triggered on UDC hot-plug by 99-usb-gadget.rules — the cable gets moved
+# between the dongle and a PC at runtime, which a one-shot call from here
+# could never follow.
+
+echo "[BEACON] customservice: multi-user.target reached, starting" > /dev/kmsg
 
 load_aoc_firmware
-setup_usb_gadget
 format_userdata
+
+echo "[BEACON] customservice: finished" > /dev/kmsg
+
+# Best-effort: log every assigned IPv4 address so we know if DHCP succeeded.
+ip -4 addr show 2>/dev/null | awk '/inet /{ print "[BEACON] " $NF " " $2 > "/dev/kmsg" }'

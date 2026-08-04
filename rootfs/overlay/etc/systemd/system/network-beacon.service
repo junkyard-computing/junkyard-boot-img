@@ -1,0 +1,11 @@
+[Unit]
+Description=Beacon: dump previous boot's saved network state, then save this one
+After=NetworkManager-wait-online.service multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/network-beacon
+
+[Install]
+WantedBy=multi-user.target

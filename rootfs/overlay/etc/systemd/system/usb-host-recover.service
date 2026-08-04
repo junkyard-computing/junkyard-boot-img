@@ -1,0 +1,29 @@
+[Unit]
+# Recover the USB host controller after "HC died" without rebooting.
+#
+# The SuperSpeed link intermittently fails recovery, which takes the xHCI
+# controller down with it and removes the ONLY route into a fielded unit. This
+# watches the kernel log and rebuilds the host role via the vendor dwc3 otg_id
+# pin emulation — measured to bring the dongle back in ~5s, versus ~4-5 minutes
+# for the netcheck-recover reboot path (which also risks the dongle failing to
+# re-attach at all). See usr/local/sbin/usb-host-recover for the full trace.
+Description=Recover the USB host controller after HC death (no reboot)
+Documentation=man:dmesg(1)
+After=multi-user.target
+# Do not gate on the NIC existing: the whole point is to run when it vanishes.
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/usb-host-recover
+Restart=always
+RestartSec=5s
+# It only reads the kernel log and writes one sysfs attribute; nothing here
+# should ever take the machine down with it.
+Nice=-5
+OOMScoreAdjust=-500
+# A bounce briefly drops the network, so this must not be considered a failure
+# of the unit itself.
+SuccessExitStatus=0 1
+
+[Install]
+WantedBy=multi-user.target
