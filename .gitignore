@@ -194,6 +194,10 @@ tools/payload-dumper-go/
 # sources are tracked).
 tools/memdump/memdump
 
+# Local scratch/output tree: unpacked boot images, and the per-device flash logs
+# flash-nmap.sh writes to out/flash-nmap/<timestamp>/.
+/out/
+
 # USB register capture sessions (local debugging scratch: *.bin register dumps
 # plus per-capture context.txt notes). Whole tree is throwaway per-capture data.
 aosp-vs-mainline/
