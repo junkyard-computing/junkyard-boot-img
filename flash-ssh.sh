@@ -261,6 +261,33 @@ ensure_bin() {  # <name> <local-path>
 ensure_bin pixel-bootctl "$PIXEL_BOOTCTL_BIN"
 ensure_bin pixel-ota "$PIXEL_OTA_BIN"
 
+# ★ Inhibit netcheck-recover for the duration, or it reboots us mid-update.
+#
+# That watchdog pings the gateway and reboots when it cannot reach anything. It
+# cannot distinguish a dead link from one saturated by our own ~1 GB transfer, so
+# on 34291FDHS000WV (2026-08-04) it fired mid-stage, logged "lost network after
+# having it ... rebooting", and killed the update — surfacing to the operator only
+# as `client_loop: send disconnect: Broken pipe`, which points nowhere near the
+# actual cause.
+#
+# Cleared on EXIT so an interrupted run does not leave a headless device with its
+# only recovery mechanism switched off. The flag lives in /run (tmpfs) as a second
+# backstop: even a hard kill that skips the trap only suppresses it until the next
+# boot, which is itself the event that would have cleared the fault.
+INHIBIT=/run/netcheck-recover.inhibit
+log "inhibiting netcheck-recover for the duration of this update"
+sshc "sudo touch '$INHIBIT'" || true
+
+# ONE trap for everything that must be undone. bash replaces an EXIT trap rather
+# than appending, so a second `trap ... EXIT` later silently discards this one —
+# which would leave the inhibit set on a headless device.
+CLEAN_RDIR=""
+cleanup() {
+	ssh $SSH_OPTS "$HOST" "sudo rm -f '$INHIBIT'" >/dev/null 2>&1 || true
+	[ -n "$CLEAN_RDIR" ] && ssh $SSH_OPTS "$HOST" "rm -rf \"$CLEAN_RDIR\"" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
+
 # 4) Stage the rootfs first — the long transfer, while nothing has changed ---
 stage="$ud_mnt/pixel-ota"
 log "staging rootfs.img onto $stage (in-place reflash is DESTRUCTIVE, no rollback)"
@@ -307,7 +334,9 @@ log "staged rootfs verified: $rootfs_sha"
 log "boot chain -> inactive slot (pixel-ota update)"
 rdir=$(sshc 'mktemp -d')
 # shellcheck disable=SC2064  # expand $rdir/$HOST now, into the EXIT trap.
-trap "ssh $SSH_OPTS '$HOST' 'rm -rf \"$rdir\"' >/dev/null 2>&1 || true" EXIT
+CLEAN_RDIR="$rdir"   # picked up by the single EXIT trap set above; a second
+                     # `trap ... EXIT` here would replace that one and leave the
+                     # netcheck inhibit set on the device.
 scpc "$BOOT_IMG"        "$HOST:$rdir/boot.img"
 scpc "$VENDOR_BOOT_IMG" "$HOST:$rdir/vendor_boot.img"
 if [ -n "$DTBO_IMG" ]; then

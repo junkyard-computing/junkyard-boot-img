@@ -42,6 +42,29 @@ log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg
 
 [ -e /etc/netcheck-recover.disable ] && { log "disabled by /etc/netcheck-recover.disable"; exit 0; }
 
+# ★ An OTA in progress inhibits this check, because the check cannot tell a dead
+# link from a saturated one.
+#
+# Observed on 34291FDHS000WV (2026-08-04): flash-ssh was pushing ~1 GB over the
+# wire when this timer fired, its gateway ping lost to the transfer, and it
+# concluded "lost network after having it ... rebooting" — killing the update
+# mid-flight and leaving the operator a bare `client_loop: send disconnect:
+# Broken pipe`. Nothing in that error points here.
+#
+# At fleet scale this is not an edge case: every OTA saturates the link for
+# minutes and this timer runs every 5, so a slice of every sweep would be
+# rebooted out from under itself, at random, on the devices with the slowest
+# links — the ones least able to afford a restart.
+#
+# /run (tmpfs) on purpose: an updater that dies without cleaning up leaves the
+# inhibit behind only until the next boot, which is the same event that would
+# have cleared the fault anyway. A persistent path could disable the only
+# recovery mechanism on a headless device indefinitely.
+if [ -e /run/netcheck-recover.inhibit ]; then
+    log "inhibited: an update is in progress (/run/netcheck-recover.inhibit)"
+    exit 0
+fi
+
 # REACHABILITY, not address presence.
 #
 # The previous version asked "is there a global IPv4 on a non-gadget interface?"
