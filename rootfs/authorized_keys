@@ -1,0 +1,18 @@
+# Public keys authorised for $(USER_LOGIN) on every built image.
+#
+# Baked in on purpose: the rootfs cutover replaces the whole filesystem, so
+# a key added by hand to a running device survives only until its next OTA.
+# See SSH_AUTHORIZED_KEYS in the Makefile.
+#
+# This is also flash-nmap.sh's PRIMARY ownership gate — criterion 1 is that
+# BatchMode key auth succeeds and 'sudo -n' grants root. A device that does
+# not accept one of these is not recognised as ours and is skipped, so an
+# image built without this file makes a whole fleet invisible to a sweep.
+#
+# A DEDICATED fleet key, deliberately not a personal identity: units get
+# handed to a contractor, and the key that can root the fleet should be
+# rotatable without touching anyone's own ~/.ssh. Private half lives at
+# ~/.ssh/junkyard-fleet on the build host and is NOT in this repo.
+# Use it with: flash-nmap.sh -i ~/.ssh/junkyard-fleet   (adds IdentitiesOnly)
+#              flash-ssh.sh  SSH_OPTS='-i ~/.ssh/junkyard-fleet'
+ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK7Vvm4sWJOH7kuwRjw9VKVDvnWKlfNdUkBdOmrmCyPO junkyard-fleet deploy key
