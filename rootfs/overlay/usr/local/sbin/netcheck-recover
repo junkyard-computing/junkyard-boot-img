@@ -252,6 +252,46 @@ while [ "$i" -lt "$DEADLINE" ]; do
     i=$((i + 1)); sleep 1
 done
 
+# ★ TRY THE CHEAP FIX BEFORE THE EXPENSIVE ONE: bounce the USB host role.
+#
+# Rebooting was the only escalation here, which is a ~5-6 minute outage for a
+# fault that a host-role bounce clears in about two seconds. On this hardware the
+# overwhelmingly common cause of "no network" is the USB-Ethernet dongle — either
+# gone from the bus, or enumerated but wedged — and toggling dwc3_exynos_otg_id
+# rebuilds the controller and re-enumerates it in place. usb-host-recover already
+# does exactly this, but only when the kernel logs `HC died`; a link that dies
+# quietly produces no such message and fell straight through to a reboot.
+#
+# Covers both shapes, which is why it bounces unconditionally rather than
+# checking for the NIC first: dongle-rehost's have_nic() test would say "nothing
+# to do" for a NIC that is present but passing no traffic, and that is precisely
+# the case observed repeatedly on 34291FDHS000WV.
+#
+# Bounded and non-destructive: one attempt per invocation (the timer retries in 5
+# minutes), and a failed write just falls through to the existing escalation. A
+# reboot is still the answer if this does not help — it is now the second answer.
+OTG_ID=${OTG_ID:-/sys/devices/platform/11210000.usb/dwc3_exynos_otg_id}
+BOUNCE_SETTLE=${BOUNCE_SETTLE:-15}
+if [ -w "$OTG_ID" ]; then
+    log "no network after ${DEADLINE}s — bouncing the USB host role before escalating"
+    if printf 1 > "$OTG_ID" 2>/dev/null && sleep 1 && printf 0 > "$OTG_ID" 2>/dev/null; then
+        j=0
+        while [ "$j" -lt "$BOUNCE_SETTLE" ]; do
+            if healthy; then
+                log "recovered by USB host bounce after ${j}s — no reboot needed"
+                "$BOOTCTL" mark-successful >/dev/null 2>&1 || true
+                : > "$HADIP" 2>/dev/null
+                rm -f "$COUNTER"
+                exit 0
+            fi
+            j=$((j + 1)); sleep 1
+        done
+        log "USB host bounce did not restore reachability within ${BOUNCE_SETTLE}s"
+    else
+        log "USB host bounce failed to write $OTG_ID"
+    fi
+fi
+
 proven=$(slot_field successful)
 [ "$proven" = true ] || proven=false
 
