@@ -62,7 +62,18 @@ fastboot oem disable-verification
 
 `flash-fastboot.sh` wraps flashing `boot.img` + `vendor_boot.img` + `rootfs.img` (to the `super` slot) over fastboot, with the device in the bootloader on USB.
 
-For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then reflashes the rootfs via the systemd shutdown initramfs. It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and requires a persistent staging partition mounted at `/userdata` (the rootfs reflash is destructive and rollback-free).
+For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then reflashes the rootfs via the `90rootfs-flash` dracut pre-mount hook. It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and stages the image on the `userdata` partition — mounting it if it isn't mounted (the rootfs reflash is destructive and rollback-free).
+
+For a **fleet**, `flash-nmap.sh` finds the devices first: it nmaps the given subnets for SSH, fingerprints every host that answers (board, arch, serial, image version, A/B slot, `userdata`), writes an inventory CSV, and reports which ones are really ours.
+
+```shell
+./flash-nmap.sh 10.0.0.0/24                            # survey only — the default
+./flash-nmap.sh --from-version 'v7.1*' --flash 10.0.0.0/24
+```
+
+It flashes **nothing** without `--flash`. A device is a target only if it (1) authorizes our SSH key and grants it passwordless root, (2) runs our rootfs — gs201/felix device tree plus overlay-only markers — and (3) reports an `IMAGE_VERSION` matching `--from-version`. That last one is the gate that scales: you know what image the devices were built with even when you don't know their serials. `--fleet ID` additionally requires the build-time stamp in `/etc/junkyard-fleet` (`just all fleet_id=…`). Exclusions are by serial (`--exclude-serial-file`), which is the list that stays small.
+
+Because the rootfs half is not rollback-safe, a run is **canaried and waved**: `--canary 3` units go first and must come back on the new version or the run stops with the rest untouched, then `--wave 25` batches, each verified by re-scanning and matching serials (a reflashed device may take a new DHCP lease). `--max-fail 10` trips a circuit breaker. Devices already on the target version are skipped, so re-running the same command converges the fleet. Logs and the inventory land in `out/flash-nmap/<timestamp>/`.
 
 ## TODO
 

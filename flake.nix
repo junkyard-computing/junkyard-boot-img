@@ -40,6 +40,10 @@
         erofs-utils         # fsck.erofs for the vendor partition
         android-tools       # fastboot, adb, simg2img
 
+        # --- flashing over the network ---
+        openssh             # ssh/scp for flash-ssh.sh
+        nmap                # host discovery for flash-nmap.sh
+
         # --- kernel build deps (mainline kbuild + AOSP/kleaf host tools) ---
         python3             # kleaf's cache_dir_config_tags etc. bootstrap via `/usr/bin/env python3`
         perl                # kleaf hermetic-tools host_tools = [bash perl rsync sh]
