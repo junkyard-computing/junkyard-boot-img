@@ -178,3 +178,13 @@ This repo is the **substrate / dev platform**; related work lives in sibling rep
 ## Build-host prerequisites
 
 Beyond the obvious `just`, `repo`, `qemu-user-static`: `make`, `e2fsprogs` (for `mkfs.ext4`), `rsync`, `debootstrap`, `systemd-container` (for `systemd-nspawn`), `curl`, `unzip`, `xxd`. `erofs-utils` and `android-sdk-libsparse-utils` are optional and only kick in if a future felix OTA ships the vendor partition in those formats. `nmap` is needed only by [flash-nmap.sh](flash-nmap.sh) (both it and `openssh` are in the flake dev shell); `flash-nmap.sh --hosts-from FILE` skips the scan and needs neither.
+
+**⚠ The toolchains are split across two environments, and neither can do a whole build.** The rootfs stages (`mount_rootfs`, `systemd-nspawn`, the overlay rsync) need root, which is what `tools/dockershell` provides — it runs as uid 1000 *with passwordless sudo*, not as root, so the recipes call `sudo` internally. The Rust cross-builds (`.build_pixel_bootctl`, `.build_pixel_ota`) need the `rustToolchain` from `nix develop`, which the container does **not** have. So:
+
+```shell
+nix develop -c make .build_pixel_ota .build_pixel_bootctl   # Rust, host side
+tools/dockershell make .build_boot KERNEL_VERSION=… …       # rootfs stages, needs sudo
+nix run .#bazel-fhs -- -c 'just build_kernel'               # kleaf, needs the FHS env
+```
+
+This only bites when a sentinel that has been satisfied for weeks gets invalidated — bumping either pixel-* submodule gitlink re-triggers its cross-build, and a `tools/dockershell make .build_boot` then dies with a bare `/bin/sh: 2: cargo: not found` several stages in, with nothing to indicate which shell it wanted. Also note `debugfs` (e2fsprogs) is needed on `$PATH` for `flash-nmap.sh --flash`, which refuses to run without it rather than silently disarming its canary.
