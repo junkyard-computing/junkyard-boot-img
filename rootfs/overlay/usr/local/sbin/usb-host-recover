@@ -1,0 +1,154 @@
+#!/bin/sh
+# Recover the USB host controller after it dies, WITHOUT a reboot.
+#
+# ── THE FAILURE THIS SURVIVES ──────────────────────────────────────────────
+# The SuperSpeed link intermittently fails recovery. Traced with xhci
+# tracepoints across a live failure (2026-08-03):
+#
+#   329.981  xhci_handle_port_status: port-0: Powered Connected Disabled
+#                                     Link:Inactive PortSpeed:4 Change: PLC
+#   330.121  xhci_urb_dequeue: ep3in-intr
+#   330.121  xhci_handle_command: Stop Ring Command   <- this one COMPLETED
+#   330.123  xhci_urb_dequeue: ep2out-bulk
+#            ... a later Stop Ring never retires
+#   +5s      xhci_handle_command_timeout() -> xhci_halt() + xhci_hc_died()
+#
+#     xHCI host not responding to stop endpoint command
+#     xHCI host controller not responding, assume dead
+#     HC died; cleaning up
+#     r8152 ...: Tx status -2          <- consequence, not cause
+#
+# The link dies FIRST; the xHCI teardown is fallout. `HC died` takes the whole
+# bus down, and on a fielded unit that bus carries the ONLY route in.
+#
+# ── WHY A REBOOT IS THE WRONG RECOVERY ────────────────────────────────────
+# Today netcheck-recover notices after 60s and reboots: ~4-5 minutes of no
+# comms, and the dongle does not reliably re-attach afterwards (the re-attach
+# strand is present on the stock image too, so a reboot can make things WORSE).
+#
+# ── WHY otg_id WORKS ──────────────────────────────────────────────────────
+# Writing dwc3_exynos_otg_id runs dwc3_exynos_host_event(dev, !id) (see
+# dwc3-exynos.c dwc3_exynos_otg_id_store), which tears the host role down and
+# brings it back up — recreating the xHCI controller AND both root hubs, and
+# re-enumerating the peripheral. Measured: dongle back with carrier in 5s.
+#
+# Discovered by accident: an attempt to force USB2 by unbinding the SS root hub
+# was defeated because the otg_id re-init RECREATED the hub. That failure is
+# exactly the property we want here.
+#
+# NOTE: /sys/class/typec/port0/data_role is mode 444 on this build — writes fail
+# with EACCES. Do not use it. otg_id is the writable lever.
+set -u
+
+OTG=${OTG:-/sys/devices/platform/11210000.usb/dwc3_exynos_otg_id}
+GADGET_IF=${GADGET_IF:-usb0}
+SETTLE=${SETTLE:-25}        # seconds to wait for the NIC after a bounce
+
+# ★ COOLDOWN must be SHORTER than netcheck-recover's patience, or this service
+# loses the race and the device reboots anyway.
+#
+# Measured 2026-08-04, 15-min flood: SIX HC deaths in ~6 minutes. A 60s cooldown
+# suppressed the bounces that landed inside each window, the link stayed down
+# through the gaps, and netcheck-recover hit its 60s no-network threshold and
+# rebooted — exactly the comms loss this service exists to prevent. The bounces
+# that DID run worked perfectly (NIC back in 2s); the rate limit is what failed.
+#
+# A bounce costs ~6s and only touches one sysfs attribute, so it is cheap to
+# repeat. The cooldown exists solely to stop a stuck matcher from bouncing a
+# HEALTHY link forever, and BURST_MAX bounds that far better than a long delay:
+# after BURST_MAX bounces inside BURST_WINDOW the link is genuinely gone and
+# netcheck-recover should escalate instead.
+COOLDOWN=${COOLDOWN:-8}          # min seconds between bounces
+BURST_MAX=${BURST_MAX:-6}        # max bounces per window before standing down
+BURST_WINDOW=${BURST_WINDOW:-300}
+DISABLE=/etc/usb-host-recover.disable
+
+log() { logger -t usb-host-recover "$*"; echo "usb-host-recover: $*" > /dev/kmsg 2>/dev/null; }
+
+[ -e "$DISABLE" ] && { log "disabled by $DISABLE"; exit 0; }
+
+if [ ! -w "$OTG" ]; then
+    log "no writable $OTG ($(ls -l "$OTG" 2>&1 | awk '{print $1}')) — cannot recover; exiting"
+    exit 0
+fi
+
+# A real wired NIC: has a device symlink (excludes the ~44 virtual rmnet/gre/sit
+# interfaces this kernel creates), is ARPHRD_ETHER, and is not the gadget.
+have_nic() {
+    for d in /sys/class/net/*; do
+        n=${d##*/}
+        [ "$n" = lo ] && continue
+        [ "$n" = "$GADGET_IF" ] && continue
+        [ -e "$d/device" ] || continue
+        [ "$(cat "$d/type" 2>/dev/null)" = "1" ] && return 0
+    done
+    return 1
+}
+
+bounce() {
+    log "bouncing USB host role via otg_id to rebuild the controller"
+    if ! echo 1 > "$OTG" 2>/dev/null; then
+        log "write otg_id=1 FAILED — cannot recover"
+        return 1
+    fi
+    sleep 3
+    if ! echo 0 > "$OTG" 2>/dev/null; then
+        log "write otg_id=0 FAILED — host role may be left DOWN"
+        return 1
+    fi
+    i=0
+    while [ "$i" -lt "$SETTLE" ]; do
+        if have_nic; then
+            log "NIC back ${i}s after bounce"
+            return 0
+        fi
+        i=$((i + 1)); sleep 1
+    done
+    log "no NIC ${SETTLE}s after bounce (link may be genuinely gone)"
+    return 1
+}
+
+log "watching for host-controller death (otg_id=$OTG cooldown=${COOLDOWN}s burst=${BURST_MAX}/${BURST_WINDOW}s)"
+last=0
+burst=0
+burst_start=0
+
+# Follow the kernel log. `dmesg --follow` starts at the tail, so a death that
+# happened before we started is not re-processed — deliberate: on a fresh boot
+# the controller is already healthy, and re-bouncing on a stale message would
+# drop a working link for nothing.
+dmesg --follow 2>/dev/null | while read -r line; do
+    # ★ Skip our OWN messages first. log() echoes to /dev/kmsg, and the
+    # "detected:" line quotes the matched text — which contains "HC died".
+    # dmesg --follow then reads it back and matches again, so without this the
+    # service bounces the link every COOLDOWN seconds forever, on a healthy
+    # controller, with no real failure anywhere.
+    case "$line" in
+        *usb-host-recover*) continue ;;
+    esac
+    case "$line" in
+        *"HC died"*|*"host controller not responding"*|*"not responding to stop endpoint"*)
+            now=$(cut -d. -f1 /proc/uptime)
+            if [ $((now - last)) -lt "$COOLDOWN" ]; then
+                # The three death messages arrive together; only the first acts.
+                continue
+            fi
+            # Burst accounting: bound repeats without adding latency between them.
+            if [ $((now - burst_start)) -gt "$BURST_WINDOW" ]; then
+                burst=0; burst_start=$now
+            fi
+            burst=$((burst + 1))
+            if [ "$burst" -gt "$BURST_MAX" ]; then
+                log "burst limit ($BURST_MAX in ${BURST_WINDOW}s) reached — link is genuinely gone, standing down for netcheck-recover to escalate"
+                continue
+            fi
+            last=$now
+            log "detected (bounce $burst/$BURST_MAX): ${line#*] }"
+            if bounce; then
+                log "recovered without reboot"
+            else
+                log "bounce did not restore the NIC; leaving netcheck-recover to escalate"
+            fi
+            ;;
+    esac
+done

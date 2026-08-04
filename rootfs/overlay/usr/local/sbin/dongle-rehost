@@ -25,6 +25,22 @@
 # that have no Type-C role control.
 set -u
 PORT=${PORT:-/sys/class/typec/port0/data_role}
+# ★ THE LEVER THAT ACTUALLY WORKS ON THE AOSP TRACK.
+#
+# /sys/class/typec/port0/data_role is mode 444 (READ-ONLY) on this build, so
+# every DR_SWAP write this script used to attempt failed with EACCES — the
+# healer has never once worked here, and it logged "role forced back to host"
+# unconditionally afterwards, reporting an action it never performed. Verified
+# on 34291FDHS000WV 2026-08-03:
+#     dongle-rehost: cannot create /sys/class/typec/port0/data_role: Permission denied
+#     -r--r--r--  /sys/class/typec/port0/data_role
+#
+# The vendor dwc3 exposes a writable OTG ID-pin emulation instead. From
+# dwc3-exynos.c dwc3_exynos_otg_id_store():
+#     dwc3_exynos_host_event(exynos->dev, !id);
+# i.e. writing 0 raises a HOST event (ID grounded = A-device = host) and
+# writing 1 drops back to device. That is the AOSP equivalent of the DR_SWAP.
+OTG_ID=${OTG_ID:-/sys/devices/platform/11210000.usb/dwc3_exynos_otg_id}
 GADGET_IF=${GADGET_IF:-usb0}
 SETTLE=${SETTLE:-30}      # seconds to allow normal enumeration first
 TRIES=${TRIES:-3}
@@ -45,32 +61,81 @@ have_nic() {
 }
 
 # Give normal enumeration a chance before intervening.
+#
+# Log the outcome UNCONDITIONALLY, including the boring success case. An earlier
+# version was silent when it found a NIC and exited, which meant that after a
+# strand there was no way to tell whether it had run and seen a dongle, or
+# misfired, or never started — the one question the log needed to answer.
 i=0
 while [ "$i" -lt "$SETTLE" ]; do
-    have_nic && exit 0
+    if have_nic; then
+        log "wired NIC present after ${i}s ($(ls /sys/class/net | wc -l) ifaces total) — nothing to do"
+        exit 0
+    fi
     i=$((i + 1)); sleep 1
 done
+log "no wired NIC after ${SETTLE}s; ifaces=$(ls /sys/class/net | tr '\n' ' ')"
 
-[ -w "$PORT" ] || { log "no writable $PORT — cannot re-host; leaving alone"; exit 0; }
+# Pick a lever we can actually write. Report which, and REPORT FAILURE HONESTLY:
+# the previous version claimed "role forced back to host" even when every write
+# had been rejected, which turned a broken healer into a silent one.
+#
+# `[ -w ]` is not sufficient on its own here — test an actual write, because a
+# sysfs attribute can be mode-writable and still reject the value.
+METHOD=""
+if [ -w "$OTG_ID" ]; then
+    METHOD=otg_id
+elif [ -w "$PORT" ]; then
+    METHOD=data_role
+else
+    log "no writable role control (tried $OTG_ID and $PORT) — cannot re-host"
+    log "  $OTG_ID: $(ls -l "$OTG_ID" 2>&1 | awk '{print $1}')"
+    log "  $PORT: $(ls -l "$PORT" 2>&1 | awk '{print $1}')"
+    exit 0
+fi
+log "using $METHOD to force host mode"
+
+force_host() {
+    case "$METHOD" in
+        otg_id)    echo 0 > "$OTG_ID" 2>/dev/null ;;
+        data_role) echo host > "$PORT" 2>/dev/null ;;
+    esac
+}
+force_device() {
+    case "$METHOD" in
+        otg_id)    echo 1 > "$OTG_ID" 2>/dev/null ;;
+        data_role) echo device > "$PORT" 2>/dev/null ;;
+    esac
+}
 
 t=0
 while [ "$t" -lt "$TRIES" ]; do
     t=$((t + 1))
-    log "no wired NIC after ${SETTLE}s (attempt $t/$TRIES) — forcing Type-C DR_SWAP"
-    echo device > "$PORT" 2>/dev/null
-    sleep 5
-    echo host   > "$PORT" 2>/dev/null
+    log "no wired NIC after ${SETTLE}s (attempt $t/$TRIES) — forcing host via $METHOD"
+    # Bounce through device so the downstream port sees a real disconnect,
+    # then assert host. On a port that simply never left device role (the PD
+    # case: sink role never triggers host), the second write is the one that
+    # matters.
+    force_device; sleep 3
+    if ! force_host; then
+        log "write to $METHOD FAILED — cannot force host mode; giving up"
+        exit 1
+    fi
     i=0
     while [ "$i" -lt 30 ]; do
         if have_nic; then
-            log "dongle re-attached after DR_SWAP (attempt $t)"
+            log "dongle attached after forcing host via $METHOD (attempt $t)"
             exit 0
         fi
         i=$((i + 1)); sleep 1
     done
 done
 
-# Never leave a network-only device parked in device role.
-echo host > "$PORT" 2>/dev/null
-log "dongle did NOT re-attach after $TRIES DR_SWAP attempts; role forced back to host"
+# Never leave a network-only device parked in device role. Only claim we did it
+# if the write actually succeeded.
+if force_host; then
+    log "dongle did NOT attach after $TRIES attempts; host role re-asserted via $METHOD"
+else
+    log "dongle did NOT attach after $TRIES attempts; AND re-asserting host FAILED"
+fi
 exit 1
