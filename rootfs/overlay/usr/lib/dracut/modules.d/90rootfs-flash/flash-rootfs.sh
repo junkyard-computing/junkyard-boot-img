@@ -58,13 +58,46 @@ udevadm settle --timeout=10 2>/dev/null
 # about to boot from and leave the other one holding the previous rootfs. If this
 # boot fails, the bootloader's existing retry/rollback lands on the other slot and
 # finds it intact — which is the whole point, and needs nothing from pixel-bootctl.
-if [ -b "$SLOTDEV" ]; then
-    TARGET=$SLOTDEV
-    info "rootfs-flash: rootfs A/B active -- target is this slot's half ($TARGET)"
-else
+# ...and the choice is made by SIZE, not just by whether a half is mapped, because
+# there are two different operations sharing this one hook:
+#
+#   an UPGRADE stages a half-sized rootfs.img  -> write the mapped half
+#   a MIGRATION or RESTRUCTURE stages super.img,
+#   the whole partition with both halves seeded -> write the whole partition
+#
+# Keying only on "is a half mapped?" gets migration exactly backwards. On a
+# migrating device the NEW initramfs is already running, so rootfs-slot HAS mapped
+# a half — and super.img is twice the size of that half, so the fit check would
+# refuse the very image whose job is to establish the layout. The device would
+# come back on the old rootfs with the flag cleared, reporting success.
+#
+# So: take the half only if the image actually fits in it. Anything larger is by
+# definition not a single-slot image, and belongs to the whole partition.
+# Deciding this needs the image size, which is why it happens here rather than
+# before the mount.
+select_target() {
+    _isz=$(stat -c %s "$MNT/$IMG" 2>/dev/null) || _isz=
+    case "$_isz" in ''|*[!0-9]*) _isz= ;; esac
+
+    if [ -b "$SLOTDEV" ] && [ -n "$_isz" ]; then
+        _hsz=$(blockdev --getsize64 "$SLOTDEV" 2>/dev/null) || _hsz=
+        case "$_hsz" in ''|*[!0-9]*) _hsz= ;; esac
+        if [ -n "$_hsz" ] && [ "$_isz" -le "$_hsz" ]; then
+            TARGET=$SLOTDEV
+            info "rootfs-flash: image fits this slot's half -- upgrading in place ($TARGET)"
+            return 0
+        fi
+        TARGET=$SUPER
+        info "rootfs-flash: image ($_isz) exceeds the mapped half (${_hsz:-?}) -- treating as a"
+        info "rootfs-flash: whole-partition image (migration/restructure) -> $TARGET"
+        WHOLE_UNDER_MAPPING=1
+        return 0
+    fi
+
     TARGET=$SUPER
     info "rootfs-flash: no slot mapping -- target is the whole partition ($TARGET)"
-fi
+}
+WHOLE_UNDER_MAPPING=0
 
 mkdir -p "$MNT"
 if ! mount -t ext4 "$UD" "$MNT" 2>/dev/null; then
@@ -73,6 +106,7 @@ if ! mount -t ext4 "$UD" "$MNT" 2>/dev/null; then
 fi
 
 if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
+    select_target
     # INTEGRITY GATE — `[ -s ]` above only proves the file is non-empty, which is
     # nowhere near enough to bet the rootfs on. Staging is a long network
     # transfer and is interruptible; setting the flag is a SEPARATE action, so a
@@ -215,19 +249,58 @@ if [ -e "$MNT/$PENDING" ] && [ -s "$MNT/$IMG" ]; then
             info "rootfs-flash: fit ok ($isz <= $dsz)" ;;
     esac
 
+    # Whole-partition write with a half currently mapped over it: drop the mapping
+    # first. Device-mapper holds the underlying device open, and whether a raw
+    # write through it is permitted is not something to find out during a fleet
+    # migration — a refused write here leaves the flag already cleared and the
+    # device booting a half that was never seeded.
+    #
+    # Removed rather than rewritten afterwards: recreating the table would mean
+    # duplicating rootfs-slot's halving arithmetic in a second place, and two
+    # copies of that maths drifting apart is exactly the failure this hook was
+    # designed to avoid. Reboot instead and let rootfs-slot map it cleanly over
+    # the freshly seeded partition. The flag is already cleared, so the next boot
+    # does not reflash — it just boots.
+    if [ "$WHOLE_UNDER_MAPPING" = 1 ]; then
+        if command -v dmsetup >/dev/null 2>&1; then
+            if dmsetup remove "$(basename "$SLOTDEV")" 2>/dev/null; then
+                info "rootfs-flash: dropped the slot mapping for a whole-partition write"
+            else
+                warn "rootfs-flash: could not drop the slot mapping -- attempting the write anyway"
+            fi
+        else
+            warn "rootfs-flash: dmsetup unavailable -- attempting the write under a live mapping"
+        fi
+    fi
+
     info "rootfs-flash: pending flash -> writing $IMG onto $TARGET"
     rm -f "$MNT/$PENDING"
     # Persist the flag removal first. This initramfs may lack sync(1); sysrq is
     # always-enabled via the kernel cmdline, and 's' syncs all filesystems.
     sync 2>/dev/null
     echo s > /proc/sysrq-trigger 2>/dev/null
+    _wrote=0
     if cat "$MNT/$IMG" > "$TARGET"; then
         info "rootfs-flash: write complete"
+        _wrote=1
     else
-        warn "rootfs-flash: write FAILED -- super may be inconsistent"
+        warn "rootfs-flash: write FAILED -- $TARGET may be inconsistent"
     fi
     sync 2>/dev/null
     echo s > /proc/sysrq-trigger 2>/dev/null
+
+    # After re-laying the whole partition we have no slot mapping and this
+    # initramfs's view of the layout is stale by definition. Reboot into it rather
+    # than continuing a boot whose root device we just removed.
+    if [ "$WHOLE_UNDER_MAPPING" = 1 ] && [ "$_wrote" = 1 ]; then
+        info "rootfs-flash: layout re-established -- rebooting so the slot is mapped fresh"
+        umount "$MNT" 2>/dev/null
+        sync 2>/dev/null
+        echo s > /proc/sysrq-trigger 2>/dev/null
+        echo b > /proc/sysrq-trigger 2>/dev/null
+        # If sysrq is unavailable, fall through: dracut will fail to find root and
+        # rd.emergency=reboot takes us round anyway.
+    fi
 else
     info "rootfs-flash: no pending flash (looked for $MNT/$PENDING + $MNT/$IMG)"
 fi
