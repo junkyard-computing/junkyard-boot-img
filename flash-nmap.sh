@@ -102,6 +102,16 @@
 #   -S, --serial-file F      NARROW to these serials (optional; for retries)
 #       --expect-version V   image version devices must report after flashing
 #                            (default: read from the local rootfs.img)
+#       --expect-device D    refuse any device whose image was built for a
+#                            DIFFERENT device (default: read from the local
+#                            rootfs.img). Needed because lynx is also gs201, so
+#                            the device-tree match alone cannot separate them and
+#                            two images built from one commit share a version.
+#                            ⚠ Devices with no /etc/image-device predate the stamp
+#                            and are NOT refused — failing closed there would
+#                            block the very upgrade that installs the stamp, so
+#                            the gate is inert until a device has been flashed
+#                            once with a stamped image.
 #       --force              flash even devices already on the target version
 #       --canary N           units in the first, strictly-verified wave (default 3)
 #       --wave N             units per wave thereafter (default 25)
