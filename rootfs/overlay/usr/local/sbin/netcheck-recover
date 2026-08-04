@@ -60,9 +60,32 @@ log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg
 # inhibit behind only until the next boot, which is the same event that would
 # have cleared the fault anyway. A persistent path could disable the only
 # recovery mechanism on a headless device indefinitely.
-if [ -e /run/netcheck-recover.inhibit ]; then
-    log "inhibited: an update is in progress (/run/netcheck-recover.inhibit)"
-    exit 0
+INHIBIT=/run/netcheck-recover.inhibit
+INHIBIT_MAX_AGE=${INHIBIT_MAX_AGE:-900}
+if [ -e "$INHIBIT" ]; then
+    _now=$(date +%s 2>/dev/null || echo 0)
+    _mt=$(stat -c %Y "$INHIBIT" 2>/dev/null || echo 0)
+    _age=$(( _now - _mt ))
+    [ "$_age" -lt 0 ] && _age=0
+    if [ "$_age" -lt "$INHIBIT_MAX_AGE" ]; then
+        log "inhibited: update in progress (${_age}s old, expires at ${INHIBIT_MAX_AGE}s)"
+        exit 0
+    fi
+    # ★ EXPIRED. An updater that died without cleaning up must NOT be able to
+    # switch off the only recovery mechanism this device has.
+    #
+    # The first version of this check had no expiry and justified itself with
+    # "/run is tmpfs, so it clears on the next boot". That reasoning is circular:
+    # the inhibit suppresses the reboot that would clear the inhibit. A flash-ssh
+    # killed mid-run, followed by the link dropping, would have left a screenless,
+    # buttonless device unable to rescue itself — permanently, and silently. That
+    # is a strictly worse failure than the mid-OTA reboot the inhibit exists to
+    # prevent, so the inhibit has to be the weaker of the two guarantees.
+    #
+    # Delete it as well as ignoring it, so this is reported once rather than every
+    # five minutes, and so the next updater starts from a clean slate.
+    log "inhibit file is ${_age}s old (>= ${INHIBIT_MAX_AGE}s) — an update died without clearing it; resuming recovery"
+    rm -f "$INHIBIT" 2>/dev/null || true
 fi
 
 # REACHABILITY, not address presence.

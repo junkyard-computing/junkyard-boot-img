@@ -278,11 +278,26 @@ INHIBIT=/run/netcheck-recover.inhibit
 log "inhibiting netcheck-recover for the duration of this update"
 sshc "sudo touch '$INHIBIT'" || true
 
+# The device EXPIRES this inhibit (see netcheck-recover: INHIBIT_MAX_AGE, 900s),
+# so it must be refreshed while we work or a slow transfer outlives it and gets
+# rebooted anyway. Refreshing is also what makes the expiry safe: the device
+# resumes recovery on its own if this process dies, without depending on us.
+#
+# Deliberately shorter than the expiry by a wide margin — a couple of missed
+# touches (a blip, a busy link) must not expire a live update.
+REFRESH_PID=""
+( while :; do
+	sleep 120
+	ssh $SSH_OPTS "$HOST" "sudo touch '$INHIBIT'" >/dev/null 2>&1 || true
+  done ) &
+REFRESH_PID=$!
+
 # ONE trap for everything that must be undone. bash replaces an EXIT trap rather
 # than appending, so a second `trap ... EXIT` later silently discards this one —
 # which would leave the inhibit set on a headless device.
 CLEAN_RDIR=""
 cleanup() {
+	[ -n "$REFRESH_PID" ] && kill "$REFRESH_PID" 2>/dev/null || true
 	ssh $SSH_OPTS "$HOST" "sudo rm -f '$INHIBIT'" >/dev/null 2>&1 || true
 	[ -n "$CLEAN_RDIR" ] && ssh $SSH_OPTS "$HOST" "rm -rf \"$CLEAN_RDIR\"" >/dev/null 2>&1 || true
 }
