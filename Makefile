@@ -176,6 +176,30 @@ BUILD_DATE ?= $(shell date -u +%Y-%m-%d)
 # variable set, no file, and the marker-count identity check still applies.
 FLEET_ID ?=
 
+# Which DEVICE this image is built for. Stamped into /etc/image-device so the
+# image can be matched against the hardware before it is written.
+#
+# ★ Nothing else in the rootfs identifies the target. IMAGE_VERSION is derived
+# from the commit and the kernel, so two images built from one commit for two
+# different devices are byte-identical in every field flash-nmap.sh compares:
+# same version, same fleet id, same overlay markers.
+#
+# ★★ And the device-tree check does NOT separate them, because lynx (Pixel 7a) is
+# ALSO gs201 — `//private/devices/google/lynx:gs201_lynx_dist`. flash-nmap's
+# default `--match 'felix|gs201'` therefore matches a lynx device just as happily
+# as a felix one. So without this stamp every gate in the tool passes for a
+# felix image aimed at lynx hardware: it authorises our key, it runs our overlay,
+# it reports the expected version, it carries the right fleet id. The images are
+# genuinely incompatible — different kernel branch, different vendor firmware —
+# and an in-layout upgrade would at least fail AVB on the inactive slot and roll
+# back, but a MIGRATION writes the whole partition and destroys both halves
+# before anything gets the chance to reject it.
+#
+# Default felix so this branch (felix-only) keeps building unchanged; on the
+# multi-device branch DEVICE is already the real variable that selects
+# devices/$(DEVICE).mk, so this picks it up with no further wiring.
+DEVICE ?= felix
+
 # Wrap nspawn invocations through tools/nspawn-wrap.sh so each one starts
 # from a known-good sysroot/dev (no leftover mounts, no stale /dev/pts).
 # See the script header for the systemd >= 260 specifics that motivate it.
@@ -768,10 +792,12 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 stamp_version: .install_packages
 	just mount_rootfs
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
-		"sed -i --follow-symlinks '/^IMAGE_VERSION=/d; /^IMAGE_BUILD_DATE=/d' /etc/os-release; \
+		"sed -i --follow-symlinks '/^IMAGE_VERSION=/d; /^IMAGE_BUILD_DATE=/d; /^IMAGE_DEVICE=/d' /etc/os-release; \
 		echo 'IMAGE_VERSION=\"$(IMAGE_VERSION)\"' >> /etc/os-release; \
 		echo 'IMAGE_BUILD_DATE=\"$(BUILD_DATE)\"' >> /etc/os-release; \
-		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version"
+		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version; \
+		echo 'IMAGE_DEVICE=\"$(DEVICE)\"' >> /etc/os-release; \
+		printf '%s\n' '$(DEVICE)' > /etc/image-device"
 	# Fleet stamp — see FLEET_ID. Removed when unset, so an image never keeps a
 	# stale claim to a fleet it was rebuilt out of (this stage is PHONY and reruns
 	# on every build, so the file always reflects THIS build's variables).

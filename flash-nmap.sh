@@ -143,7 +143,7 @@ PORT=22; MIN_MARKS=2
 DEVICE_USER="${DEVICE_USER:-kalm}"
 MATCH_RE="${DEVICE_MATCH:-felix|gs201}"
 FLEET_ID="${FLEET_ID:-}"
-IDENTITY=""; HOSTS_FROM=""; EXPECT_VER="${EXPECT_VERSION:-}"
+IDENTITY=""; HOSTS_FROM=""; EXPECT_VER="${EXPECT_VERSION:-}"; EXPECT_DEV="${EXPECT_DEVICE:-}"
 INSECURE_HOSTKEYS=0
 declare -a TARGETS=() ONLY_SERIALS=() SKIP_SERIALS=() EXCLUDES=() FROM_VERSIONS=()
 # FROM_VERSION=a,b in the environment works too, for cron/CI.
@@ -187,6 +187,7 @@ while [ $# -gt 0 ]; do
 		--exclude-serial)      val "$@"; SKIP_SERIALS+=("$REPLY"); shift ;;
 		-S|--serial-file)      val "$@"; read_serials "$REPLY" ONLY_SERIALS; shift ;;
 		--expect-version)      val "$@"; EXPECT_VER="$REPLY"; shift ;;
+		--expect-device)       val "$@"; EXPECT_DEV="$REPLY"; shift ;;
 		--force)               FORCE=1 ;;
 		--canary)              val "$@"; CANARY="$REPLY"; shift ;;
 		--wave)                val "$@"; WAVE="$REPLY"; shift ;;
@@ -249,6 +250,13 @@ fi
 if [ -z "$EXPECT_VER" ] && [ -f "$ROOTFS_IMG_LOCAL" ] && command -v debugfs >/dev/null 2>&1; then
 	EXPECT_VER=$(debugfs -R 'cat /etc/image-version' "$ROOTFS_IMG_LOCAL" 2>/dev/null | tr -d '\r' | head -n1)
 	EXPECT_VER="${EXPECT_VER//[[:space:]]/}"
+	# Only when not given explicitly — an operator-supplied --expect-device must
+	# win, exactly as --expect-version does. Deriving unconditionally here would
+	# silently discard the override and make the flag look like it did nothing.
+	if [ -z "$EXPECT_DEV" ]; then
+		EXPECT_DEV=$(debugfs -R "cat /etc/image-device" "$ROOTFS_IMG_LOCAL" 2>/dev/null | tr -d "\r" | head -n1)
+		EXPECT_DEV="${EXPECT_DEV//[[:space:]]/}"
+	fi
 fi
 
 # ★ REFUSE TO FLASH BLIND. Everything downstream that makes a fleet sweep safe is
@@ -388,6 +396,16 @@ if [ -z "$imgver" ] && [ -r /etc/os-release ]; then
 fi
 p imgver "$imgver"
 
+# Which DEVICE the running image was BUILT for (Makefile DEVICE -> /etc/image-device).
+# Distinct from what hardware this is: the device tree says what the board is, this
+# says what the image expects. They can disagree, and nothing else here would notice.
+imgdev=""
+[ -r /etc/image-device ] && imgdev=$(head -n1 /etc/image-device 2>/dev/null | tr -d '[:space:]')
+if [ -z "$imgdev" ] && [ -r /etc/os-release ]; then
+	imgdev=$(sed -n 's/^IMAGE_DEVICE="\{0,1\}\([^"]*\)"\{0,1\}$/\1/p' /etc/os-release | head -n1)
+fi
+p imgdev "$imgdev"
+
 # Fleet stamp, when the image carries one (Makefile FLEET_ID).
 fleet=""
 [ -r /etc/junkyard-fleet ] && fleet=$(head -n1 /etc/junkyard-fleet 2>/dev/null | tr -d '[:space:]')
@@ -457,12 +475,12 @@ version_allowed() {  # <imgver>
 # ---------------------------------------------------------------------------
 # 3) Classify.
 # ---------------------------------------------------------------------------
-declare -A SERIAL_OF=() INFO_OF=() VERDICT_OF=() REASON_OF=() IMGVER_OF=() ADDR_OF=()
+declare -A SERIAL_OF=() INFO_OF=() VERDICT_OF=() REASON_OF=() IMGVER_OF=() ADDR_OF=() IMGDEV_OF=()
 declare -A KERN_OF=() SLOT_OF=() UD_OF=()
 declare -a MATCHED=()
 
 classify_all() {  # <addr...> ; fills the arrays above, MATCHED = flashable ones
-	MATCHED=(); SERIAL_OF=(); INFO_OF=(); VERDICT_OF=(); REASON_OF=(); IMGVER_OF=(); ADDR_OF=()
+	MATCHED=(); SERIAL_OF=(); INFO_OF=(); VERDICT_OF=(); REASON_OF=(); IMGVER_OF=(); ADDR_OF=(); IMGDEV_OF=()
 	KERN_OF=(); SLOT_OF=(); UD_OF=()
 	local h f verdict reason arch model compat serial slot imgver fleet marks
 	local sudoq busybox userdata kern s
@@ -481,10 +499,11 @@ classify_all() {  # <addr...> ; fills the arrays above, MATCHED = flashable ones
 		fi
 		arch=$(kv "$f" arch);     model=$(kv "$f" model);   compat=$(kv "$f" compat)
 		serial=$(kv "$f" serial); slot=$(kv "$f" slot);     imgver=$(kv "$f" imgver)
+		imgdev=$(kv "$f" imgdev)
 		fleet=$(kv "$f" fleet);   marks=$(kv "$f" marks);   kern=$(kv "$f" kernel)
 		sudoq=$(kv "$f" sudo);    busybox=$(kv "$f" busybox); userdata=$(kv "$f" userdata)
 
-		SERIAL_OF[$h]="$serial"; IMGVER_OF[$h]="$imgver"
+		SERIAL_OF[$h]="$serial"; IMGVER_OF[$h]="$imgver"; IMGDEV_OF[$h]="$imgdev"
 		KERN_OF[$h]="$kern"; SLOT_OF[$h]="$slot"; UD_OF[$h]="$userdata"
 		INFO_OF[$h]="${imgver:-?} k${kern:-?} slot ${slot:-?} ud=${userdata:-?}"
 		[ -n "$serial" ] && ADDR_OF[$serial]="$h"
@@ -495,6 +514,18 @@ classify_all() {  # <addr...> ; fills the arrays above, MATCHED = flashable ones
 			reason="arch $arch"
 		elif [ -n "$FLEET_ID" ] && [ "$fleet" != "$FLEET_ID" ]; then
 			reason="fleet stamp '${fleet:-none}' != '$FLEET_ID'"
+		elif [ -n "$EXPECT_DEV" ] && [ -n "$imgdev" ] && [ "$imgdev" != "$EXPECT_DEV" ]; then
+			# ★ The image we are about to push was built for a DIFFERENT device than
+			# the one this unit is running. Nothing else here catches that: lynx
+			# (Pixel 7a) is ALSO gs201, so the device-tree match accepts it, the
+			# deploy key is the same, the overlay markers are the same, and two
+			# images built from one commit for two devices carry an IDENTICAL
+			# IMAGE_VERSION. Every other gate says yes.
+			#
+			# An in-layout upgrade would at least fail AVB on the inactive slot and
+			# roll back. A MIGRATION writes the whole partition and destroys both
+			# halves before anything can reject it, so this has to be caught here.
+			reason="image built for '$imgdev', this fleet run ships '$EXPECT_DEV'"
 		elif [ "${marks:-0}" -lt "$MIN_MARKS" ]; then
 			# Right board, our key works, but it is not running our rootfs — a
 			# stock-Android or third-party image on identical hardware. Flashing it
