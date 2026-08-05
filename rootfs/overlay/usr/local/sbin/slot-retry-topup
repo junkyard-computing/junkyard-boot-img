@@ -31,16 +31,73 @@
 # Only byte 0 (retry_count) is written. The flags byte is deliberately untouched:
 # an earlier hand-write here clobbered fastboot_ok while clearing another bit,
 # and flags are not this script's business.
+#
+# ★★ FACTORY FLASHES ONLY. OUR OTAs KEEP THE STANDARD 7.
+#
+# The larger budget is a concession to one specific situation: a fastboot flash
+# writes the SAME image into both halves, so neither is committed and the phone
+# carries ~14 boots in total with no fallback that differs from what it is
+# already running.
+#
+# An OTA is not that situation. It writes one half and leaves the other holding
+# the PREVIOUS, already-committed image — a real fallback. Rollback there is
+# meaningful and should stay prompt: 7 failed boots is ~10 minutes, 15 would be
+# ~22, and a genuinely bad update should be undone quickly.
+#
+# So: identical halves => factory flash => raise. Differing halves => our OTA =>
+# leave at 7. Fails closed — if the other half cannot be read we do NOT raise,
+# because 7 is the safe default and the OTA case is the one that must not change.
 set -u
 
 DEVINFO=${DEVINFO:-/dev/disk/by-partlabel/devinfo}
+SUPER=${SUPER:-/dev/disk/by-partlabel/super}
 BUDGET=${BUDGET:-15}
 STAMP=${STAMP:-/var/lib/slot-retry-topup/done}
+MNT=/run/slot-retry-topup-other
 
 log() { logger -t slot-retry-topup "$*"; echo "slot-retry-topup: $*" > /dev/kmsg 2>/dev/null; }
+stamp() { mkdir -p "$(dirname "$STAMP")" 2>/dev/null && : > "$STAMP"; }
 
 [ -e "$STAMP" ] && exit 0
 [ -b "$DEVINFO" ] || { log "no $DEVINFO — nothing to do"; exit 0; }
+
+# The inactive half of super, read-only. super is one partition split into two
+# equal halves by dm-linear; the running slot selects which.
+other_version() {
+    [ -b "$SUPER" ] || return 1
+    _total=$(blockdev --getsize64 "$SUPER" 2>/dev/null) || return 1
+    [ "${_total:-0}" -gt 0 ] || return 1
+    _half=$(( _total / 2 )); _half=$(( _half - (_half % 4096) ))
+    case "$(grep -o 'slot_suffix = "[^"]*"' /proc/bootconfig 2>/dev/null | cut -d'"' -f2)" in
+        _a) _off=$_half ;;
+        _b) _off=0 ;;
+        *)  return 1 ;;
+    esac
+    _lo=$(losetup -f --read-only -o "$_off" --sizelimit "$_half" --show "$SUPER" 2>/dev/null) || return 1
+    mkdir -p "$MNT" 2>/dev/null
+    # noload skips journal recovery, which a read-only mount of a possibly
+    # unclean filesystem requires.
+    if mount -o ro,noload "$_lo" "$MNT" 2>/dev/null; then
+        cat "$MNT/etc/image-version" 2>/dev/null
+        umount "$MNT" 2>/dev/null
+    fi
+    losetup -d "$_lo" 2>/dev/null
+    rmdir "$MNT" 2>/dev/null
+}
+
+mine=$(cat /etc/image-version 2>/dev/null)
+other=$(other_version)
+
+if [ -z "$mine" ] || [ -z "$other" ]; then
+    log "cannot compare halves (running '${mine:-?}', other '${other:-?}') — leaving the budget alone"
+    stamp
+    exit 0
+fi
+if [ "$mine" != "$other" ]; then
+    log "halves differ (running $mine, other $other) — an OTA, not a factory flash; budget stays at 7"
+    stamp
+    exit 0
+fi
 
 # devinfo layout (device/google/gs-common/bootctrl DevInfo.h): 128-byte struct,
 # magic "DEVI", per-slot 4 bytes at offset 48 (A) / 52 (B), byte 0 = retry_count.
@@ -58,7 +115,7 @@ before=$(dd if="$DEVINFO" bs=1 skip="$off" count=1 status=none 2>/dev/null | od 
 # Never lower an existing budget: if something already granted more, leave it.
 if [ "${before:-0}" -ge "$BUDGET" ]; then
     log "slot $slot already has $before retries (>= $BUDGET) — leaving it"
-    mkdir -p "$(dirname "$STAMP")" 2>/dev/null && : > "$STAMP"
+    stamp
     exit 0
 fi
 
@@ -69,7 +126,7 @@ if printf "\\$oct" | dd of="$DEVINFO" bs=1 seek="$off" count=1 conv=notrunc stat
     after=$(dd if="$DEVINFO" bs=1 skip="$off" count=1 status=none 2>/dev/null | od -An -tu1 | tr -d ' ')
     if [ "$after" = "$BUDGET" ]; then
         log "slot $slot retry budget raised $before -> $after (once per install; fallback to fastboot still armed)"
-        mkdir -p "$(dirname "$STAMP")" 2>/dev/null && : > "$STAMP"
+        stamp
     else
         log "wrote $BUDGET to slot $slot but it reads back $after — not stamping, will retry next boot"
     fi
