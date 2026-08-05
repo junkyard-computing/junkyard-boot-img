@@ -939,13 +939,28 @@ clean_image:
 	rm -f .create_image .debootstrap .install_vendor_firmware .install_packages .install_kernel .install_initramfs .build_boot
 
 clean: clean_image
-	rm -f boot/boot.img boot/vendor_boot.img
+	# ★ super.img MUST be removed here, and `all` rebuilds it (both changed
+	# 2026-08-05). It was previously excluded from `all` (another 8 GiB,
+	# only fastboot and a layout migration need it), so a `clean` that leaves it
+	# behind produces the worst possible outcome: fresh boot.img/vendor_boot.img
+	# beside a STALE rootfs inside super.img, with nothing to warn you. It is
+	# gitignored, so `git clean` does not catch it either, and `git status` stays
+	# clean throughout.
+	#
+	# That is not hypothetical — measured 2026-08-05: a `just clean && just all`
+	# after a version bump produced rootfs.img at 1.5.0-ge0559d7 while super.img
+	# still held 1.4.0-gdaa33e3. flash-fastboot.sh flashes super.img, and
+	# package-provisioning.sh reads the version FROM super.img, so the contractor
+	# kit would have told an operator to expect 1.4.0 on screen while shipping a
+	# 1.5.0 boot chain.
+	rm -f boot/boot.img boot/vendor_boot.img boot/super.img
 	sudo rm -rf rootfs/unpack
 
 # Build the full-flash `super.img`: the whole partition with both halves seeded
 # from $(ROOTFS_IMG). See the SUPER_IMG block near the top for why both.
 #
-# Not part of .build_boot: it is only needed for a fastboot flash or a layout
+# Not part of .build_boot, but `just all` does invoke it — see the justfile. It is
+# needed for a fastboot flash or a layout
 # migration, and it is another 8 GiB of build output. `just build_super_image`.
 .PHONY: super_image
 super_image: $(ROOTFS_IMG)

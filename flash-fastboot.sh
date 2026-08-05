@@ -107,6 +107,38 @@ if [ ! -f "$IMAGE_DIR/super.img" ]; then
 	echo " unseeded and the first OTA would have no valid rollback target.)" >&2
 	exit 1
 fi
+
+# ★ REFUSE A STALE super.img.
+#
+# super.img is NOT built by `just all` — it is another 8 GiB and only fastboot
+# and a layout migration need it — and `just clean` did not remove it either
+# until this was found. So an ordinary rebuild leaves fresh boot.img and
+# vendor_boot.img beside a super.img containing the PREVIOUS rootfs, with
+# nothing to warn you: it is gitignored, so `git status` stays clean throughout.
+#
+# Measured 2026-08-05: after a version bump, `just clean && just all` produced
+# rootfs.img at 1.5.0-ge0559d7 while super.img still held 1.4.0-gdaa33e3. This
+# script flashes super.img, so that would have paired a 1.5.0 boot chain with a
+# 1.4.0 rootfs on every phone in the batch.
+#
+# Only checkable when rootfs.img is present (a repo checkout). The provisioning
+# kit ships super.img alone, and package-provisioning.sh does this comparison at
+# packaging time instead.
+if [ -f "$IMAGE_DIR/rootfs.img" ]; then
+	_dbg=$(command -v debugfs || ls -d /nix/store/*e2fsprogs*/bin/debugfs 2>/dev/null | head -1)
+	if [ -n "$_dbg" ]; then
+		_sv=$("$_dbg" -R 'cat /etc/image-version' "$IMAGE_DIR/super.img" 2>/dev/null | tr -d '\0\n')
+		_rv=$("$_dbg" -R 'cat /etc/image-version' "$IMAGE_DIR/rootfs.img" 2>/dev/null | tr -d '\0\n')
+		if [ -n "$_sv" ] && [ -n "$_rv" ] && [ "$_sv" != "$_rv" ]; then
+			echo "refusing to flash: super.img is STALE." >&2
+			echo "  super.img  : $_sv" >&2
+			echo "  rootfs.img : $_rv" >&2
+			echo "super.img is not rebuilt by 'just all'. Regenerate it:" >&2
+			echo "    just build_super_image" >&2
+			exit 1
+		fi
+	fi
+fi
 fb flash super "$IMAGE_DIR/super.img"
 # fb oem uart disable
 fb reboot

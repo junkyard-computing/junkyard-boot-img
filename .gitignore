@@ -201,3 +201,8 @@ tools/memdump/memdump
 # USB register capture sessions (local debugging scratch: *.bin register dumps
 # plus per-capture context.txt notes). Whole tree is throwaway per-capture data.
 aosp-vs-mainline/
+
+# Provisioning kits built by package-provisioning.sh (~1.5 GB each).
+# Untracked files make GIT_DIRTY fire, which stamps images "-dirty" and breaks
+# flash-nmap --from-version targeting, so these must never sit untracked.
+junkyard-provisioning-*.zip

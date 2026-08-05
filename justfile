@@ -137,6 +137,25 @@ all android_kernel_branch="android-gs-felix-6.1-android16" size=_rootfs_size deb
     # Return blocks freed during the build (apt cache, pruned kernel trees) to
     # the sparse backing file so boot/rootfs.img doesn't bloat over time.
     just trim_rootfs
+    # ★ super.img is part of `all`, because `all` must mean ALL.
+    #
+    # It used to be excluded to save 8 GiB and a minute, on the reasoning that
+    # only fastboot and a layout migration need it. That reasoning was wrong in
+    # the way that matters: it left boot/ HALF UPDATED. A rebuild produced fresh
+    # boot.img, vendor_boot.img and rootfs.img next to a super.img containing the
+    # PREVIOUS rootfs — and nothing said so, because super.img is gitignored, so
+    # `git status` stays clean and the build reports success.
+    #
+    # Measured 2026-08-05: `just clean && just all` after a version bump left
+    # rootfs.img at 1.5.0-ge0559d7 and super.img at 1.4.0-gdaa33e3.
+    # flash-fastboot.sh flashes super.img, and package-provisioning.sh reads the
+    # shipped version FROM super.img — so the contractor kit would have told an
+    # operator to expect 1.4.0 on screen while shipping a 1.5.0 boot chain, and
+    # the screen check would have "passed" against the wrong expectation.
+    #
+    # A minute of dd is worth less than that failure mode. `just clean` now
+    # removes it too, so clean+all really does recreate every artifact.
+    just build_super_image
 
 [group('kernel')]
 [working-directory: 'kernel/source']
@@ -378,7 +397,11 @@ build_boot_images:
         KERNEL_VERSION=$KVER \
         INITRAMFS_PATH={{ _sysroot_dir }}/boot/initrd.img-$KVER
 
-# Not built by `all`: another 8 GiB of output, and only the fastboot flash and a
+# Built by `all` (since 2026-08-05) AND removed by `clean`, so clean+all really
+# recreates every artifact. Kept as its own target too, for regenerating just this
+# one. It used to be excluded to save 8 GiB, which left boot/ half-updated: a
+# fresh boot chain beside a super.img holding the PREVIOUS rootfs, silently,
+# because it is gitignored. Formerly: only the fastboot flash and a
 # layout migration use it. See the SUPER_IMG block in the Makefile for why BOTH
 # halves are seeded rather than just slot A.
 #
