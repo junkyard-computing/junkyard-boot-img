@@ -5,7 +5,12 @@
 # defined in gs201.dtsi) to status="okay". Without it UART login and the
 # display silently go dead. Any prior "reflash to stock" wipes whatever
 # stock dtbo was there, so always re-flash ours.
-DTBO=../kernel/source/out/felix/dist/dtbo.img
+# Image locations. Overridable so the SAME script works from a repo checkout and
+# from the standalone provisioning kit, which lays them out differently: the kit
+# sets IMAGE_DIR=images DTBO=images/dtbo.img. One tested flashing path, two
+# layouts, instead of a second copy that drifts.
+IMAGE_DIR="${IMAGE_DIR:-boot}"
+DTBO="${DTBO:-kernel/source/out/felix/dist/dtbo.img}"
 
 # Which device to flash. REQUIRED — bare `fastboot` commands target "the single
 # attached device", and this script runs `erase super` (the rootfs) among others,
@@ -26,6 +31,10 @@ if [ -z "$SERIAL" ]; then
 fi
 # Confirm the named device is actually in fastboot, so a typo'd serial fails here
 # rather than after the first few commands have already run against nothing.
+# How many phones are attached, recorded BEFORE we flash — the slot commit below
+# needs to know, and by the time it runs this phone has rebooted out of fastboot.
+ATTACHED=$(fastboot devices | awk 'NF' | wc -l)
+
 if ! fastboot devices | grep -q "^${SERIAL}[[:space:]]"; then
 	echo "refusing to flash: '$SERIAL' is not in fastboot. attached devices:" >&2
 	fastboot devices >&2
@@ -36,7 +45,7 @@ echo ">>> flashing $SERIAL ($(fastboot -s "$SERIAL" getvar product 2>&1 | head -
 # Every command below goes through this, so none of them can pick a device.
 fb() { fastboot -s "$SERIAL" "$@"; }
 
-pushd boot
+cd "$(dirname "$0")"
 
 # ★★ FLASH THE BOOT CHAIN TO BOTH SLOTS, and disable AVB on both.
 #
@@ -63,9 +72,9 @@ for slot in a b; do
 	fb oem disable-verity
 	fb erase init_boot_$slot   || true
 	fb erase boot_$slot        || true
-	fb flash boot_$slot boot.img
+	fb flash boot_$slot "$IMAGE_DIR/boot.img"
 	fb erase vendor_boot_$slot || true
-	fb flash vendor_boot_$slot vendor_boot.img
+	fb flash vendor_boot_$slot "$IMAGE_DIR/vendor_boot.img"
 	fb erase dtbo_$slot        || true
 	fb flash dtbo_$slot "$DTBO"
 	fb erase vendor_kernel_boot_$slot || true
@@ -92,17 +101,16 @@ fb erase super
 # bootloader rolls back into an unmountable half. On a unit with no screen, no
 # buttons and no physical access, that is the difference between a failed update
 # and a dead device.
-if [ ! -f super.img ]; then
+if [ ! -f "$IMAGE_DIR/super.img" ]; then
 	echo "missing super.img — build it with: just build_super_image" >&2
 	echo "(rootfs.img alone is only half of super; flashing it would leave slot B" >&2
 	echo " unseeded and the first OTA would have no valid rollback target.)" >&2
 	exit 1
 fi
-fb flash super super.img
+fb flash super "$IMAGE_DIR/super.img"
 # fb oem uart disable
 fb reboot
 
-popd
 
 # ★★ COMMIT THE FLASHED SLOT.
 #
@@ -119,11 +127,31 @@ popd
 # and we commit over that. No wired network required, which is the whole point.
 #
 # Best effort by design: if it cannot be reached, SAY SO LOUDLY rather than
-# exiting 0 on a unit whose slot is uncommitted. The in-image `--mark-only`
-# path also commits when no wired NIC is present, so this is belt-and-braces
-# for a unit that has a dongle attached but no DHCP behind it — the one case
-# neither mechanism can prove on its own.
-[ "${COMMIT_SLOT:-1}" = 1 ] || { echo ">>> COMMIT_SLOT=0, leaving the slot uncommitted"; exit 0; }
+# exiting 0 on a unit whose slot is uncommitted.
+#
+# ★★ OPT-IN (COMMIT_SLOT=1), AND ONLY WITH ONE PHONE ATTACHED.
+#
+# EVERY phone serves the gadget on the SAME address, 10.42.0.1. With a hub full
+# of them the host ends up with several 10.42.0.x interfaces all routing to that
+# one address, and the connection lands on whichever route wins — not on the
+# phone we just flashed. The serial check below stops us committing the WRONG
+# phone, but it cannot make the right one reachable, so on a hub this just burns
+# 40 x 15s of pointless polling per device.
+#
+# Defaulting this OFF is safe because flash-fastboot.sh writes the boot chain to
+# BOTH slots: an uncommitted slot that rolls back lands on an identical system.
+# Committing only avoids the rollback happening at all, which is cosmetic here.
+# Set COMMIT_SLOT=1 on a single-phone bench where that is worth having.
+if [ "${COMMIT_SLOT:-0}" != 1 ]; then
+	echo ">>> not committing the slot (COMMIT_SLOT=0; both slots hold this image)"
+	exit 0
+fi
+if [ "${ATTACHED:-1}" -gt 1 ]; then
+	echo ">>> $ATTACHED phones were attached — skipping the slot commit." >&2
+	echo "    Every phone answers on 10.42.0.1, so it cannot be aimed at one of them." >&2
+	echo "    Harmless: both slots carry this image, so a rollback changes nothing." >&2
+	exit 0
+fi
 
 GADGET=${GADGET:-10.42.0.1}
 SSH_KEY=${SSH_KEY:-$HOME/.ssh/junkyard-fleet}

@@ -1,0 +1,186 @@
+# Flashing Junkyard Debian onto Pixel Fold
+
+This folder is everything needed to flash a batch of Pixel Folds. Work through
+the steps in order. **Everything you need is in here — do not download anything.**
+
+This kit builds:
+
+| | |
+|---|---|
+| Image version | `@IMAGE_VERSION@` |
+| Kernel version | `@KERNEL_VERSION@` |
+| Google build | `@FELIX_BUILD@` (bundled under `factory/`) |
+| Packaged | @PACKAGED_DATE@ |
+
+**What you need**
+
+- A Linux machine with `adb` and `fastboot` (`platform-tools` from Google;
+  `fastboot` must be 33.0.1 or newer).
+- A **powered** USB hub. `super.img` is 7.9 GB per phone, so a batch of eight is
+  ~63 GB through one USB controller. An unpowered hub will drop phones mid-flash.
+- ~50 GB free disk space.
+
+**Check the kit arrived intact before you start:**
+
+```
+sha256sum -c SHA256SUMS
+```
+
+---
+
+## Step 1 — Prepare each phone
+
+On every phone, in Android:
+
+1. Settings → About phone → tap **Build number** seven times.
+2. Settings → System → Developer options → enable **OEM unlocking** and
+   **USB debugging**.
+
+Plug all the phones into the hub.
+
+## Step 2 — Get them into fastboot
+
+```
+./reboot-to-fastboot.sh
+```
+
+Phones you have not used before show an **"Allow USB debugging?"** dialog.
+Accept it on each, then run the script again — it names any phone still stuck as
+`unauthorized` rather than skipping it quietly.
+
+Wait until every phone shows the fastboot screen.
+
+## Step 3 — Unlock the bootloaders
+
+```
+./unlock-bootloaders.sh
+```
+
+⚠ Each phone shows a confirmation you must accept with the **volume and power
+buttons**. This cannot be automated.
+
+⚠ Unlocking **factory resets** the phone. That is expected.
+
+## Step 4 — Flash Google's image
+
+```
+./flash-google-batch.sh
+```
+
+This runs Google's own `flash-all.sh` (already unpacked in `factory/`) on every
+attached phone at once. Nothing to download and nothing to unzip.
+
+This step is not optional and it is not the same as step 5. It installs the
+bootloader and radio firmware, which our image never touches.
+
+⚠ **Do not substitute a different Google build.** Our system carries hardware
+firmware taken from build `@FELIX_BUILD@` and it has to match the bootloader and
+radio installed here. A mismatch does not fail cleanly — it looks like our
+software is broken.
+
+⚠ This **wipes** each phone, and reboots it several times on its own. Do not
+unplug anything until the summary appears. Each phone writes `google-<serial>.log`.
+
+Afterwards the phones boot into stock Android. Leave them at the welcome screen
+and put them back into fastboot: hold **volume down + power** while the phone
+restarts.
+
+## Step 5 — Flash the Junkyard image
+
+With every phone in fastboot:
+
+```
+./flash-batch.sh
+```
+
+This flashes all attached phones at once and prints `OK` or `FAILED` per phone.
+Each phone also writes its own `flash-<serial>.log`.
+
+⚠ **Do not unplug anything until the summary appears.** 7.9 GB per phone is
+slow. Slow is normal; slow is not stuck.
+
+If a phone fails, re-run just that one — you do not need to redo the batch:
+
+```
+./flash-fastboot.sh <serial>
+```
+
+The phones reboot themselves when finished.
+
+## Step 6 — Check the screens
+
+**First boot takes up to 90 seconds.** A phone on the Google logo for a minute
+and a half is still working. Only treat it as stuck after three minutes.
+
+When it finishes, each phone shows a login screen on its own display. **Read it.**
+It should look like this:
+
+```
+Debian GNU/Linux 13 tty1
+
+Image:  @IMAGE_VERSION@  (built @IMAGE_BUILD_DATE@)
+Kernel: @KERNEL_VERSION@
+Battery: 87%
+IPv4:   10.42.0.1
+Boot:   slot A
+```
+
+Check these three lines on every phone:
+
+| Line | Must read | If it does not |
+|---|---|---|
+| `Image:` | `@IMAGE_VERSION@` | Re-flash: `./flash-fastboot.sh <serial>` |
+| `Kernel:` | `@KERNEL_VERSION@` | Re-flash: `./flash-fastboot.sh <serial>` |
+| `Boot:` | `slot A` | Fine if it says `slot B` — see "About slots" |
+
+`Battery:` and `IPv4:` will differ per phone and do not matter here.
+
+**Why read the screen rather than trust the flash.** A phone can accept a flash,
+report success, and still boot something else — that is the specific failure this
+check exists to catch, and the screen is the only place it shows. A phone that
+displays the two lines above is running what you flashed.
+
+**A phone showing no login screen at all after three minutes** has not come up.
+Re-flash it. If it fails twice, set it aside and report the serial.
+
+---
+
+## About slots
+
+Each phone keeps two copies of the system, called slot A and slot B. This kit
+puts the **same image in both**, so a phone is fine whichever slot it starts on.
+
+If `Boot:` reads `slot B` instead of `slot A`, the phone chose its backup copy.
+It is running the same software and needs nothing done to it. Worth mentioning
+in your notes if it happens on many phones, but it is not a fault.
+
+### Nothing to do about slots here
+
+A freshly flashed phone is on probation: it has a limited number of start-ups to
+prove itself before falling back to its other copy. It leaves probation once it
+reaches a working network, which normally happens where the phones are finally
+installed — not here.
+
+**This does not need managing during flashing.** Both copies hold the same
+image, so a phone that falls back is running exactly the same software. Powering
+phones on and off a handful of times while you check screens is well within
+budget.
+
+Just avoid leaving a phone power-cycling repeatedly — dozens of times — before it
+has ever been on a network. Normal handling is fine.
+
+---
+
+## If something goes wrong
+
+**A phone is missing from `fastboot devices`.** It is not in fastboot, or the
+cable is charge-only. Try another cable first — this is the most common cause.
+
+**`flash-fastboot.sh` says "not in fastboot — skipping".** That phone booted
+while the batch ran. Put it back in fastboot and re-run it for that serial.
+
+**A phone reboots by itself during flashing.** Re-flash it. Tell us if the same
+phone does it more than once.
+
+**Anything you set aside:** send us the serial number and what its screen showed
+(a photo is ideal). The serial is on the fastboot screen and on the box.

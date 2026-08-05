@@ -1,0 +1,5 @@
+# Build outputs are staged here for the contractor, never committed —
+# super.img alone is 7.9 GB.
+*.img
+VERSION
+!.gitignore
