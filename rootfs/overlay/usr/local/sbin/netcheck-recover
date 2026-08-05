@@ -341,7 +341,31 @@ done
 # reboot is still the answer if this does not help — it is now the second answer.
 OTG_ID=${OTG_ID:-/sys/devices/platform/11210000.usb/dwc3_exynos_otg_id}
 BOUNCE_SETTLE=${BOUNCE_SETTLE:-15}
-if [ -w "$OTG_ID" ]; then
+
+# ★★ NEVER BOUNCE THE PORT WHILE A HOST IS ATTACHED TO THE GADGET.
+#
+# gadget_reachable() requires BOTH carrier AND a leased peer that answers. The
+# state in between — carrier up, no peer answering — is a phone plugged into a
+# laptop whose interface has not taken a DHCP lease yet, or that filters ICMP.
+# healthy() is false there, so we would arrive here and bounce the role toward
+# HOST, destroying the very link someone is sitting on.
+#
+# Bouncing cannot fix that fault anyway: the problem is on the host side, and no
+# amount of role-forcing on the phone configures somebody's laptop. Someone
+# plugged that cable in; leave them their end to fix.
+#
+# In the field this never fires: a fielded unit has a dongle and no host, so
+# usb0 carrier is 0 and the bounce proceeds exactly as before. This only changes
+# behaviour on a bench or at the factory, where a human is by definition present.
+#
+# Same shape as the dongle-rehost bug fixed in 8f76ec2, which tore down gadget
+# sessions ~30s after every boot. This one is narrower — it needs the network to
+# already look broken, and only writes otg_id, which is frequently a no-op when
+# the Type-C manager owns the role — but it is the same mistake: attacking the
+# port to hunt for a dongle while the gadget is carrying the only way in.
+if [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ]; then
+    log "USB gadget has a host attached — not bouncing the port role"
+elif [ -w "$OTG_ID" ]; then
     log "no network after ${DEADLINE}s — bouncing the USB host role before escalating"
     if printf 1 > "$OTG_ID" 2>/dev/null && sleep 1 && printf 0 > "$OTG_ID" 2>/dev/null; then
         j=0
