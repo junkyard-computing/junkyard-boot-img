@@ -709,7 +709,31 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	# panic recurred — same call path, same faulting address
 	# ffffffc00e1e3568. Do not re-add it on that reasoning; the panic is
 	# something else. See the uevent-panic notes for the live state.
-	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d' $(MODULE_ORDER_PATH)
+	#
+	# st21nfc: the NFC controller driver, dropped because on some units the chip
+	# does not answer cleanly on i2c and its probe wedges a udev worker — inside
+	# the INITRAMFS, where dracut-initqueue then loops "Timed out while waiting
+	# for udev queue to empty" at ~60s a round.
+	#
+	# Measured over UART on 34291FDHS000WV (2026-08-04): 500+ seconds of boot,
+	# stalls of 60/117/46/58/50s each ending in either an st21nfc
+	# "Switched from IDLE to IDLE" error or another initqueue timeout. The same
+	# image on 35041FDHS0032G boots in 13.0s total. The two units differ in
+	# st21nfc lines (7 vs 1) and IDLE-to-IDLE errors (7 vs 0); every other
+	# candidate was identical across both — same cs40l26 i2c NO-ACKs (11), same
+	# deferred probes (9), same missing-firmware -2 loads (17), healthy UFS, AOC
+	# up. So the NFC chip is the variable, not the image.
+	#
+	# The user-visible symptom is a device that sits on the bootloader splash for
+	# ten minutes and looks bricked, which is how this started: three separate
+	# wrong diagnoses (bad dongle, netcheck bricking both slots, an unclean
+	# sysrq reboot) before the console showed it was simply still in the initramfs.
+	#
+	# These devices have no use for NFC at all, so dropping the driver costs
+	# nothing and removes a boot-blocking dependency on a peripheral we never
+	# touch. Paired with a blacklist entry so udev cannot autoload it later by
+	# modalias — the sed only stops dracut force-loading it.
+	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d; /^st21nfc$$/d' $(MODULE_ORDER_PATH)
 	# Prune module/header/boot trees from other kernel versions so a
 	# KERNEL_VERSION bump doesn't accumulate stale ones in the image. (The new
 	# version's initrd is (re)created later in .install_initramfs.)
