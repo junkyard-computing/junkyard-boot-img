@@ -51,6 +51,9 @@ APT_PACKAGES_FILE ?= rootfs/packages.txt
 # Sysroot-relative paths retired from rootfs/overlay/. See the rm -f in
 # .install_packages for why deleting an overlay file is not enough on its own.
 RETIRED_OVERLAY_PATHS ?= \
+	usr/local/sbin/slot-autocommit \
+	etc/systemd/system/slot-autocommit.service \
+	etc/systemd/system/multi-user.target.wants/slot-autocommit.service \
 	etc/systemd/system/multi-user.target.wants/netcheck-recover.service \
 	etc/systemd/system/multi-user.target.wants/mark-slot-successful.service
 MODULE_ORDER_PATH ?= rootfs/module_order.txt
