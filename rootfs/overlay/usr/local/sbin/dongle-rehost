@@ -60,6 +60,31 @@ have_nic() {
     return 1
 }
 
+# ★★ IS THE USB GADGET ACTUALLY IN USE? IF SO, DO NOT TOUCH THE PORT.
+#
+# have_nic() deliberately ignores usb0, so a phone with no dongle looks NIC-less
+# — which is exactly a phone sitting on a USB cable to a laptop, being used over
+# the gadget. Every lever below (otg_id, dwc3 mode=host, TCPC unbind/rebind)
+# forces the port towards HOST, and that tears the gadget down.
+#
+# That is not theoretical: it is what made a gadget-only unit reachable over SSH
+# for ~30s after boot and then vanish from the host's USB bus entirely, over and
+# over, on 2026-08-05. Before the escalation ladder existed the writes were
+# no-ops ("role unchanged none") so this was harmless; making the ladder work
+# turned a harmless misfire into a service that destroys the connection it is
+# supposed to be repairing.
+#
+# ★ On a screenless, buttonless unit the gadget is a PATH IN. Breaking it to go
+# looking for a dongle that was never attached trades a working route for a
+# hypothetical one.
+#
+# carrier=1 is the right test: for CDC-NCM the device only sees carrier once a
+# host has configured the link, so it means a host is really there — not merely
+# that we brought usb0 up ourselves.
+gadget_in_use() {
+    [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ]
+}
+
 # Give normal enumeration a chance before intervening.
 #
 # Log the outcome UNCONDITIONALLY, including the boring success case. An earlier
@@ -72,8 +97,16 @@ while [ "$i" -lt "$SETTLE" ]; do
         log "wired NIC present after ${i}s ($(ls /sys/class/net | wc -l) ifaces total) — nothing to do"
         exit 0
     fi
+    if gadget_in_use; then
+        log "USB gadget is connected to a host — leaving the port alone"
+        exit 0
+    fi
     i=$((i + 1)); sleep 1
 done
+if gadget_in_use; then
+    log "USB gadget is connected to a host — leaving the port alone"
+    exit 0
+fi
 log "no wired NIC after ${SETTLE}s; ifaces=$(ls /sys/class/net | tr '\n' ' ')"
 
 # Pick a lever we can actually write. Report which, and REPORT FAILURE HONESTLY:
@@ -111,6 +144,12 @@ force_device() {
 t=0
 while [ "$t" -lt "$TRIES" ]; do
     t=$((t + 1))
+    # Re-check every round: this loop runs for ~90s, and someone plugging a
+    # laptop in mid-way must not have the cable yanked out from under them.
+    if gadget_in_use; then
+        log "gadget came up mid-run — stopping before we break it"
+        exit 0
+    fi
     log "no wired NIC after ${SETTLE}s (attempt $t/$TRIES) — forcing host via $METHOD"
     # Bounce through device so the downstream port sees a real disconnect,
     # then assert host. On a port that simply never left device role (the PD
@@ -169,6 +208,10 @@ wait_for_nic() {  # wait_for_nic <seconds> <what>
     return 1
 }
 
+if gadget_in_use; then
+	log "gadget in use — skipping escalation entirely"
+	exit 0
+fi
 if [ -w "$DWC3_MODE" ]; then
     log "escalating: asking dwc3 directly for host mode via $DWC3_MODE"
     if echo host > "$DWC3_MODE" 2>/dev/null; then
