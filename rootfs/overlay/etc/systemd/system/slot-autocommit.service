@@ -1,0 +1,16 @@
+[Unit]
+Description=Commit the A/B slot when a rollback could not achieve anything
+# Needs the rootfs and device nodes, nothing else. Deliberately not ordered
+# before anything: if this is slow or fails it must not hold up the boot.
+After=local-fs.target
+ConditionPathExists=/usr/local/bin/pixel-bootctl
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/slot-autocommit
+# Bounded: it loop-mounts the inactive half read-only, and a wedged mount must
+# not become a boot-time hang on a device with no console.
+TimeoutStartSec=60
+
+[Install]
+WantedBy=multi-user.target
