@@ -60,9 +60,36 @@ log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg
 # inhibit behind only until the next boot, which is the same event that would
 # have cleared the fault anyway. A persistent path could disable the only
 # recovery mechanism on a headless device indefinitely.
+# --mark-only: confirm the network and COMMIT THE SLOT, never escalate.
+#
+# Split out because the two jobs have opposite risk profiles. Marking a slot
+# successful is safe the instant the network is proven; escalating (reboot,
+# rollback) must stay slow and cautious. Running both off one 5-minute timer made
+# the safe half inherit the cautious half's delay, and that silently reverted a
+# freshly flashed device:
+#
+#   flash-ssh switches to the new slot active-but-NOT-successful (rollback-safe).
+#   The slot is only committed once netcheck proves network — first run at
+#   OnBootSec=5min. Meanwhile the OTA inhibit suppresses netcheck for up to 900s.
+#   So a newly flashed unit has a ~20 minute window in which SEVEN reboots
+#   exhaust the retry counter and the bootloader rolls back — correctly, but to
+#   the OLD image, silently, on a unit that is up and reachable the whole time.
+#
+# Observed on 34291FDHS000WV 2026-08-05 during a 20-cycle reboot soak: slot B
+# ended `retry count: 0, successful: false` and the device came back running the
+# previous image from slot A. Power flapping, a rack power-cycle, or an operator
+# retrying a unit that "looks stuck" all reproduce it in the field.
+MARK_ONLY=0
+[ "${1:-}" = "--mark-only" ] && MARK_ONLY=1
+
 INHIBIT=/run/netcheck-recover.inhibit
 INHIBIT_MAX_AGE=${INHIBIT_MAX_AGE:-900}
-if [ -e "$INHIBIT" ]; then
+# ★ --mark-only deliberately IGNORES the inhibit. The inhibit exists to stop an
+# in-flight OTA being rebooted out from under itself; committing a slot that has
+# demonstrably reached the network does not reboot anything, and suppressing it
+# is what leaves the freshly flashed slot uncommitted during the exact window the
+# retry counter is being spent.
+if [ "$MARK_ONLY" != 1 ] && [ -e "$INHIBIT" ]; then
     _now=$(date +%s 2>/dev/null || echo 0)
     _mt=$(stat -c %Y "$INHIBIT" 2>/dev/null || echo 0)
     _age=$(( _now - _mt ))
@@ -234,6 +261,26 @@ slot_field() {  # slot_field <field>  -> value for the RUNNING slot
         {v[s FS $1]=$2}
         END {print v[want FS f]}'
 }
+
+# --mark-only stops here: commit the slot if the network is proven, and NEVER
+# escalate. Exits 0 either way — an unproven slot is simply left uncommitted for
+# the next run to retry, which is the conservative behaviour. All the escalation
+# machinery below (bounce, reboot, mark-unbootable) stays on the slow timer.
+if [ "$MARK_ONLY" = 1 ]; then
+    i=0
+    while [ "$i" -lt "${MARK_DEADLINE:-20}" ]; do
+        if healthy; then
+            "$BOOTCTL" mark-successful >/dev/null 2>&1 || true
+            : > "$HADIP" 2>/dev/null
+            rm -f "$COUNTER"
+            log "network proven — slot committed (mark-only)"
+            exit 0
+        fi
+        i=$((i + 1)); sleep 1
+    done
+    log "network not proven within ${MARK_DEADLINE:-20}s — leaving the slot uncommitted (mark-only never escalates)"
+    exit 0
+fi
 
 # Give a transient blip a chance to clear before acting on it.
 i=0
