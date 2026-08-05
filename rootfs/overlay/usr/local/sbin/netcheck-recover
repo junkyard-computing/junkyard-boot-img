@@ -328,8 +328,31 @@ wired_nic_present() {
 # reboot-looping a device that nobody has cabled. Gated on HARDWARE PRESENCE,
 # not on address history — see wired_nic_present() above for why. If a NIC is
 # present but dead, we fall through and reboot, which is the case that matters.
-if [ "$proven" = true ] && [ ! -e "$HADIP" ] && ! wired_nic_present; then
-    log "no wired NIC attached and no address since boot — nothing plugged in; not rebooting"
+# ★★ NO WIRED NIC => NEVER ESCALATE, whether or not this slot has proven itself.
+#
+# This guard used to require `proven = true`, which made it useless in the one
+# case that matters. A slot only becomes "proven" by observing a healthy network,
+# so a device whose NIC is dead can never prove ANY slot — and an unproven slot
+# falls straight through to: 3 reboots, mark-unbootable, roll back. The other slot
+# has the same dead NIC, so it burns down the same path, and the device ends up
+# with BOTH slots unbootable and nothing to boot.
+#
+# That is a device bricking itself over a hardware fault, on units with no screen
+# and no buttons. Believed to be what happened to 34291FDHS000WV on 2026-08-04:
+# freshly flashed (so neither slot was proven), came up gadget-only with no wired
+# NIC, and ended stuck at the bootloader splash.
+#
+# The rule the escalation is built on is "a slot that cannot reach the network is
+# probably a bad image". That inference is only valid if a NIC exists to fail. No
+# NIC at all is positive evidence the fault is NOT the image, and rolling back
+# cannot attach one — so rollback is guaranteed useless here and its downside is
+# unbounded. Stay up, stay debuggable over the USB gadget, and let a human decide.
+if ! wired_nic_present; then
+    log "no wired NIC attached — hardware fault, not a bad image; not rebooting or rolling back"
+    exit 0
+fi
+if [ "$proven" = true ] && [ ! -e "$HADIP" ]; then
+    log "wired NIC present but no address since boot on a proven slot — nothing plugged in; not rebooting"
     exit 0
 fi
 if [ ! -e "$HADIP" ] && wired_nic_present; then
