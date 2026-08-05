@@ -97,7 +97,7 @@ This flashes all attached phones at once and prints `OK` or `FAILED` per phone.
 Each phone also writes its own `flash-<serial>.log`.
 
 ⚠ **Do not unplug anything until the summary appears.** 7.9 GB per phone is
-slow. Slow is normal; slow is not stuck.
+slow.
 
 If a phone fails, re-run just that one — you do not need to redo the batch:
 
