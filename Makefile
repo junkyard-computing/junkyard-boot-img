@@ -841,7 +841,22 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 		--add "rescue bash rootfs-flash rootfs-slot" \
 		--install /vendor/firmware/aoc.bin \
 		--kernel-cmdline "rd.shell=0 rd.emergency=reboot" \
+		--omit-drivers "$(INITRAMFS_EXCLUDE_MODULES)" \
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
+	# --omit-drivers is load-bearing and NOT redundant with the
+	# $(MODULE_ORDER_PATH) filtering. Removing a name from the force-drivers
+	# list only stops dracut FORCE-loading it; the .ko still ships in the
+	# initramfs, and udev then autoloads it by modalias anyway — measured:
+	# exynos-drm.ko was still present and `exynos-decon 1c240000.drmdecon:
+	# successfully probed` still appeared at t=3.4s under the initramfs
+	# hostname, with the full 6min42s stall intact. --omit-drivers keeps the
+	# file out entirely, which is the only thing that actually prevents the
+	# probe.
+	#
+	# ⚠ When verifying this, grep the initramfs for the FILE name, not the
+	# module name: modinfo reports `exynos_drm` but the file is `exynos-drm.ko`.
+	# Grepping for `exynos_drm\.ko` returns a false zero and makes a broken
+	# build look verified.
 	just unmount_rootfs
 	touch $@
 
