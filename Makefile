@@ -882,10 +882,36 @@ install_arm_blobs: .install_packages
 # transition for the quirk to prevent. The real question is why SuperSpeed link
 # RECOVERY fails, which is a PHY/signal-integrity matter, not an LPM one.
 # (snps,parkmode-disable-ss-quirk is also NOT a fix — failures recur with it.)
+# udev.event_timeout=20 BOUNDS THE INTERMITTENT MULTI-MINUTE BOOT.
+#
+# On some boots a udev worker wedges while holding the display `atc` uevent and
+# systemd-udevd SIGKILLs it at its default timeout — measured at 130s, twice per
+# affected boot, which is the whole of the ~6min42s initrd (dracut-initqueue
+# meanwhile loops "Timed out while waiting for udev queue to empty"). Same image,
+# same hour, three units: 12.8s / 25.2s / 6min38s.
+#
+# ★ The worker is killed either way. NOTHING depends on it finishing, so the
+# 130s is pure waiting for a foregone conclusion. Killing it at 20s instead
+# turns a ~6min50s worst case into roughly 50s, without needing to know what it
+# is blocked on. This BOUNDS the symptom; it is not a root-cause fix, and the
+# underlying wedge is still worth chasing at the pd_dpu/coldplug level.
+#
+# ★★ Why bounding it matters more than the seconds saved: with no screen and no
+# console, a 6min50s boot and a HANG are indistinguishable from the outside.
+# "Wait seven minutes and see" is not a procedure a contractor can follow across
+# hundreds of units, so the unpredictability was the real defect, not the delay.
+#
+# 20s is ~1000x the duration of a normal udev event (they finish in ms), so it
+# should never truncate legitimate work. It is read by systemd-udevd straight
+# from /proc/cmdline, which is why it goes HERE in boot.img's cmdline and not in
+# dracut's --kernel-cmdline: the latter only lands in the initramfs's
+# /etc/cmdline.d for dracut's own parsing, where systemd-udevd never sees it.
+# Being on the real cmdline also means it applies in the real root too, where
+# the same wedge otherwise burns 130s post-boot.
 .build_boot: .install_initramfs .install_vendor_firmware
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
-		--cmdline "root=/dev/mapper/rootfs" \
+		--cmdline "root=/dev/mapper/rootfs udev.event_timeout=20" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
