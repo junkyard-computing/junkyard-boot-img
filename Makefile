@@ -54,21 +54,6 @@ RETIRED_OVERLAY_PATHS ?= \
 	etc/systemd/system/multi-user.target.wants/netcheck-recover.service \
 	etc/systemd/system/multi-user.target.wants/mark-slot-successful.service
 MODULE_ORDER_PATH ?= rootfs/module_order.txt
-
-# Modules that must NOT be force-loaded into the initramfs by dracut.
-# Removed from $(MODULE_ORDER_PATH) in .install_kernel — see the long comment
-# there for why each group is here. Short version: the first three are drivers
-# we never use whose probes can wedge a udev worker; the rest are the display
-# stack, which has no job in early boot and whose dqe/atc sysfs nodes are what
-# actually caused the multi-minute boot stalls.
-INITRAMFS_EXCLUDE_MODULES := \
-	bcmdhd4389 exynos_mfc st21nfc \
-	exynos_drm exynos_drm_audio gs_drm_connector gs_panel panel_common \
-	drm_display_helper phy_exynos_mipi_dsim \
-	panel_samsung_drv panel_samsung_emul panel_samsung_sofef01 \
-	panel_samsung_s6e3hc2 panel_samsung_s6e3hc3 panel_samsung_s6e3hc3_c10 \
-	panel_samsung_s6e3hc4 panel_samsung_s6e3fc3 panel_samsung_s6e3fc3_p10 \
-	panel_samsung_ana6707_f10 panel_samsung_ea8182_f10 panel_boe_nt37290
 ROOTFS_IMG ?= boot/rootfs.img
 
 # ═══ FULL-FLASH IMAGE (`super.img`) ══════════════════════════════════════════
@@ -725,54 +710,30 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	# ffffffc00e1e3568. Do not re-add it on that reasoning; the panic is
 	# something else. See the uevent-panic notes for the live state.
 	#
-	# st21nfc: the NFC controller driver. Dropped because these devices have no
-	# use for NFC, which costs nothing and removes a peripheral from the boot
-	# path. ⚠ It was originally added here as the fix for the multi-minute boot
-	# stall and that diagnosis was WRONG — see the display block below. Keeping
-	# it is fine; crediting it with anything is not.
+	# st21nfc: the NFC controller driver, dropped because on some units the chip
+	# does not answer cleanly on i2c and its probe wedges a udev worker — inside
+	# the INITRAMFS, where dracut-initqueue then loops "Timed out while waiting
+	# for udev queue to empty" at ~60s a round.
 	#
-	# THE DISPLAY STACK: the actual cause of the multi-minute boot stall.
+	# Measured over UART on 34291FDHS000WV (2026-08-04): 500+ seconds of boot,
+	# stalls of 60/117/46/58/50s each ending in either an st21nfc
+	# "Switched from IDLE to IDLE" error or another initqueue timeout. The same
+	# image on 35041FDHS0032G boots in 13.0s total. The two units differ in
+	# st21nfc lines (7 vs 1) and IDLE-to-IDLE errors (7 vs 0); every other
+	# candidate was identical across both — same cs40l26 i2c NO-ACKs (11), same
+	# deferred probes (9), same missing-firmware -2 loads (17), healthy UFS, AOC
+	# up. So the NFC chip is the variable, not the image.
 	#
-	# Symptom: a device sits on the bootloader splash for 6-10 minutes and looks
-	# bricked. dracut-initqueue loops "Timed out while waiting for udev queue to
-	# empty" ~3 times, and initrd comes out at ~6min42s instead of ~8s.
+	# The user-visible symptom is a device that sits on the bootloader splash for
+	# ten minutes and looks bricked, which is how this started: three separate
+	# wrong diagnoses (bad dongle, netcheck bricking both slots, an unclean
+	# sysrq reboot) before the console showed it was simply still in the initramfs.
 	#
-	# Mechanism: systemd-udevd logs
-	#     atc: Worker [N] processing SEQNUM=X is taking a long time
-	#     atc: Worker [N] processing SEQNUM=X killed          (130s later)
-	# `atc` is the display Adaptive-Tone-Control sysfs node under
-	# /sys/devices/platform/1c24{0,1}000.drmdecon/dqe{0,1}/atc, created by
-	# `exynos_drm`. pm_genpd_summary shows pd-dpu = off-0 with both drmdecon
-	# devices suspended, i.e. the same gated-power-domain family as the known
-	# "decon MMIO on a gated pd_dpu hangs the AXI" bug. 130s is exactly the
-	# systemd-udevd event timeout, so the worker is killed rather than finishing.
-	# It is the ONLY device that ever wedges — nothing else appears in a
-	# "taking a long time" line, on any unit.
-	#
-	# ★ Why it looked unit-specific and intermittent: it is a race, and the only
-	# thing that matters is whether the 130s stall lands INSIDE dracut's
-	# udev-settle window. Measured on one unit (35071FDHS0017C), same image,
-	# consecutive boots: 6min51s (4 atc wedges, 3 initqueue timeouts) then
-	# 12.8s (zero atc wedges, zero timeouts). 34291FDHS000WV gave 12.7s, 12.8s,
-	# then 6min37s. So two fast boots prove nothing here — soak before believing
-	# any fix, because a coin flip gives ~50% odds of looking validated.
-	#
-	# Fix: stop force-loading the display stack into the INITRAMFS. Nothing in
-	# early boot needs it — the initramfs mounts UFS/dm/ext4, has no display, no
-	# networking and no plymouth (rd.shell=0), and the console we actually use
-	# comes up in the real root. With exynos_drm absent there, the drmdecon
-	# platform devices never probe in the initramfs, the dqe/atc nodes never
-	# exist, and there is no worker to wedge inside the settle window. The
-	# modules still load normally after switch_root: systemd-udev-trigger
-	# re-emits uevents for every device and they autoload by modalias.
-	#
-	# ⚠ These are NOT blacklisted, unlike st21nfc — the display is wanted, just
-	# not this early. If a panel ever fails to come up in the real root, check
-	# `lsmod | grep exynos_drm` before suspecting the panel driver itself.
-	sudo sh -c 'printf "%s\n" $(INITRAMFS_EXCLUDE_MODULES) > $(MODULE_ORDER_PATH).excl; \
-		grep -vxF -f $(MODULE_ORDER_PATH).excl $(MODULE_ORDER_PATH) > $(MODULE_ORDER_PATH).new; \
-		mv $(MODULE_ORDER_PATH).new $(MODULE_ORDER_PATH); \
-		rm -f $(MODULE_ORDER_PATH).excl'
+	# These devices have no use for NFC at all, so dropping the driver costs
+	# nothing and removes a boot-blocking dependency on a peripheral we never
+	# touch. Paired with a blacklist entry so udev cannot autoload it later by
+	# modalias — the sed only stops dracut force-loading it.
+	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d; /^st21nfc$$/d' $(MODULE_ORDER_PATH)
 	# Prune module/header/boot trees from other kernel versions so a
 	# KERNEL_VERSION bump doesn't accumulate stale ones in the image. (The new
 	# version's initrd is (re)created later in .install_initramfs.)
@@ -841,22 +802,7 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 		--add "rescue bash rootfs-flash rootfs-slot" \
 		--install /vendor/firmware/aoc.bin \
 		--kernel-cmdline "rd.shell=0 rd.emergency=reboot" \
-		--omit-drivers "$(INITRAMFS_EXCLUDE_MODULES)" \
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
-	# --omit-drivers is load-bearing and NOT redundant with the
-	# $(MODULE_ORDER_PATH) filtering. Removing a name from the force-drivers
-	# list only stops dracut FORCE-loading it; the .ko still ships in the
-	# initramfs, and udev then autoloads it by modalias anyway — measured:
-	# exynos-drm.ko was still present and `exynos-decon 1c240000.drmdecon:
-	# successfully probed` still appeared at t=3.4s under the initramfs
-	# hostname, with the full 6min42s stall intact. --omit-drivers keeps the
-	# file out entirely, which is the only thing that actually prevents the
-	# probe.
-	#
-	# ⚠ When verifying this, grep the initramfs for the FILE name, not the
-	# module name: modinfo reports `exynos_drm` but the file is `exynos-drm.ko`.
-	# Grepping for `exynos_drm\.ko` returns a false zero and makes a broken
-	# build look verified.
 	just unmount_rootfs
 	touch $@
 
