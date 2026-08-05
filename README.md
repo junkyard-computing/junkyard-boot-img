@@ -31,7 +31,7 @@ just sync_vendor_firmware         # once; ~2GB OTA download
 just all                          # full pipeline; produces boot/{boot,vendor_boot,rootfs}.img
 ```
 
-`just all` takes optional args: `android_kernel_branch`, `size`, `debootstrap_release`, `root_password`, `hostname`, `user_login`, `user_password`. Defaults: `android-gs-felix-6.1-android16`, `8100M`, `trixie`, `0000`, `fold`, `kalm`, `0000`.
+`just all` takes optional args: `android_kernel_branch`, `size`, `debootstrap_release`, `root_password`, `hostname`, `user_login`, `user_password`, `fleet_id`. Defaults: `android-gs-felix-6.1-android16`, `4000M`, `trixie`, `0000`, `fold`, `kalm`, `0000`, empty.
 
 ### What `just all` runs
 
@@ -60,9 +60,11 @@ fastboot oem disable-verification
 ./flash-fastboot.sh
 ```
 
-`flash-fastboot.sh` wraps flashing `boot.img` + `vendor_boot.img` + `rootfs.img` (to the `super` slot) over fastboot, with the device in the bootloader on USB.
+`flash-fastboot.sh` wraps flashing `boot.img` + `vendor_boot.img` + `super.img` over fastboot, with the device in the bootloader on USB. It requires an explicit serial (`$1` or `FASTBOOT_SERIAL`) because it erases `super`, and it flashes `super.img` — the full-flash image with **both** rootfs halves seeded — not `rootfs.img`, which is only one half.
 
-For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then reflashes the rootfs via the `90rootfs-flash` dracut pre-mount hook. It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and stages the image on the `userdata` partition — mounting it if it isn't mounted (the rootfs reflash is destructive and rollback-free).
+For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then arms a rootfs reflash that the initramfs' `90rootfs-flash` **pre-mount hook** performs on the way back up — before root is mounted, and after verifying the staged image against its `sha256`/`size` sidecars. (Not a systemd shutdown pivot: `dracut-shutdown.service` is `/bin/true` on these images.) It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and stages the image on the `userdata` partition — mounting it if it isn't mounted.
+
+On a **rootfs-A/B** image the hook writes only the active slot's half of `super`, so the other half keeps the previous rootfs and a bad image rolls back with the boot slot. On a single-rootfs image it overwrites the whole partition, which is destructive and rollback-free. Which one happens is decided by the image size, not a flag — see [rootfs A/B](#rootfs-ab) below.
 
 For a **fleet**, `flash-nmap.sh` finds the devices first: it nmaps the given subnets for SSH, fingerprints every host that answers (board, arch, serial, image version, A/B slot, `userdata`), writes an inventory CSV, and reports which ones are really ours.
 
@@ -74,6 +76,27 @@ For a **fleet**, `flash-nmap.sh` finds the devices first: it nmaps the given sub
 It flashes **nothing** without `--flash`. A device is a target only if it (1) authorizes our SSH key and grants it passwordless root, (2) runs our rootfs — gs201/felix device tree plus overlay-only markers — and (3) reports an `IMAGE_VERSION` matching `--from-version`. That last one is the gate that scales: you know what image the devices were built with even when you don't know their serials. `--fleet ID` additionally requires the build-time stamp in `/etc/junkyard-fleet` (`just all fleet_id=…`). Exclusions are by serial (`--exclude-serial-file`), which is the list that stays small.
 
 Because the rootfs half is not rollback-safe, a run is **canaried and waved**: `--canary 3` units go first and must come back on the new version or the run stops with the rest untouched, then `--wave 25` batches, each verified by re-scanning and matching serials (a reflashed device may take a new DHCP lease). `--max-fail 10` trips a circuit breaker. Devices already on the target version are skipped, so re-running the same command converges the fleet. Logs and the inventory land in `out/flash-nmap/<timestamp>/`.
+
+## rootfs A/B
+
+`super` is a single 8136 MiB partition with no A/B twin — the GPT has no free space to carve one from. So it is split in software: two 4068 MiB halves, each holding a complete rootfs, with the initramfs' `90rootfs-slot` module mapping one at a time as `/dev/mapper/rootfs` via dm-linear. `boot.img`'s cmdline is `root=/dev/mapper/rootfs`, so the half that gets mapped is the one that gets mounted.
+
+**Which half is not our decision.** The bootloader has already chosen a boot slot and reports it in `androidboot.slot_suffix`, so the rootfs slot simply follows it. That means rootfs A/B inherits the boot chain's existing machinery — same active-slot choice, same retry counter, same automatic rollback when a slot fails to boot — instead of needing a selector and a rollback policy of its own. `pixel-bootctl` is unchanged.
+
+Two image artifacts fall out of this:
+
+| | size | used for |
+| --- | --- | --- |
+| `rootfs.img` | 4000 MiB, one rootfs | an in-layout **upgrade**: write the inactive half, switch the boot slot, reboot |
+| `super.img` | 8136 MiB, **both halves seeded** | the initial fastboot flash, and a network **migration** of a device still on the old single-rootfs layout |
+
+Build the second with `just build_super_image` (it is not part of `just all` — another 8 GiB of output that only those two paths use).
+
+Both halves are seeded rather than just slot A because the invariant worth holding is *both halves always contain something bootable*. Seeding only the half being booted leaves the other holding a fragment of the old filesystem — an ext4 superblock claiming 8100 MiB inside a 4068 MiB mapping. Nothing looks wrong: the device boots and is reachable. The damage surfaces only when an update fails its retries and the bootloader rolls back into an unmountable half, on a unit with no screen, no buttons and no physical access.
+
+The `90rootfs-flash` hook serves both layouts and picks its target by **image size**, not by a flag: an image that fits the mapped half is an upgrade and goes to that half; anything larger is a whole-partition image and goes to `super`. Keying on "is a half mapped?" alone would get migration backwards, since the migrating device is already running the new initramfs and has a half mapped.
+
+> ⚠ **Not yet validated on hardware.** The slot mapping, the halved write and rollback are implemented and unit-tested but have not booted a device.
 
 ## TODO
 

@@ -37,7 +37,11 @@ KMSCON_URL ?= https://snapshot.debian.org/file/19dae225043718dfcbf02b50a7fcbedbf
 KMSCON_SHA256 ?= 5a200898513a82cac4f9262f7c20fe4b2bfc6d1d57045ab5f7d9ee0b9ca07a4f
 # felix's super partition is 2082816 × 4096B = 8136.9 MiB; 8100M leaves a small
 # margin so fastboot doesn't reject on a slightly-oversized image.
-SIZE ?= 8100M
+# Sized to fit ONE HALF of `super`, not all of it. super is 8136 MiB, split into
+# two 4068 MiB rootfs slots that the initramfs maps one at a time (see the
+# rootfs-slot dracut module); 4000M leaves a little slack inside a half. Raising
+# this past 4068 silently produces an image that overruns slot A into slot B.
+SIZE ?= 4000M
 SYSROOT_DIR ?= rootfs/sysroot
 
 KERNEL_SOURCE_DIR ?= kernel/source
@@ -51,6 +55,42 @@ RETIRED_OVERLAY_PATHS ?= \
 	etc/systemd/system/multi-user.target.wants/mark-slot-successful.service
 MODULE_ORDER_PATH ?= rootfs/module_order.txt
 ROOTFS_IMG ?= boot/rootfs.img
+
+# ═══ FULL-FLASH IMAGE (`super.img`) ══════════════════════════════════════════
+#
+# `rootfs.img` is ONE rootfs, sized to fit one half of `super`. `super.img` is the
+# whole partition with BOTH halves seeded from it.
+#
+# Two artifacts because there are two different operations:
+#
+#   rootfs.img  ->  an in-layout upgrade: write the INACTIVE half while running,
+#                   switch the boot slot, reboot. Nothing is mounted on that half,
+#                   so this needs no initramfs involvement at all.
+#   super.img   ->  establishing or re-establishing the layout: the initial
+#                   fastboot flash, and a network MIGRATION of a device that is
+#                   still on the old single-rootfs `super`. Both rewrite the whole
+#                   partition, which for a running device means the pre-mount hook,
+#                   because the live root is inside what is being overwritten.
+#
+# ★ Why both halves are seeded rather than just half A: the invariant that makes
+# rootfs A/B worth having is "both halves always contain something bootable". If a
+# migration seeded only the half it boots into, the OTHER half would still hold a
+# fragment of the old 8100 MiB filesystem — an ext4 superblock claiming 8100 MiB
+# inside a 4068 MiB mapping. The device comes up fine, so nothing looks wrong,
+# and the damage only surfaces when the new image fails its retries and the
+# bootloader rolls back into an unmountable half. That is a brick on a unit whose
+# defining property is that nobody can reach it. Seeding both costs one extra
+# 4068 MiB write, once, and makes the first real upgrade rollback-safe.
+#
+# ⚠ SUPER_BYTES is felix's `super` and must match the TARGET device, not the build
+# host. Confirmed identical on all three felixes: 0x1FC800000 = 8136 MiB exactly.
+# The initramfs halves the REAL device at runtime, so a wrong value here does not
+# corrupt anything — it produces an image that does not line up with the mapping,
+# which the hook's fit check then rejects.
+SUPER_IMG   ?= boot/super.img
+SUPER_BYTES ?= 8531214336
+# Half, 4K-aligned exactly as rootfs-slot.sh computes it (sectors/2, minus %8).
+SUPER_HALF_BYTES := $(shell echo $$(( ( ($(SUPER_BYTES)/512/2) - ($(SUPER_BYTES)/512/2) % 8 ) * 512 )))
 MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
 BAZEL ?= kernel/source/tools/bazel
 OVERLAY_DIR ?= rootfs/overlay
@@ -135,6 +175,30 @@ BUILD_DATE ?= $(shell date -u +%Y-%m-%d)
 # network — the version filter alone cannot separate those. Empty by default: no
 # variable set, no file, and the marker-count identity check still applies.
 FLEET_ID ?=
+
+# Which DEVICE this image is built for. Stamped into /etc/image-device so the
+# image can be matched against the hardware before it is written.
+#
+# ★ Nothing else in the rootfs identifies the target. IMAGE_VERSION is derived
+# from the commit and the kernel, so two images built from one commit for two
+# different devices are byte-identical in every field flash-nmap.sh compares:
+# same version, same fleet id, same overlay markers.
+#
+# ★★ And the device-tree check does NOT separate them, because lynx (Pixel 7a) is
+# ALSO gs201 — `//private/devices/google/lynx:gs201_lynx_dist`. flash-nmap's
+# default `--match 'felix|gs201'` therefore matches a lynx device just as happily
+# as a felix one. So without this stamp every gate in the tool passes for a
+# felix image aimed at lynx hardware: it authorises our key, it runs our overlay,
+# it reports the expected version, it carries the right fleet id. The images are
+# genuinely incompatible — different kernel branch, different vendor firmware —
+# and an in-layout upgrade would at least fail AVB on the inactive slot and roll
+# back, but a MIGRATION writes the whole partition and destroys both halves
+# before anything gets the chance to reject it.
+#
+# Default felix so this branch (felix-only) keeps building unchanged; on the
+# multi-device branch DEVICE is already the real variable that selects
+# devices/$(DEVICE).mk, so this picks it up with no further wiring.
+DEVICE ?= felix
 
 # Wrap nspawn invocations through tools/nspawn-wrap.sh so each one starts
 # from a known-good sysroot/dev (no leftover mounts, no stale /dev/pts).
@@ -645,7 +709,31 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	# panic recurred — same call path, same faulting address
 	# ffffffc00e1e3568. Do not re-add it on that reasoning; the panic is
 	# something else. See the uevent-panic notes for the live state.
-	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d' $(MODULE_ORDER_PATH)
+	#
+	# st21nfc: the NFC controller driver, dropped because on some units the chip
+	# does not answer cleanly on i2c and its probe wedges a udev worker — inside
+	# the INITRAMFS, where dracut-initqueue then loops "Timed out while waiting
+	# for udev queue to empty" at ~60s a round.
+	#
+	# Measured over UART on 34291FDHS000WV (2026-08-04): 500+ seconds of boot,
+	# stalls of 60/117/46/58/50s each ending in either an st21nfc
+	# "Switched from IDLE to IDLE" error or another initqueue timeout. The same
+	# image on 35041FDHS0032G boots in 13.0s total. The two units differ in
+	# st21nfc lines (7 vs 1) and IDLE-to-IDLE errors (7 vs 0); every other
+	# candidate was identical across both — same cs40l26 i2c NO-ACKs (11), same
+	# deferred probes (9), same missing-firmware -2 loads (17), healthy UFS, AOC
+	# up. So the NFC chip is the variable, not the image.
+	#
+	# The user-visible symptom is a device that sits on the bootloader splash for
+	# ten minutes and looks bricked, which is how this started: three separate
+	# wrong diagnoses (bad dongle, netcheck bricking both slots, an unclean
+	# sysrq reboot) before the console showed it was simply still in the initramfs.
+	#
+	# These devices have no use for NFC at all, so dropping the driver costs
+	# nothing and removes a boot-blocking dependency on a peripheral we never
+	# touch. Paired with a blacklist entry so udev cannot autoload it later by
+	# modalias — the sed only stops dracut force-loading it.
+	sudo sed -i '/^bcmdhd4389$$/d; /^exynos_mfc$$/d; /^st21nfc$$/d' $(MODULE_ORDER_PATH)
 	# Prune module/header/boot trees from other kernel versions so a
 	# KERNEL_VERSION bump doesn't accumulate stale ones in the image. (The new
 	# version's initrd is (re)created later in .install_initramfs.)
@@ -711,7 +799,7 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 		--lz4 \
 		--show-modules \
 		--force \
-		--add "rescue bash rootfs-flash" \
+		--add "rescue bash rootfs-flash rootfs-slot" \
 		--install /vendor/firmware/aoc.bin \
 		--kernel-cmdline "rd.shell=0 rd.emergency=reboot" \
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
@@ -728,10 +816,12 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 stamp_version: .install_packages
 	just mount_rootfs
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
-		"sed -i --follow-symlinks '/^IMAGE_VERSION=/d; /^IMAGE_BUILD_DATE=/d' /etc/os-release; \
+		"sed -i --follow-symlinks '/^IMAGE_VERSION=/d; /^IMAGE_BUILD_DATE=/d; /^IMAGE_DEVICE=/d' /etc/os-release; \
 		echo 'IMAGE_VERSION=\"$(IMAGE_VERSION)\"' >> /etc/os-release; \
 		echo 'IMAGE_BUILD_DATE=\"$(BUILD_DATE)\"' >> /etc/os-release; \
-		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version"
+		printf '%s\n' '$(IMAGE_VERSION)' > /etc/image-version; \
+		echo 'IMAGE_DEVICE=\"$(DEVICE)\"' >> /etc/os-release; \
+		printf '%s\n' '$(DEVICE)' > /etc/image-device"
 	# Fleet stamp — see FLEET_ID. Removed when unset, so an image never keeps a
 	# stale claim to a fleet it was rebuilt out of (this stage is PHONY and reruns
 	# on every build, so the file always reflects THIS build's variables).
@@ -792,10 +882,36 @@ install_arm_blobs: .install_packages
 # transition for the quirk to prevent. The real question is why SuperSpeed link
 # RECOVERY fails, which is a PHY/signal-integrity matter, not an LPM one.
 # (snps,parkmode-disable-ss-quirk is also NOT a fix — failures recur with it.)
+# udev.event_timeout=20 BOUNDS THE INTERMITTENT MULTI-MINUTE BOOT.
+#
+# On some boots a udev worker wedges while holding the display `atc` uevent and
+# systemd-udevd SIGKILLs it at its default timeout — measured at 130s, twice per
+# affected boot, which is the whole of the ~6min42s initrd (dracut-initqueue
+# meanwhile loops "Timed out while waiting for udev queue to empty"). Same image,
+# same hour, three units: 12.8s / 25.2s / 6min38s.
+#
+# ★ The worker is killed either way. NOTHING depends on it finishing, so the
+# 130s is pure waiting for a foregone conclusion. Killing it at 20s instead
+# turns a ~6min50s worst case into roughly 50s, without needing to know what it
+# is blocked on. This BOUNDS the symptom; it is not a root-cause fix, and the
+# underlying wedge is still worth chasing at the pd_dpu/coldplug level.
+#
+# ★★ Why bounding it matters more than the seconds saved: with no screen and no
+# console, a 6min50s boot and a HANG are indistinguishable from the outside.
+# "Wait seven minutes and see" is not a procedure a contractor can follow across
+# hundreds of units, so the unpredictability was the real defect, not the delay.
+#
+# 20s is ~1000x the duration of a normal udev event (they finish in ms), so it
+# should never truncate legitimate work. It is read by systemd-udevd straight
+# from /proc/cmdline, which is why it goes HERE in boot.img's cmdline and not in
+# dracut's --kernel-cmdline: the latter only lands in the initramfs's
+# /etc/cmdline.d for dracut's own parsing, where systemd-udevd never sees it.
+# Being on the real cmdline also means it applies in the real root too, where
+# the same wedge otherwise burns 130s post-boot.
 .build_boot: .install_initramfs .install_vendor_firmware
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
-		--cmdline "root=/dev/disk/by-partlabel/super" \
+		--cmdline "root=/dev/mapper/rootfs udev.event_timeout=20" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
@@ -822,3 +938,31 @@ clean_image:
 clean: clean_image
 	rm -f boot/boot.img boot/vendor_boot.img
 	sudo rm -rf rootfs/unpack
+
+# Build the full-flash `super.img`: the whole partition with both halves seeded
+# from $(ROOTFS_IMG). See the SUPER_IMG block near the top for why both.
+#
+# Not part of .build_boot: it is only needed for a fastboot flash or a layout
+# migration, and it is another 8 GiB of build output. `just build_super_image`.
+.PHONY: super_image
+super_image: $(ROOTFS_IMG)
+	@set -e; \
+	half=$(SUPER_HALF_BYTES); \
+	isz=$$(stat -c%s "$(ROOTFS_IMG)"); \
+	if [ "$$isz" -gt "$$half" ]; then \
+		echo "ERROR: $(ROOTFS_IMG) is $$isz bytes but a half of super is only $$half."; \
+		echo "       Lower _rootfs_size in the justfile — an image that does not fit a"; \
+		echo "       half cannot be used for A/B at all, and seeding it here would just"; \
+		echo "       overwrite the start of the other half."; \
+		exit 1; \
+	fi; \
+	echo "super.img: $(SUPER_BYTES) bytes, two halves of $$half, seeded from a $$isz-byte rootfs"; \
+	rm -f "$(SUPER_IMG)"; \
+	truncate -s $(SUPER_BYTES) "$(SUPER_IMG)"; \
+	dd if="$(ROOTFS_IMG)" of="$(SUPER_IMG)" bs=4M conv=notrunc status=none; \
+	: 'seek_bytes, NOT seek in bs units: half/4194304 truncates to 0 whenever the'; \
+	: 'half is not a whole number of blocks, which would stack both copies at'; \
+	: 'offset 0 and leave slot B empty — silently, since the image still builds.'; \
+	: 'It is exact for felix (1017 x 4M) and would not be for another device.'; \
+	dd if="$(ROOTFS_IMG)" of="$(SUPER_IMG)" bs=4M oflag=seek_bytes seek=$$half conv=notrunc status=none; \
+	echo "  wrote $(SUPER_IMG) (apparent $$(stat -c%s "$(SUPER_IMG)"), on disk $$(du -h --apparent-size=never "$(SUPER_IMG)" 2>/dev/null | cut -f1 || du -h "$(SUPER_IMG)" | cut -f1))"

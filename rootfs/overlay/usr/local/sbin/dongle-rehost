@@ -131,11 +131,80 @@ while [ "$t" -lt "$TRIES" ]; do
     done
 done
 
+# ---------------------------------------------------------------------------
+# ESCALATION. otg_id is mode 644 so the loop above always *runs*, but on a
+# PD-powered hub it does nothing at all: the Type-C port manager owns the role,
+# and every write comes back
+#     exynos-dwc3 11210000.usb: set desired role to none
+#     exynos-dwc3 11210000.usb: role unchanged none
+# Measured on 35071FDHS0017C 2026-08-05, boot -1: three otg_id attempts here and
+# a fourth from netcheck-recover, all no-ops, `lsusb` empty the whole time, the
+# unit reachable only over the USB gadget. Every role knob under
+# /sys/class/typec/port0 (data_role, power_role, preferred_role, port_type) is
+# mode 444, and the usb_role switch has no `role` attribute — it never leaves
+# waiting_for_supplier. So there is no polite lever, and "we tried otg_id" is
+# not the same as "we tried".
+#
+# ⚠ This matters more than it looks: the fielded units have NO BATTERY, so they
+# must take power AND ethernet through the one port. PD-plus-hub is not a bench
+# quirk, it is the shipping topology — the exact case where otg_id is useless.
+#
+# Two levers that are actually writable, weakest first:
+#   1. dwc3's debugfs `mode` — asks the controller directly, bypassing the TCPM.
+#   2. unbind/rebind the TCPC driver — re-runs the whole Type-C attach state
+#      machine. This is the software equivalent of physically replugging, which
+#      is the one thing known to clear this state.
+# Both are last resorts, so they run only after the polite path has failed.
+DWC3_MODE=${DWC3_MODE:-/sys/kernel/debug/usb/11210000.dwc3/mode}
+TCPC_DRV=${TCPC_DRV:-/sys/bus/i2c/drivers/max77759tcpc}
+TCPC_DEV=${TCPC_DEV:-13-0025}
+
+wait_for_nic() {  # wait_for_nic <seconds> <what>
+    _n=0
+    while [ "$_n" -lt "$1" ]; do
+        if have_nic; then log "dongle attached after $2"; return 0; fi
+        _n=$((_n + 1)); sleep 1
+    done
+    log "$2 did not bring the dongle back within $1s"
+    return 1
+}
+
+if [ -w "$DWC3_MODE" ]; then
+    log "escalating: asking dwc3 directly for host mode via $DWC3_MODE"
+    if echo host > "$DWC3_MODE" 2>/dev/null; then
+        wait_for_nic 20 "dwc3 mode=host" && exit 0
+    else
+        log "write to $DWC3_MODE was rejected"
+    fi
+else
+    log "no $DWC3_MODE (debugfs not mounted or kernel lacks it) — skipping that step"
+fi
+
+if [ -w "$TCPC_DRV/unbind" ] && [ -e "$TCPC_DRV/$TCPC_DEV" ]; then
+    log "escalating: software replug — unbind/rebind $TCPC_DEV on max77759tcpc"
+    # A failed rebind leaves the port with NO manager at all, which is strictly
+    # worse than a wedged one, so treat the bind as the step that must succeed
+    # and say so loudly if it does not.
+    if echo "$TCPC_DEV" > "$TCPC_DRV/unbind" 2>/dev/null; then
+        sleep 2
+        if echo "$TCPC_DEV" > "$TCPC_DRV/bind" 2>/dev/null; then
+            log "TCPC rebound; waiting for the port to re-attach"
+            wait_for_nic 45 "TCPC unbind/rebind" && exit 0
+        else
+            log "CRITICAL: unbound $TCPC_DEV but REBIND FAILED — port has no manager"
+        fi
+    else
+        log "unbind of $TCPC_DEV was rejected"
+    fi
+else
+    log "no writable $TCPC_DRV/unbind for $TCPC_DEV — skipping the software replug"
+fi
+
 # Never leave a network-only device parked in device role. Only claim we did it
 # if the write actually succeeded.
 if force_host; then
-    log "dongle did NOT attach after $TRIES attempts; host role re-asserted via $METHOD"
+    log "dongle did NOT attach after $TRIES attempts + escalation; host role re-asserted via $METHOD"
 else
-    log "dongle did NOT attach after $TRIES attempts; AND re-asserting host FAILED"
+    log "dongle did NOT attach after $TRIES attempts + escalation; AND re-asserting host FAILED"
 fi
 exit 1

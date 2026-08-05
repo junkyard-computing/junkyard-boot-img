@@ -158,10 +158,15 @@ Cargo.lock
 
 kernel_version
 kernel/kernel_version
+# Per-device variants (kernel_version.felix, .lynx) written by the multi-device
+# build. Same generated artifact, but the suffix escapes the patterns above.
+kernel_version.*
+kernel/kernel_version.*
 rootfs/module_order.txt
 rootfs/sysroot/
 rootfs/unpack/
 boot/rootfs.img
+boot/super.img
 boot/boot.img
 boot/vendor_boot.img
 

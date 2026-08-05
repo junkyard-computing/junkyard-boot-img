@@ -39,5 +39,5 @@ install() {
     # .sha256/.size files. Install both anyway — a missing helper in the
     # integrity gate degrades it silently, which is the one failure mode this
     # whole hook exists to avoid.
-    inst_multiple cat mount umount mkdir rm sync sha256sum stat cut tr
+    inst_multiple cat mount umount mkdir rm sync sha256sum stat cut tr blockdev dmsetup
 }

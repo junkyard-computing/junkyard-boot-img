@@ -62,6 +62,17 @@ _felix_ota_sha256 := "7a13341eb090a7656e67e1244b832420ffe6c7c0f2530d544ab9e7e23c
 _vendor_firmware_workdir := join(justfile_directory(), "rootfs", "vendor-firmware")
 [private]
 _vendor_firmware_stage := join(_vendor_firmware_workdir, "extracted")
+# Rootfs image size. Sized to fit ONE HALF of `super`, which the initramfs maps
+# as the active rootfs slot (see the rootfs-slot dracut module): super is 8136 MiB,
+# halved into two 4068 MiB slots, and 4000M leaves a little slack inside a half.
+# Raising this past 4068 silently produces an image that overruns slot A into B.
+#
+# This is the single source of truth — every recipe below defaults its `size` param
+# to it, because each one passes SIZE= explicitly to make and therefore OVERRIDES
+# the Makefile's `SIZE ?=` default. Changing only the Makefile has no effect on a
+# `just` build.
+[private]
+_rootfs_size := "4000M"
 [private]
 _payload_dumper_version := "1.2.2"
 [private]
@@ -99,7 +110,7 @@ default:
 # KERNEL_VERSION written by .build_kernel. justfile exports are evaluated at
 # parse time, so on a fresh checkout KERNEL_VERSION would be empty without
 # this split.
-all android_kernel_branch="android-gs-felix-6.1-android16" size="8100M" debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000" fleet_id="": (clone_kernel_source android_kernel_branch)
+all android_kernel_branch="android-gs-felix-6.1-android16" size=_rootfs_size debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000" fleet_id="": (clone_kernel_source android_kernel_branch)
     {{ _make }} -C {{ justfile_directory() }} .build_kernel
     KVER=$(cat {{ justfile_directory() }}/kernel/kernel_version); \
     {{ _make }} -C {{ justfile_directory() }} .build_boot \
@@ -216,7 +227,7 @@ apply_kernel_patches:
 
 # Create the empty ext4 rootfs image.
 [group('rootfs')]
-create_rootfs_image size="8100M": unmount_rootfs
+create_rootfs_image size=_rootfs_size: unmount_rootfs
     {{ _make }} -C {{ justfile_directory() }} .create_image SIZE={{ size }}
 
 # Mount the ext4 rootfs image at rootfs/sysroot. The --make-rprivate is required:
@@ -225,7 +236,7 @@ create_rootfs_image size="8100M": unmount_rootfs
 # with "/dev is pre-mounted and pre-populated" / "Failed to create /dev/pts: File exists".
 # Apply --make-rprivate unconditionally so a sysroot reused across runs (e.g. when a
 # prior nspawn failed mid-recipe) still becomes private even though we skip the mount.
-mount_rootfs size="8100M": (create_rootfs_image size)
+mount_rootfs size=_rootfs_size: (create_rootfs_image size)
     @mkdir -p {{ _sysroot_dir }}
     @if ! mountpoint -q {{ _sysroot_dir }}; then \
       echo "Mounting rootfs image at {{ _sysroot_dir }}"; \
@@ -298,7 +309,7 @@ install_arm_blobs:
     {{ _make }} -C {{ justfile_directory() }} install_arm_blobs
 
 [group('rootfs')]
-build_rootfs debootstrap_release="trixie" root_password="0000" hostname="fold" size="8100M":
+build_rootfs debootstrap_release="trixie" root_password="0000" hostname="fold" size=_rootfs_size:
     {{ _make }} -C {{ justfile_directory() }} .debootstrap \
         RELEASE={{ debootstrap_release }} \
         ROOT_PW={{ root_password }} \
@@ -366,3 +377,12 @@ build_boot_images:
     {{ _make }} -C {{ justfile_directory() }} .build_boot \
         KERNEL_VERSION=$KVER \
         INITRAMFS_PATH={{ _sysroot_dir }}/boot/initrd.img-$KVER
+
+# Not built by `all`: another 8 GiB of output, and only the fastboot flash and a
+# layout migration use it. See the SUPER_IMG block in the Makefile for why BOTH
+# halves are seeded rather than just slot A.
+#
+# Build the full-flash super.img (whole partition, both halves seeded).
+[group('boot')]
+build_super_image:
+    {{ _make }} -C {{ justfile_directory() }} super_image

@@ -42,6 +42,79 @@ log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg
 
 [ -e /etc/netcheck-recover.disable ] && { log "disabled by /etc/netcheck-recover.disable"; exit 0; }
 
+# ★ An OTA in progress inhibits this check, because the check cannot tell a dead
+# link from a saturated one.
+#
+# Observed on 34291FDHS000WV (2026-08-04): flash-ssh was pushing ~1 GB over the
+# wire when this timer fired, its gateway ping lost to the transfer, and it
+# concluded "lost network after having it ... rebooting" — killing the update
+# mid-flight and leaving the operator a bare `client_loop: send disconnect:
+# Broken pipe`. Nothing in that error points here.
+#
+# At fleet scale this is not an edge case: every OTA saturates the link for
+# minutes and this timer runs every 5, so a slice of every sweep would be
+# rebooted out from under itself, at random, on the devices with the slowest
+# links — the ones least able to afford a restart.
+#
+# /run (tmpfs) on purpose: an updater that dies without cleaning up leaves the
+# inhibit behind only until the next boot, which is the same event that would
+# have cleared the fault anyway. A persistent path could disable the only
+# recovery mechanism on a headless device indefinitely.
+# --mark-only: confirm the network and COMMIT THE SLOT, never escalate.
+#
+# Split out because the two jobs have opposite risk profiles. Marking a slot
+# successful is safe the instant the network is proven; escalating (reboot,
+# rollback) must stay slow and cautious. Running both off one 5-minute timer made
+# the safe half inherit the cautious half's delay, and that silently reverted a
+# freshly flashed device:
+#
+#   flash-ssh switches to the new slot active-but-NOT-successful (rollback-safe).
+#   The slot is only committed once netcheck proves network — first run at
+#   OnBootSec=5min. Meanwhile the OTA inhibit suppresses netcheck for up to 900s.
+#   So a newly flashed unit has a ~20 minute window in which SEVEN reboots
+#   exhaust the retry counter and the bootloader rolls back — correctly, but to
+#   the OLD image, silently, on a unit that is up and reachable the whole time.
+#
+# Observed on 34291FDHS000WV 2026-08-05 during a 20-cycle reboot soak: slot B
+# ended `retry count: 0, successful: false` and the device came back running the
+# previous image from slot A. Power flapping, a rack power-cycle, or an operator
+# retrying a unit that "looks stuck" all reproduce it in the field.
+MARK_ONLY=0
+[ "${1:-}" = "--mark-only" ] && MARK_ONLY=1
+
+INHIBIT=/run/netcheck-recover.inhibit
+INHIBIT_MAX_AGE=${INHIBIT_MAX_AGE:-900}
+# ★ --mark-only deliberately IGNORES the inhibit. The inhibit exists to stop an
+# in-flight OTA being rebooted out from under itself; committing a slot that has
+# demonstrably reached the network does not reboot anything, and suppressing it
+# is what leaves the freshly flashed slot uncommitted during the exact window the
+# retry counter is being spent.
+if [ "$MARK_ONLY" != 1 ] && [ -e "$INHIBIT" ]; then
+    _now=$(date +%s 2>/dev/null || echo 0)
+    _mt=$(stat -c %Y "$INHIBIT" 2>/dev/null || echo 0)
+    _age=$(( _now - _mt ))
+    [ "$_age" -lt 0 ] && _age=0
+    if [ "$_age" -lt "$INHIBIT_MAX_AGE" ]; then
+        log "inhibited: update in progress (${_age}s old, expires at ${INHIBIT_MAX_AGE}s)"
+        exit 0
+    fi
+    # ★ EXPIRED. An updater that died without cleaning up must NOT be able to
+    # switch off the only recovery mechanism this device has.
+    #
+    # The first version of this check had no expiry and justified itself with
+    # "/run is tmpfs, so it clears on the next boot". That reasoning is circular:
+    # the inhibit suppresses the reboot that would clear the inhibit. A flash-ssh
+    # killed mid-run, followed by the link dropping, would have left a screenless,
+    # buttonless device unable to rescue itself — permanently, and silently. That
+    # is a strictly worse failure than the mid-OTA reboot the inhibit exists to
+    # prevent, so the inhibit has to be the weaker of the two guarantees.
+    #
+    # Delete it as well as ignoring it, so this is reported once rather than every
+    # five minutes, and so the next updater starts from a clean slate.
+    log "inhibit file is ${_age}s old (>= ${INHIBIT_MAX_AGE}s) — an update died without clearing it; resuming recovery"
+    rm -f "$INHIBIT" 2>/dev/null || true
+fi
+
 # REACHABILITY, not address presence.
 #
 # The previous version asked "is there a global IPv4 on a non-gadget interface?"
@@ -157,19 +230,79 @@ healthy() {
     return 1
 }
 
-slot_field() {  # slot_field <field>  -> value for the ACTIVE slot
-    "$BOOTCTL" status 2>/dev/null | awk -v f="$1:" '
+# ★ EVERY slot decision here is about the slot we are RUNNING ON, never the one
+# devinfo calls "active". Those are the same in steady state and differ in exactly
+# one window: after an OTA has switched the active slot but before the reboot that
+# boots it. That window is short but it is also precisely when this timer is most
+# likely to fire, because flash-ssh switches the slot and reboots seconds later.
+#
+# Reading "active" there is actively dangerous. Observed 2026-08-04 on
+# 35071FDHS0017C: a deploy switched active to slot A and then failed before
+# rebooting; this timer fired on the still-running slot B, saw a healthy network,
+# and marked *A* successful — certifying a slot that had never booted and whose
+# rootfs half was destroyed. A slot marked successful is one the bootloader has no
+# reason to abandon, so that can silently disarm the rollback it was meant to
+# protect. The whole premise of this script is that a slot must PROVE it has
+# network; only the running slot can prove anything.
+#
+# The running slot comes from the kernel, not from devinfo — androidboot.slot_suffix
+# is what the bootloader actually booted, and it cannot be changed out from under us
+# by a concurrent OTA the way the devinfo active bit can.
+running_slot() {
+    awk -F'"' '/androidboot\.slot_suffix/ {print substr($2, 2); exit}' \
+        /proc/bootconfig 2>/dev/null
+}
+
+slot_field() {  # slot_field <field>  -> value for the RUNNING slot
+    _rs=$(running_slot)
+    [ -n "$_rs" ] || return 1
+    "$BOOTCTL" status 2>/dev/null | awk -v f="$1:" -v want="$_rs" '
         tolower($1)=="slot:" {s=tolower($2); next}
-        $1=="active:" && $2=="true" {want=s}
         {v[s FS $1]=$2}
         END {print v[want FS f]}'
 }
 
-cur_slot() {
-    "$BOOTCTL" status 2>/dev/null | awk '
-        tolower($1)=="slot:" {s=tolower($2)}
-        $1=="active:" && $2=="true" {print s; exit}'
-}
+# --mark-only stops here: commit the slot if the network is proven, and NEVER
+# escalate. Exits 0 either way — an unproven slot is simply left uncommitted for
+# the next run to retry, which is the conservative behaviour. All the escalation
+# machinery below (bounce, reboot, mark-unbootable) stays on the slow timer.
+if [ "$MARK_ONLY" = 1 ]; then
+    i=0
+    while [ "$i" -lt "${MARK_DEADLINE:-20}" ]; do
+        if healthy; then
+            "$BOOTCTL" mark-successful >/dev/null 2>&1 || true
+            : > "$HADIP" 2>/dev/null
+            rm -f "$COUNTER"
+            log "network proven — slot committed (mark-only)"
+            exit 0
+        fi
+        i=$((i + 1)); sleep 1
+    done
+
+    # ⚠ DO NOT add "commit anyway when there is no wired NIC" here. It was tried
+    # and rejected 2026-08-05, and the reason is worth keeping.
+    #
+    # The tempting argument: the bootloader's retry counter drains whatever we
+    # decide, so a no-NIC unit gets rolled back by boot count even though the
+    # "never escalate without a NIC" guard refuses to roll it back — so we may as
+    # well commit and stop the counter.
+    #
+    # The argument is wrong because wired_nic_present() CANNOT DISTINGUISH a
+    # dongle that is absent from a dongle that failed to enumerate. Both present
+    # as no interface. An image that breaks USB enumeration — a bad r8152, a
+    # kernel regression, a botched module set — produces exactly the no-NIC
+    # signature, and that is precisely the case rollback exists for. Committing
+    # on no-NIC would disable rollback for the failures most likely to BE the
+    # image's fault. Observed the same day: a unit whose dongle was physically
+    # attached showed a completely empty `lsusb`.
+    #
+    # The counter-drain problem is real but belongs elsewhere: flash-fastboot.sh
+    # now writes the boot chain to BOTH slots, so a rollback lands on the same
+    # image instead of a stale/stock chain, and commits the slot at flash time
+    # over the USB gadget. That fixes the outcome without blinding the check.
+    log "network not proven within ${MARK_DEADLINE:-20}s — leaving the slot uncommitted (mark-only never escalates)"
+    exit 0
+fi
 
 # Give a transient blip a chance to clear before acting on it.
 i=0
@@ -178,14 +311,55 @@ while [ "$i" -lt "$DEADLINE" ]; do
         # Healthy. Commit this slot — this is what marks a slot good, and
         # nothing else does, deliberately: a slot must PROVE it has network
         # before the bootloader loses the ability to roll it back.
-        s=$(cur_slot)
-        "$BOOTCTL" mark-successful ${s:+--slot "$s"} >/dev/null 2>&1 || true
+        : "no --slot: pixel-bootctl defaults to the RUNNING slot, which is the only
+          one this health check can vouch for"
+        "$BOOTCTL" mark-successful >/dev/null 2>&1 || true
         : > "$HADIP" 2>/dev/null
         rm -f "$COUNTER"
         exit 0
     fi
     i=$((i + 1)); sleep 1
 done
+
+# ★ TRY THE CHEAP FIX BEFORE THE EXPENSIVE ONE: bounce the USB host role.
+#
+# Rebooting was the only escalation here, which is a ~5-6 minute outage for a
+# fault that a host-role bounce clears in about two seconds. On this hardware the
+# overwhelmingly common cause of "no network" is the USB-Ethernet dongle — either
+# gone from the bus, or enumerated but wedged — and toggling dwc3_exynos_otg_id
+# rebuilds the controller and re-enumerates it in place. usb-host-recover already
+# does exactly this, but only when the kernel logs `HC died`; a link that dies
+# quietly produces no such message and fell straight through to a reboot.
+#
+# Covers both shapes, which is why it bounces unconditionally rather than
+# checking for the NIC first: dongle-rehost's have_nic() test would say "nothing
+# to do" for a NIC that is present but passing no traffic, and that is precisely
+# the case observed repeatedly on 34291FDHS000WV.
+#
+# Bounded and non-destructive: one attempt per invocation (the timer retries in 5
+# minutes), and a failed write just falls through to the existing escalation. A
+# reboot is still the answer if this does not help — it is now the second answer.
+OTG_ID=${OTG_ID:-/sys/devices/platform/11210000.usb/dwc3_exynos_otg_id}
+BOUNCE_SETTLE=${BOUNCE_SETTLE:-15}
+if [ -w "$OTG_ID" ]; then
+    log "no network after ${DEADLINE}s — bouncing the USB host role before escalating"
+    if printf 1 > "$OTG_ID" 2>/dev/null && sleep 1 && printf 0 > "$OTG_ID" 2>/dev/null; then
+        j=0
+        while [ "$j" -lt "$BOUNCE_SETTLE" ]; do
+            if healthy; then
+                log "recovered by USB host bounce after ${j}s — no reboot needed"
+                "$BOOTCTL" mark-successful >/dev/null 2>&1 || true
+                : > "$HADIP" 2>/dev/null
+                rm -f "$COUNTER"
+                exit 0
+            fi
+            j=$((j + 1)); sleep 1
+        done
+        log "USB host bounce did not restore reachability within ${BOUNCE_SETTLE}s"
+    else
+        log "USB host bounce failed to write $OTG_ID"
+    fi
+fi
 
 proven=$(slot_field successful)
 [ "$proven" = true ] || proven=false
@@ -223,8 +397,35 @@ wired_nic_present() {
 # reboot-looping a device that nobody has cabled. Gated on HARDWARE PRESENCE,
 # not on address history — see wired_nic_present() above for why. If a NIC is
 # present but dead, we fall through and reboot, which is the case that matters.
-if [ "$proven" = true ] && [ ! -e "$HADIP" ] && ! wired_nic_present; then
-    log "no wired NIC attached and no address since boot — nothing plugged in; not rebooting"
+# ★★ NO WIRED NIC => NEVER ESCALATE, whether or not this slot has proven itself.
+#
+# This guard used to require `proven = true`, which made it useless in the one
+# case that matters. A slot only becomes "proven" by observing a healthy network,
+# so a device whose NIC is dead can never prove ANY slot — and an unproven slot
+# falls straight through to: 3 reboots, mark-unbootable, roll back. The other slot
+# has the same dead NIC, so it burns down the same path, and the device ends up
+# with BOTH slots unbootable and nothing to boot.
+#
+# That is a device bricking itself over a hardware fault, on units with no screen
+# and no buttons. Believed to be what happened to 34291FDHS000WV on 2026-08-04:
+# freshly flashed (so neither slot was proven), came up gadget-only with no wired
+# NIC, and ended stuck at the bootloader splash.
+#
+# The rule the escalation is built on is "a slot that cannot reach the network is
+# probably a bad image". That inference is only valid if a NIC exists to fail. No
+# NIC at all is positive evidence the fault is NOT the image, and rolling back
+# cannot attach one — so rollback is guaranteed useless here and its downside is
+# unbounded. Stay up, stay debuggable over the USB gadget, and let a human decide.
+if ! wired_nic_present; then
+    # Refuses to escalate, and deliberately does NOT commit the slot either —
+    # see the matching note in the --mark-only path. A missing NIC and a NIC
+    # that failed to enumerate are indistinguishable here, so committing would
+    # switch off rollback for exactly the images most likely to deserve it.
+    log "no wired NIC attached — not rebooting or rolling back; leaving the slot uncommitted"
+    exit 0
+fi
+if [ "$proven" = true ] && [ ! -e "$HADIP" ]; then
+    log "wired NIC present but no address since boot on a proven slot — nothing plugged in; not rebooting"
     exit 0
 fi
 if [ ! -e "$HADIP" ] && wired_nic_present; then
@@ -241,7 +442,7 @@ sync
 if [ "$proven" = true ]; then
     log "lost network after having it (attempt $attempts); slot proven good, rebooting without rollback"
 elif [ "$attempts" -gt "$REBOOT_BEFORE_ROLLBACK" ]; then
-    s=$(cur_slot)
+    s=$(running_slot)
     other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
         tolower($1)=="slot:" {s=$2}
         $1=="active:"     {a[s]=$2}

@@ -229,16 +229,79 @@ esac
 # 3) Ensure the tools are on the device (check, copy only if missing) --------
 ensure_bin() {  # <name> <local-path>
 	local name="$1" src="$2"
-	if sshc "command -v '$name' >/dev/null 2>&1 || test -x '/usr/local/bin/$name'"; then
-		log "$name already on $HOST"
+	# ★ Refresh on MISMATCH, not merely when missing.
+	#
+	# "Install only if absent" makes the updater unable to update itself, and that
+	# is not a cosmetic problem: a bug in pixel-ota can then only be fixed by the
+	# rootfs flash that pixel-ota is required to perform. Hit exactly that on
+	# 2026-08-04 — a fleet deploy failed on the one already-A/B device because its
+	# on-device pixel-ota predated the size-based target fix, and no amount of
+	# re-running would ever have replaced it, since the working binary was sitting
+	# inside the image it was refusing to flash.
+	#
+	# Compare by content, not version string: these are static musl binaries with
+	# no --version contract, and a digest cannot disagree with what is actually
+	# installed.
+	local want have
+	want=$(sha256sum "$src" | cut -d' ' -f1)
+	have=$(sshc "sha256sum '/usr/local/bin/$name' 2>/dev/null | cut -d' ' -f1" || true)
+	have=${have//[$'\r\n']/}
+	if [ "$have" = "$want" ]; then
+		log "$name up to date on $HOST"
 	else
-		log "$name missing on $HOST — installing"
+		if [ -n "$have" ]; then
+			log "$name on $HOST differs from the build — replacing"
+		else
+			log "$name missing on $HOST — installing"
+		fi
 		scpc "$src" "$HOST:/tmp/$name"
 		sshc "sudo install -m 0755 '/tmp/$name' '/usr/local/bin/$name' && rm -f '/tmp/$name'"
 	fi
 }
 ensure_bin pixel-bootctl "$PIXEL_BOOTCTL_BIN"
 ensure_bin pixel-ota "$PIXEL_OTA_BIN"
+
+# ★ Inhibit netcheck-recover for the duration, or it reboots us mid-update.
+#
+# That watchdog pings the gateway and reboots when it cannot reach anything. It
+# cannot distinguish a dead link from one saturated by our own ~1 GB transfer, so
+# on 34291FDHS000WV (2026-08-04) it fired mid-stage, logged "lost network after
+# having it ... rebooting", and killed the update — surfacing to the operator only
+# as `client_loop: send disconnect: Broken pipe`, which points nowhere near the
+# actual cause.
+#
+# Cleared on EXIT so an interrupted run does not leave a headless device with its
+# only recovery mechanism switched off. The flag lives in /run (tmpfs) as a second
+# backstop: even a hard kill that skips the trap only suppresses it until the next
+# boot, which is itself the event that would have cleared the fault.
+INHIBIT=/run/netcheck-recover.inhibit
+log "inhibiting netcheck-recover for the duration of this update"
+sshc "sudo touch '$INHIBIT'" || true
+
+# The device EXPIRES this inhibit (see netcheck-recover: INHIBIT_MAX_AGE, 900s),
+# so it must be refreshed while we work or a slow transfer outlives it and gets
+# rebooted anyway. Refreshing is also what makes the expiry safe: the device
+# resumes recovery on its own if this process dies, without depending on us.
+#
+# Deliberately shorter than the expiry by a wide margin — a couple of missed
+# touches (a blip, a busy link) must not expire a live update.
+REFRESH_PID=""
+( while :; do
+	sleep 120
+	ssh $SSH_OPTS "$HOST" "sudo touch '$INHIBIT'" >/dev/null 2>&1 || true
+  done ) &
+REFRESH_PID=$!
+
+# ONE trap for everything that must be undone. bash replaces an EXIT trap rather
+# than appending, so a second `trap ... EXIT` later silently discards this one —
+# which would leave the inhibit set on a headless device.
+CLEAN_RDIR=""
+cleanup() {
+	[ -n "$REFRESH_PID" ] && kill "$REFRESH_PID" 2>/dev/null || true
+	ssh $SSH_OPTS "$HOST" "sudo rm -f '$INHIBIT'" >/dev/null 2>&1 || true
+	[ -n "$CLEAN_RDIR" ] && ssh $SSH_OPTS "$HOST" "rm -rf \"$CLEAN_RDIR\"" >/dev/null 2>&1 || true
+}
+trap cleanup EXIT
 
 # 4) Stage the rootfs first — the long transfer, while nothing has changed ---
 stage="$ud_mnt/pixel-ota"
@@ -254,7 +317,37 @@ sshc "sudo mkdir -p '$stage'"
 # stream. A mostly-empty 7.9 GiB image compresses to ~1 GB, measured at ~1.3
 # MB/s on the wire, far under the ~90 Mb/s cliff. Do not "optimise" this into a
 # raw uncompressed transfer without re-reading the rate-limit comment above.
-gzip -c -- "$ROOTFS_IMG" | sshc "sudo sh -c 'gzip -dc > \"$stage/rootfs.img\"'"
+# ⚠ The decompressed side goes through `dd oflag=direct`, NOT a plain shell
+# redirect, and that is load-bearing — it stops the OTA rebooting the device it
+# is updating.
+#
+# Measured on 34291FDHS000WV 2026-08-05. `gzip -dc > file` writes ~4 GB through
+# the page cache, and the resulting writeback pressure starves PID1. A dongle
+# re-enumeration landed mid-transfer, its udev rule shelled out to
+# `/bin/systemctl --no-block restart dongle-mac-issue.service`, that needs a
+# D-Bus round trip to a PID1 that is no longer scheduling, and:
+#     t=706.4  Spawned '/bin/systemctl ...' is taking longer than 59s to complete
+#     t=709.6  (last log line)
+#     t=735    softdog: Initiating system reboot
+# The bootloader records that reset as `0xbaba - Kernel PANIC`, so a healthy
+# device mid-OTA looks exactly like a kernel crash — see the watchdog drop-in in
+# the overlay for why softdog produces that false signature.
+#
+# O_DIRECT bypasses the page cache entirely, so a 4 GB stream no longer builds a
+# multi-GB dirty backlog. bs=4M keeps the alignment O_DIRECT requires on ext4.
+#
+# Support is PROBED FIRST, in a separate round trip, rather than tried inline:
+# stdin cannot be rewound, so a dd that fails partway through has already eaten
+# the stream and there is nothing left for a fallback to write.
+if sshc "sudo sh -c 'dd if=/dev/zero of=\"$stage/.odirect-probe\" bs=4M count=1 oflag=direct status=none 2>/dev/null && rm -f \"$stage/.odirect-probe\"'" 2>/dev/null; then
+    stage_writer="dd of=\"$stage/rootfs.img\" bs=4M oflag=direct conv=fsync status=none"
+else
+    echo ">>> O_DIRECT unavailable on the staging fs — using a buffered write" >&2
+    echo "    (watch for a softdog reset mid-transfer; see the comment above)" >&2
+    stage_writer="cat > \"$stage/rootfs.img\""
+fi
+gzip -c -- "$ROOTFS_IMG" | sshc "sudo sh -c 'gzip -dc | $stage_writer'" \
+    || die "staging rootfs.img failed"
 
 # Stage the digest next to the image so the 90rootfs-flash dracut hook can
 # refuse a truncated write. The hook writes the staged image over `super`, which
@@ -286,7 +379,9 @@ log "staged rootfs verified: $rootfs_sha"
 log "boot chain -> inactive slot (pixel-ota update)"
 rdir=$(sshc 'mktemp -d')
 # shellcheck disable=SC2064  # expand $rdir/$HOST now, into the EXIT trap.
-trap "ssh $SSH_OPTS '$HOST' 'rm -rf \"$rdir\"' >/dev/null 2>&1 || true" EXIT
+CLEAN_RDIR="$rdir"   # picked up by the single EXIT trap set above; a second
+                     # `trap ... EXIT` here would replace that one and leave the
+                     # netcheck inhibit set on the device.
 scpc "$BOOT_IMG"        "$HOST:$rdir/boot.img"
 scpc "$VENDOR_BOOT_IMG" "$HOST:$rdir/vendor_boot.img"
 if [ -n "$DTBO_IMG" ]; then
