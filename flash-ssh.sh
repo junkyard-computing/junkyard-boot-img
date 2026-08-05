@@ -317,7 +317,37 @@ sshc "sudo mkdir -p '$stage'"
 # stream. A mostly-empty 7.9 GiB image compresses to ~1 GB, measured at ~1.3
 # MB/s on the wire, far under the ~90 Mb/s cliff. Do not "optimise" this into a
 # raw uncompressed transfer without re-reading the rate-limit comment above.
-gzip -c -- "$ROOTFS_IMG" | sshc "sudo sh -c 'gzip -dc > \"$stage/rootfs.img\"'"
+# ⚠ The decompressed side goes through `dd oflag=direct`, NOT a plain shell
+# redirect, and that is load-bearing — it stops the OTA rebooting the device it
+# is updating.
+#
+# Measured on 34291FDHS000WV 2026-08-05. `gzip -dc > file` writes ~4 GB through
+# the page cache, and the resulting writeback pressure starves PID1. A dongle
+# re-enumeration landed mid-transfer, its udev rule shelled out to
+# `/bin/systemctl --no-block restart dongle-mac-issue.service`, that needs a
+# D-Bus round trip to a PID1 that is no longer scheduling, and:
+#     t=706.4  Spawned '/bin/systemctl ...' is taking longer than 59s to complete
+#     t=709.6  (last log line)
+#     t=735    softdog: Initiating system reboot
+# The bootloader records that reset as `0xbaba - Kernel PANIC`, so a healthy
+# device mid-OTA looks exactly like a kernel crash — see the watchdog drop-in in
+# the overlay for why softdog produces that false signature.
+#
+# O_DIRECT bypasses the page cache entirely, so a 4 GB stream no longer builds a
+# multi-GB dirty backlog. bs=4M keeps the alignment O_DIRECT requires on ext4.
+#
+# Support is PROBED FIRST, in a separate round trip, rather than tried inline:
+# stdin cannot be rewound, so a dd that fails partway through has already eaten
+# the stream and there is nothing left for a fallback to write.
+if sshc "sudo sh -c 'dd if=/dev/zero of=\"$stage/.odirect-probe\" bs=4M count=1 oflag=direct status=none 2>/dev/null && rm -f \"$stage/.odirect-probe\"'" 2>/dev/null; then
+    stage_writer="dd of=\"$stage/rootfs.img\" bs=4M oflag=direct conv=fsync status=none"
+else
+    echo ">>> O_DIRECT unavailable on the staging fs — using a buffered write" >&2
+    echo "    (watch for a softdog reset mid-transfer; see the comment above)" >&2
+    stage_writer="cat > \"$stage/rootfs.img\""
+fi
+gzip -c -- "$ROOTFS_IMG" | sshc "sudo sh -c 'gzip -dc | $stage_writer'" \
+    || die "staging rootfs.img failed"
 
 # Stage the digest next to the image so the 90rootfs-flash dracut hook can
 # refuse a truncated write. The hook writes the staged image over `super`, which
