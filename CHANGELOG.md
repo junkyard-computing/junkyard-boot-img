@@ -1,5 +1,12 @@
 # Changelog
 
+## [1.5.1](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.5.0...v1.5.1) (2026-08-05)
+
+
+### Bug Fixes
+
+* **build:** `clean` and `all` must cover super.img — it was silently stale ([e78e85b](https://github.com/junkyard-computing/junkyard-boot-img/commit/e78e85b2f9368030e0cdeb2bd4932acc1dd98328))
+
 ## [1.5.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.4.0...v1.5.0) (2026-08-05)
 
 
