@@ -38,15 +38,43 @@ fb() { fastboot -s "$SERIAL" "$@"; }
 
 pushd boot
 
-fb oem disable-verification
-fb oem disable-verity
-fb erase init_boot
-fb erase boot
-fb flash boot boot.img
-fb erase vendor_boot
-fb flash vendor_boot vendor_boot.img
-fb erase dtbo
-fb flash dtbo "$DTBO"
+# ★★ FLASH THE BOOT CHAIN TO BOTH SLOTS, and disable AVB on both.
+#
+# The old script flashed unsuffixed partitions, which target whichever slot is
+# active, so only ONE slot got our boot chain. `super` is not slotted and
+# super.img seeds both halves with our rootfs, so the other slot ended up
+# pairing a stock/stale kernel with our Debian rootfs half — provably different
+# chains on a live unit (boot_a cd09c736… vs boot_b 130f3a93…).
+#
+# That is the rollback target. A unit that rolls back — because its slot was
+# never committed and the bootloader's retry counter hit zero — lands on a
+# chain that cannot bring our system up, on hardware with no screen and no
+# buttons. Flashing both slots makes a rollback survivable instead of terminal.
+#
+# ⚠ The set-active dance is REQUIRED, not decoration: `oem disable-verification`
+# and `oem disable-verity` apply ONLY to the slot that is active when they run.
+# Flashing our unsigned repacked chain into a slot whose AVB is still enforcing
+# produces the silent-rollback failure documented for the OTA path — the flash
+# reports success, the hashes match, and the slot simply never boots.
+for slot in a b; do
+	echo ">>> preparing slot $slot (set-active, then disable AVB for THAT slot)"
+	fb --set-active=$slot
+	fb oem disable-verification
+	fb oem disable-verity
+	fb erase init_boot_$slot   || true
+	fb erase boot_$slot        || true
+	fb flash boot_$slot boot.img
+	fb erase vendor_boot_$slot || true
+	fb flash vendor_boot_$slot vendor_boot.img
+	fb erase dtbo_$slot        || true
+	fb flash dtbo_$slot "$DTBO"
+	fb erase vendor_kernel_boot_$slot || true
+done
+
+# Leave slot A active. Both slots now carry an identical, AVB-permissive chain,
+# so this is a choice of starting point rather than a fallback arrangement.
+fb --set-active=a
+
 fb erase super
 # ★ super.img, NOT rootfs.img — this is the FULL FLASH, and it is what leaves the
 # device in a valid A/B state.
@@ -71,8 +99,63 @@ if [ ! -f super.img ]; then
 	exit 1
 fi
 fb flash super super.img
-fb erase vendor_kernel_boot
 # fb oem uart disable
 fb reboot
 
 popd
+
+# ★★ COMMIT THE FLASHED SLOT.
+#
+# fastboot leaves slot metadata alone, and `--set-active` above marks the slot
+# active but NOT successful. Nothing on the device commits a slot until
+# netcheck proves a network — so a factory-flashed unit that never sees one
+# spends its 7 bootloader retries and rolls back, silently, having looked
+# healthy the whole time. That is the same invisible-rollback shape as the
+# vbmeta bug: the unit is up and reachable, it is just not running the image
+# you shipped.
+#
+# The device is already cabled to this host — that is how we just flashed it —
+# so after reboot it comes up as a CDC-NCM gadget serving DHCP on 10.42.0.1,
+# and we commit over that. No wired network required, which is the whole point.
+#
+# Best effort by design: if it cannot be reached, SAY SO LOUDLY rather than
+# exiting 0 on a unit whose slot is uncommitted. The in-image `--mark-only`
+# path also commits when no wired NIC is present, so this is belt-and-braces
+# for a unit that has a dongle attached but no DHCP behind it — the one case
+# neither mechanism can prove on its own.
+[ "${COMMIT_SLOT:-1}" = 1 ] || { echo ">>> COMMIT_SLOT=0, leaving the slot uncommitted"; exit 0; }
+
+GADGET=${GADGET:-10.42.0.1}
+SSH_KEY=${SSH_KEY:-$HOME/.ssh/junkyard-fleet}
+SSH_OPTS="-i $SSH_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=no
+          -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o ConnectTimeout=6"
+
+echo ">>> waiting for $SERIAL to come back on the USB gadget to commit its slot"
+committed=0
+for _ in $(seq 1 40); do
+	sleep 15
+	s=$(timeout 20 ssh $SSH_OPTS "kalm@$GADGET" \
+		'grep -o "androidboot.serialno = \"[^\"]*\"" /proc/bootconfig | cut -d\" -f2' 2>/dev/null)
+	# Confirm it is the unit we just flashed — the gadget address is fixed, so a
+	# different phone on the same bench would answer to it just as readily.
+	[ "$s" = "$SERIAL" ] || continue
+	if timeout 30 ssh $SSH_OPTS "kalm@$GADGET" \
+		'sudo /usr/local/bin/pixel-bootctl mark-successful' >/dev/null 2>&1; then
+		echo ">>> slot committed on $SERIAL"
+		timeout 30 ssh $SSH_OPTS "kalm@$GADGET" \
+			'sudo /usr/local/bin/pixel-bootctl status' 2>/dev/null | sed 's/^/    /'
+		committed=1
+	fi
+	break
+done
+
+if [ "$committed" != 1 ]; then
+	echo "" >&2
+	echo "!!! WARNING: could not commit the slot on $SERIAL over the USB gadget." >&2
+	echo "!!! The slot is ACTIVE but NOT SUCCESSFUL. If this unit reboots ~7 times" >&2
+	echo "!!! before something proves a network, the bootloader will roll it back." >&2
+	echo "!!! Both slots now carry the same chain, so a rollback is survivable —" >&2
+	echo "!!! but the unit would be running the other slot, not the one you flashed." >&2
+	echo "!!! Fix: boot it, confirm reachability, and run:" >&2
+	echo "!!!     sudo pixel-bootctl mark-successful" >&2
+fi

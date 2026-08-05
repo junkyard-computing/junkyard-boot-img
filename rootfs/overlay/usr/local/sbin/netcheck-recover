@@ -278,6 +278,28 @@ if [ "$MARK_ONLY" = 1 ]; then
         fi
         i=$((i + 1)); sleep 1
     done
+
+    # ⚠ DO NOT add "commit anyway when there is no wired NIC" here. It was tried
+    # and rejected 2026-08-05, and the reason is worth keeping.
+    #
+    # The tempting argument: the bootloader's retry counter drains whatever we
+    # decide, so a no-NIC unit gets rolled back by boot count even though the
+    # "never escalate without a NIC" guard refuses to roll it back — so we may as
+    # well commit and stop the counter.
+    #
+    # The argument is wrong because wired_nic_present() CANNOT DISTINGUISH a
+    # dongle that is absent from a dongle that failed to enumerate. Both present
+    # as no interface. An image that breaks USB enumeration — a bad r8152, a
+    # kernel regression, a botched module set — produces exactly the no-NIC
+    # signature, and that is precisely the case rollback exists for. Committing
+    # on no-NIC would disable rollback for the failures most likely to BE the
+    # image's fault. Observed the same day: a unit whose dongle was physically
+    # attached showed a completely empty `lsusb`.
+    #
+    # The counter-drain problem is real but belongs elsewhere: flash-fastboot.sh
+    # now writes the boot chain to BOTH slots, so a rollback lands on the same
+    # image instead of a stale/stock chain, and commits the slot at flash time
+    # over the USB gadget. That fixes the outcome without blinding the check.
     log "network not proven within ${MARK_DEADLINE:-20}s — leaving the slot uncommitted (mark-only never escalates)"
     exit 0
 fi
@@ -395,7 +417,11 @@ wired_nic_present() {
 # cannot attach one — so rollback is guaranteed useless here and its downside is
 # unbounded. Stay up, stay debuggable over the USB gadget, and let a human decide.
 if ! wired_nic_present; then
-    log "no wired NIC attached — hardware fault, not a bad image; not rebooting or rolling back"
+    # Refuses to escalate, and deliberately does NOT commit the slot either —
+    # see the matching note in the --mark-only path. A missing NIC and a NIC
+    # that failed to enumerate are indistinguishable here, so committing would
+    # switch off rollback for exactly the images most likely to deserve it.
+    log "no wired NIC attached — not rebooting or rolling back; leaving the slot uncommitted"
     exit 0
 fi
 if [ "$proven" = true ] && [ ! -e "$HADIP" ]; then
