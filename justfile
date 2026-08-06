@@ -233,7 +233,7 @@ _build: clone_kernel_source
 clone_kernel_source:
     #!/usr/bin/env bash
     set -euo pipefail
-    branch=$({{ _make }} -C {{ justfile_directory() }} print-KERNEL_BRANCH DEVICE={{ device }} | tail -1)
+    branch=$({{ _make }} --no-print-directory -C {{ justfile_directory() }} print-KERNEL_BRANCH DEVICE={{ device }} | tail -1)
     src={{ _kernel_source_dir }}
     manifest={{ justfile_directory() }}/kernel/kernel-manifest.{{ device }}.xml
 
@@ -323,7 +323,7 @@ clean_kernel: clone_kernel_source
 config_kernel: clone_kernel_source
     #!/usr/bin/env bash
     set -euo pipefail
-    target=$({{ _make }} -C {{ justfile_directory() }} print-BAZEL_TARGET DEVICE={{ device }} | tail -1)
+    target=$({{ _make }} --no-print-directory -C {{ justfile_directory() }} print-BAZEL_TARGET DEVICE={{ device }} | tail -1)
     cd {{ _kernel_source_dir }}
     cp ./aosp/arch/arm64/configs/gki_defconfig ./gki_defconfig_original
     # Same package as BAZEL_TARGET, but the :kernel_config rule rather than :dist.
@@ -593,8 +593,8 @@ install_apt_packages:
 sync_vendor_firmware:
     #!/usr/bin/env bash
     set -euo pipefail
-    ota_url=$({{ _make }} -C {{ justfile_directory() }} print-OTA_URL DEVICE={{ device }} | tail -1)
-    ota_sha=$({{ _make }} -C {{ justfile_directory() }} print-OTA_SHA256 DEVICE={{ device }} | tail -1)
+    ota_url=$({{ _make }} --no-print-directory -C {{ justfile_directory() }} print-OTA_URL DEVICE={{ device }} | tail -1)
+    ota_sha=$({{ _make }} --no-print-directory -C {{ justfile_directory() }} print-OTA_SHA256 DEVICE={{ device }} | tail -1)
     work={{ _vendor_firmware_workdir }}
     zip="$work/{{ device }}-ota.zip"
     mkdir -p "$work" {{ _payload_dumper_dir }}
