@@ -166,7 +166,13 @@ SUPER_IMG := $(BUILD_DIR)/super.img
 # Half, 4K-aligned exactly as rootfs-slot.sh computes it (sectors/2, minus %8).
 SUPER_HALF_BYTES := $(shell echo $$(( ( ($(SUPER_BYTES)/512/2) - ($(SUPER_BYTES)/512/2) % 8 ) * 512 )))
 MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
-BAZEL := $(KERNEL_SOURCE_DIR)/tools/bazel
+# ABSOLUTE, deliberately: .build_kernel does `cd $(KERNEL_SOURCE_DIR); $(BAZEL)`,
+# so a path relative to the repo root stops resolving the moment we cd into the
+# tree. This used to work by accident — the justfile exported BAZEL as an
+# absolute path, overriding the Makefile's relative `?=` default. That export is
+# gone (the layout is derived from $(DEVICE) here now), so the absoluteness has
+# to be stated rather than inherited.
+BAZEL := $(abspath $(KERNEL_SOURCE_DIR))/tools/bazel
 OVERLAY_DIR ?= rootfs/overlay
 # Per-device: each device's OTA supplies its own /vendor/firmware. Also keeps the
 # ~2GB download cached per-device, so switching back and forth doesn't re-fetch.

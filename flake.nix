@@ -77,7 +77,7 @@
         runScript = "bash";
         profile = ''
           export ARCH=arm64
-          echo "felix AOSP/Bazel FHS shell — run 'just build_kernel' here (then 'just all' in the default shell)"
+          echo "gs201 AOSP/Bazel FHS shell — run 'just device=<dev> build_kernel' here (then 'just <dev>' in the default shell)"
         '';
       };
     in
@@ -112,10 +112,14 @@
             shellHook = ''
               export ARCH=arm64
               export CROSS_COMPILE=${crossPrefix}
-              echo "felix build shell — ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE"
+              echo "junkyard build shell (felix + lynx) — ARCH=$ARCH CROSS_COMPILE=$CROSS_COMPILE"
               echo
-              echo "Full build on NixOS, one command (external sudo-capable terminal):  nix run .#build"
-              echo "Kernel build alone (kleaf needs the FHS env):  nix run .#bazel-fhs -- -c 'just build_kernel'"
+              echo "Build (external sudo-capable terminal):"
+              echo "    nix run .#build             felix"
+              echo "    nix run .#build -- lynx     lynx"
+              echo "    nix run .#build-all         both"
+              echo "Kernel alone (kleaf needs the FHS env):"
+              echo "    nix run .#bazel-fhs -- -c 'just device=felix build_kernel'"
               echo
               echo "NOTE — system-level prerequisites a flake CANNOT provide (set in your NixOS host / krg-nixos-flakes):"
               echo "  • binfmt for foreign-arch debootstrap:  boot.binfmt.emulatedSystems = [ \"aarch64-linux\" ];"
@@ -137,7 +141,7 @@
       });
 
       # One-command NixOS build. Nix lives ONLY here, so the Makefile/justfile stay
-      # portable (non-Nix hosts still build with a plain `just all`). The kernel build
+      # portable (non-Nix hosts still build with a plain `just <device>`). The kernel build
       # runs in the FHS env — kleaf execs /bin/bash and /usr/bin/env python3 with a
       # sanitized PATH, and only real FHS files satisfy that (envfs resolves on exec
       # but not on the stat() that `env`/bash do, so python3 isn't found). Everything
@@ -146,27 +150,54 @@
       apps = eachSystem (pkgs:
         let
           fhs = fhsFor pkgs;
-          felix-build = pkgs.writeShellApplication {
-            name = "felix-build";
+          # Takes the device as its argument, defaulting to felix:
+          #   nix run .#build            -> felix
+          #   nix run .#build -- lynx    -> lynx
+          #   nix run .#build-all        -> every device, sequentially
+          #
+          # It must be per-device rather than just calling `just all`: `all` now
+          # means EVERY device, and phase 1 below can only put ONE device's kernel
+          # through the FHS env. Ending with `just all` would run the other
+          # device's kernel build in phase 2's normal env, where kleaf fails.
+          junkyard-build = pkgs.writeShellApplication {
+            name = "junkyard-build";
             runtimeInputs = buildToolsFor pkgs ++ [ pkgs.procps ];
             text = ''
-              echo "[felix-build] 1/2 — kernel build in FHS env (kleaf needs real /bin/bash + /usr/bin/python3)"
-              # A bazel server started outside the FHS env (e.g. a prior plain `just all`)
-              # persists and runs actions in the non-FHS mount namespace, so an FHS build
-              # reuses it and fails `execvp(/bin/bash): No such file`. `bazel shutdown` from
-              # inside FHS doesn't reliably reach it, so kill this repo's bazel server here
-              # (host ns) to force a fresh one inside FHS. Harmless if none is running.
-              pkill -f "$PWD/kernel/source/out/bazel" 2>/dev/null || true
-              "${fhs}/bin/felix-bazel-fhs" -c 'just build_kernel'
-              echo "[felix-build] 2/2 — rootfs/boot in normal env (kernel cached; needs sudo + aarch64 binfmt)"
-              just all
+              DEVICE="''${1:-felix}"
+              echo "[junkyard-build] $DEVICE 1/2 — kernel build in FHS env (kleaf needs real /bin/bash + /usr/bin/python3)"
+              # A bazel server started outside the FHS env (e.g. a prior plain
+              # `just felix`) persists and runs actions in the non-FHS mount
+              # namespace, so an FHS build reuses it and fails
+              # `execvp(/bin/bash): No such file`. `bazel shutdown` from inside FHS
+              # doesn't reliably reach it, so kill this repo's bazel server here
+              # (host ns) to force a fresh one inside FHS. Harmless if none is
+              # running. Per-device path — the trees are kernel/source-<device>/.
+              pkill -f "$PWD/kernel/source-$DEVICE/out/bazel" 2>/dev/null || true
+              "${fhs}/bin/felix-bazel-fhs" -c "just device=$DEVICE build_kernel"
+              echo "[junkyard-build] $DEVICE 2/2 — rootfs/boot in normal env (kernel cached; needs sudo + aarch64 binfmt)"
+              # The device recipe re-runs .build_kernel, but phase 1 just touched
+              # its sentinel, so make skips it and the FHS-built kernel is used.
+              just "$DEVICE"
+            '';
+          };
+          junkyard-build-all = pkgs.writeShellApplication {
+            name = "junkyard-build-all";
+            runtimeInputs = [ ];
+            text = ''
+              for d in felix lynx; do
+                "${junkyard-build}/bin/junkyard-build" "$d"
+              done
             '';
           };
         in
         {
           build = {
             type = "app";
-            program = "${felix-build}/bin/felix-build";
+            program = "${junkyard-build}/bin/junkyard-build";
+          };
+          build-all = {
+            type = "app";
+            program = "${junkyard-build-all}/bin/junkyard-build-all";
           };
         });
 
