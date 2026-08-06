@@ -45,3 +45,6 @@ HOSTNAME    := lynx
 # The boot-chain partition set is confirmed identical to felix — boot, init_boot,
 # vendor_boot, vendor_kernel_boot, dtbo, vbmeta, vbmeta_system, vbmeta_vendor and
 # pvmfw all report has-slot:yes — so pixel-ota's flash list needs no change.
+
+# Human-facing model name, used in the operator-facing provisioning README.
+DEVICE_MODEL := Pixel 7a

@@ -17,13 +17,19 @@ Sentinel chain (all live under `build/<device>/`, dotfile-named): `.apply_kernel
 First-time run:
 
 ```
-just felix                        # everything for the Pixel Fold (repo sync ~1hr + OTA ~2GB on first run)
-just lynx                         # everything for the Pixel 7a
-just all                          # both
-DEVICE=felix ./flash-fastboot.sh <serial>
+just all                          # every device (first run per device: repo sync ~1hr + OTA ~2GB)
+just felix                        # or one at a time
+just lynx
+./flash-fastboot.sh <serial>      # device inferred from the bootloader
 ```
 
-**The build is multi-device.** `just felix` / `just lynx` / `just all` are the entry points; everything else takes `device=` (a just *variable*, so it goes BEFORE the recipe: `just device=lynx build_kernel`). Per-device delta lives in `devices/<device>.mk` (kernel branch, Bazel config+target, OTA url+sha, `SIZE`, `SUPER_BYTES`, hostname), included by the Makefile via `include devices/$(DEVICE).mk`. Everything else in the tree is SoC-level or userspace and is shared — felix and lynx are both gs201, and the port is board-level only.
+**The build is multi-device, and NOTHING defaults to a device.** felix and lynx are equal citizens; a default is a preference, and it silently decides which device a bare command acts on — an hour of wasted rebuild at best, the wrong image on real hardware at worst. So:
+
+- `just felix` / `just lynx` / `just all` are the entry points and set it for you. `all` means every device, derived from `devices/*.mk` so a third one is picked up automatically.
+- Every other justfile recipe takes `device=` (a just *variable*, so it goes BEFORE the recipe: `just device=lynx build_kernel`).
+- **The Makefile is the single enforcement point**: it `$(error)`s on an empty or unknown `DEVICE` and lists the known ones. The justfile passes `DEVICE=` through on every make call, so `just mount_rootfs` with no device stops there rather than operating on `build//`.
+- `flash-fastboot.sh` is the exception that proves the rule: it **asks the hardware** (`fastboot getvar product`) when `DEVICE` is unset, so the plain form is right for either device. Set `DEVICE=` to assert an expectation and a mismatch aborts.
+- `flash-ssh.sh`, `flash-nmap.sh --flash` and `package-provisioning.sh --device` all **require** it — none can safely infer which image you meant to *ship* (the target's own stamp says what it currently runs, which is a different question). Per-device delta lives in `devices/<device>.mk` (kernel branch, Bazel config+target, OTA url+sha, `SIZE`, `SUPER_BYTES`, hostname), included by the Makefile via `include devices/$(DEVICE).mk`. Everything else in the tree is SoC-level or userspace and is shared — felix and lynx are both gs201, and the port is board-level only.
 
 Each device gets its own artifact tree **and its own kernel checkout**:
 

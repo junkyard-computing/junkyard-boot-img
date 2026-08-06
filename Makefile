@@ -23,7 +23,21 @@
 # kernel branch, different vendor firmware), and a MIGRATION writes the whole
 # partition and destroys both halves before anything can reject it. See the
 # IMAGE_DEVICE stamp in stamp_version.
-DEVICE ?= felix
+# ★ NO DEFAULT, deliberately. felix and lynx are equal citizens, and a default is
+# a preference: it silently decides which device a bare command acts on. An
+# unnoticed default costs an hour of rebuild at best, and writes the wrong
+# device's image to real hardware at worst. `just felix` / `just lynx` / `just
+# all` supply it; anything else must say so.
+#
+# This is the single enforcement point — the justfile passes DEVICE= through on
+# every make call, so a `just mount_rootfs` with no device stops here rather than
+# quietly operating on build//.
+ifeq ($(strip $(DEVICE)),)
+$(error DEVICE is not set. Use `just felix` / `just lynx` / `just all`, or pass DEVICE=<device> (known: $(patsubst devices/%.mk,%,$(wildcard devices/*.mk))))
+endif
+ifeq ($(wildcard devices/$(DEVICE).mk),)
+$(error unknown DEVICE '$(DEVICE)' — no devices/$(DEVICE).mk (known: $(patsubst devices/%.mk,%,$(wildcard devices/*.mk))))
+endif
 include devices/$(DEVICE).mk
 
 # All per-device build artifacts — sentinels, rootfs.img, super.img, boot images,

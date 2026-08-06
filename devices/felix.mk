@@ -32,3 +32,6 @@ HOSTNAME := fold
 # MEASURED: `fastboot getvar partition-size:super` = 0x1FC800000 = 8136 MiB
 # exactly. Confirmed identical on all three felixes.
 SUPER_BYTES := 8531214336
+
+# Human-facing model name, used in the operator-facing provisioning README.
+DEVICE_MODEL := Pixel Fold

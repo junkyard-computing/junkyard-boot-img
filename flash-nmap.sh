@@ -151,7 +151,13 @@ DO_FLASH=0; ASSUME_YES=0; NO_VERIFY=0; FORCE=0
 JOBS=4; PROBE_JOBS=64; CANARY=3; WAVE=25; MAX_FAIL_PCT=10; SETTLE=900
 PORT=22; MIN_MARKS=2
 DEVICE_USER="${DEVICE_USER:-kalm}"
-MATCH_RE="${DEVICE_MATCH:-felix|gs201}"
+# Device-tree match for "is this one of ours". Deliberately gs201-level: it is a
+# SoC check, not a device check, and it CANNOT tell felix from lynx — both are
+# gs201 (`//private/devices/google/lynx:gs201_lynx_dist`). That separation is the
+# /etc/image-device stamp's job, checked against the image being shipped. Naming
+# only felix here would have read as a device gate while doing nothing of the
+# kind, so it names neither.
+MATCH_RE="${DEVICE_MATCH:-gs201|felix|lynx}"
 FLEET_ID="${FLEET_ID:-}"
 IDENTITY=""; HOSTS_FROM=""; EXPECT_VER="${EXPECT_VERSION:-}"; EXPECT_DEV="${EXPECT_DEVICE:-}"
 INSECURE_HOSTKEYS=0
@@ -239,8 +245,14 @@ fi
 # images below are read from that device's build dir. EXPECT_DEV is derived from
 # the image itself a few lines down, so the /etc/image-device gate still compares
 # against what is actually being shipped rather than against this variable.
-DEVICE="${DEVICE:-felix}"
+# ★ REQUIRED when flashing, no default — same reasoning as flash-ssh.sh, which
+# this passes it through to. Survey mode needs no device: it reports what it
+# finds, including each unit's own /etc/image-device stamp.
+DEVICE="${DEVICE:-}"
 export DEVICE
+if [ "$DO_FLASH" = 1 ] && [ -z "$DEVICE" ]; then
+	die "DEVICE is not set — say which device's build to ship, e.g. DEVICE=felix $0 --flash ... (known: $(ls "$here"/devices/*.mk 2>/dev/null | sed 's|.*/||; s|\.mk$||' | tr '\n' ' '))"
+fi
 ROOTFS_IMG_LOCAL="${ROOTFS_IMG:-$here/build/$DEVICE/rootfs.img}"
 
 if [ "$DO_FLASH" = 1 ]; then

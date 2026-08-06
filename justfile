@@ -21,11 +21,25 @@
 # "hostname=x" as the first positional parameter (android_kernel_branch), so the
 # override was silently ignored and a bogus kernel branch was used instead.
 
-# Which gs201 Pixel to build for. Selects devices/<device>.mk in the Makefile and
+# Which gs201 Pixel to act on. Selects devices/<device>.mk in the Makefile and
 # namespaces every artifact under build/<device>/, so felix and lynx never clobber
-# each other. Prefer `just felix` / `just lynx`; set this directly only for the
-# lower-level recipes (mount_rootfs, clean, sync_vendor_firmware, ...).
-device := "felix"
+# each other.
+#
+# ★ EMPTY BY DESIGN — there is no default device. felix and lynx are equal
+# citizens, and a default is a preference: it silently decides which device a
+# bare command acts on. `just felix` / `just lynx` / `just all` set it for you;
+# the lower-level recipes (mount_rootfs, clean, sync_vendor_firmware, ...) need
+# it spelled out: `just device=lynx clean`.
+#
+# The Makefile is the single enforcement point — every recipe here passes
+# DEVICE={{ device }} through to make, which errors on an empty or unknown one.
+device := ""
+
+# Every device the tree knows about, derived from devices/*.mk so `all` and
+# `clean_all` pick up a new one automatically — adding a device stays "a new
+# fragment plus a one-line recipe".
+[private]
+_devices := trim(shell("ls devices/*.mk 2>/dev/null | sed 's|devices/||; s|\\.mk$||' | tr '\\n' ' '"))
 
 # Empty means "use the device fragment's value" (devices/<device>.mk), which is
 # the right answer almost always — SIZE in particular is one half of `super` and
@@ -148,10 +162,13 @@ default:
 # dir, kernel source dir, kernel version) resolve for that device. They are
 # sequential, not parallel: the stages mount one shared sysroot at
 # rootfs/sysroot, so two concurrent device builds would fight over the mount.
-[doc('Build EVERY device (felix + lynx)')]
+[doc('Build EVERY device')]
 all:
-    just device=felix _build
-    just device=lynx _build
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for d in {{ _devices }}; do
+        just device="$d" _build
+    done
 
 # Build the felix (Pixel Fold) image.
 felix:
@@ -407,8 +424,11 @@ clean: unmount_rootfs
 
 # Clean every device, mirroring `all`.
 clean_all:
-    just device=felix clean
-    just device=lynx clean
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for d in {{ _devices }}; do
+        just device="$d" clean
+    done
 
 # ═══ ONE-TIME MIGRATION INTO THE PER-DEVICE LAYOUT ═══════════════════════════
 #

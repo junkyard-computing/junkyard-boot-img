@@ -26,9 +26,9 @@ Automated flow for building a Pixel Fold (felix) boot image trio — `boot.img`,
 The pipeline is Makefile-driven with sentinel files per stage, so reruns skip completed work.
 
 ```shell
-just felix     # build the Pixel Fold image
-just lynx      # build the Pixel 7a image
-just all       # build both
+just all       # build every device
+just felix     # or just one
+just lynx
 ```
 
 Each of those runs the whole pipeline for its device, including the first-time `repo` sync (~1hr) and the ~2GB vendor-firmware OTA download. Reruns are cheap.
@@ -85,23 +85,20 @@ A device build invokes make twice in sequence: first to build `.build_kernel`, t
 
 Individual stages are also exposed, and take `device=` like everything else: `just build_kernel`, `just build_rootfs`, `just install_apt_packages`, `just update_kernel_modules_and_source`, `just update_initramfs`, `just build_boot_images`, `just device=lynx build_kernel`. See `just --list`.
 
-`just clean` removes one device's images and sentinels (default felix), preserving the expensive kernel-build and OTA caches; `just clean_all` does both devices; `just clean_kernel` is the separate knob for the Bazel output.
+`just clean` removes one device's images and sentinels (`device=` is required, as everywhere), preserving the expensive kernel-build and OTA caches; `just clean_all` does both devices; `just clean_kernel` is the separate knob for the Bazel output.
 
 ## Flashing
 
 ```shell
-fastboot oem disable-verity
-fastboot oem disable-verification
-./flash-fastboot.sh
+./flash-fastboot.sh <serial>              # device inferred from the bootloader
+DEVICE=lynx ./flash-fastboot.sh <serial>  # or asserted
 ```
 
 `flash-fastboot.sh` wraps flashing `boot.img` + `vendor_boot.img` + `super.img` over fastboot, with the device in the bootloader on USB. It requires an explicit serial (`$1` or `FASTBOOT_SERIAL`) because it erases `super`, and it flashes `super.img` — the full-flash image with **both** rootfs halves seeded — not `rootfs.img`, which is only one half.
 
-It reads `build/<device>/`, selected with `DEVICE=` (default felix), and **refuses a cross-device flash**: it compares `fastboot getvar product` against the images it is about to write and stops if they disagree. felix and lynx are both gs201 and both accept these commands happily, but the images are incompatible, and this is the path that erases `super` and writes both slots. `DEVICE_CHECK=0` overrides.
+It reads `build/<device>/`. With no `DEVICE=` it **asks the hardware** — `fastboot getvar product` — and uses that, so the plain form is correct for either device; set `DEVICE=` to assert an expectation instead and a mismatch aborts. felix and lynx are both gs201 and both accept these commands happily, but the images are incompatible, and this is the path that erases `super` and writes both slots. `DEVICE_CHECK=0` overrides.
 
-```shell
-DEVICE=lynx ./flash-fastboot.sh 39271JEHN00059
-```
+**No command in this repo has a default device.** felix and lynx are equal citizens, and a default is a preference — it silently decides which device a bare command acts on. `just felix` / `just lynx` / `just all` say it for you; `flash-fastboot.sh` asks the bootloader; everything else requires it and lists the known devices if you forget. The one enforcement point is the Makefile, which errors on an empty or unknown `DEVICE`.
 
 For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then arms a rootfs reflash that the initramfs' `90rootfs-flash` **pre-mount hook** performs on the way back up — before root is mounted, and after verifying the staged image against its `sha256`/`size` sidecars. (Not a systemd shutdown pivot: `dracut-shutdown.service` is `/bin/true` on these images.) It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and stages the image on the `userdata` partition — mounting it if it isn't mounted.
 
@@ -116,7 +113,7 @@ For a **fleet**, `flash-nmap.sh` finds the devices first: it nmaps the given sub
 
 It flashes **nothing** without `--flash`. A device is a target only if it (1) authorizes our SSH key and grants it passwordless root, (2) runs our rootfs — gs201/felix device tree plus overlay-only markers — and (3) reports an `IMAGE_VERSION` matching `--from-version`. That last one is the gate that scales: you know what image the devices were built with even when you don't know their serials. `--fleet ID` additionally requires the build-time stamp in `/etc/junkyard-fleet` (`just fleet_id=… felix`). Exclusions are by serial (`--exclude-serial-file`), which is the list that stays small.
 
-Both SSH paths take `DEVICE=` too, and the device's own `/etc/image-device` stamp is checked against the image being shipped — the gate that stops a felix image reaching lynx hardware, which every other check would pass since lynx is also gs201.
+Both SSH paths **require** `DEVICE=`, and the device's own `/etc/image-device` stamp is checked against the image being shipped — the gate that stops a felix image reaching lynx hardware, which every other check would pass since lynx is also gs201.
 
 Because the rootfs half is not rollback-safe, a run is **canaried and waved**: `--canary 3` units go first and must come back on the new version or the run stops with the rest untouched, then `--wave 25` batches, each verified by re-scanning and matching serials (a reflashed device may take a new DHCP lease). `--max-fail 10` trips a circuit breaker. Devices already on the target version are skipped, so re-running the same command converges the fleet. Logs and the inventory land in `out/flash-nmap/<timestamp>/`.
 
