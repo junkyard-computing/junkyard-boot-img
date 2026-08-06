@@ -1,0 +1,71 @@
+--- a/lib/kobject_uevent.c
++++ b/lib/kobject_uevent.c
+@@ -25,6 +25,7 @@
+ #include <linux/uidgid.h>
+ #include <linux/uuid.h>
+ #include <linux/ctype.h>
++#include <linux/uaccess.h>	/* copy_from_kernel_nofault() — see subsystem probe below */
+ #include <net/sock.h>
+ #include <net/netlink.h>
+ #include <net/net_namespace.h>
+@@ -535,6 +536,60 @@
+ 		return 0;
+ 	}
+ 
++	/*
++	 * felix: DROP the uevent if the subsystem name is unreadable, instead of
++	 * taking a fatal paging fault while formatting it.
++	 *
++	 * Observed on ~40% of boots on this platform, always inside the
++	 * initramfs (t~6-7s), always Comm: udevadm writing a synthetic uevent:
++	 *
++	 *   Unable to handle kernel paging request at virtual address ffffffc00e20b568
++	 *   CPU: 5 PID: 1633 Comm: udevadm
++	 *   pc : string+0xc8/0x120   lr : vsnprintf+0x438/0x668
++	 *   x6 : 4554535953425553 ("SUBSYSTE")  x7 : 3d4d455453595342 ("BSYSTEM=")
++	 *   Call trace: string <- vsnprintf <- add_uevent_var <- kobject_uevent_env
++	 *               <- kobject_synth_uevent <- uevent_store <- vfs_write
++	 *
++	 * x6/x7 spell "SUBSYSTEM=", so the pointer being dereferenced is exactly
++	 * the `subsystem` resolved just above. The faulting addresses across five
++	 * separate crashes were:
++	 *   ffffffc00dda3568 ffffffc00e1ab568 ffffffc00e213568
++	 *   ffffffc00e0ab568 ffffffc00e20b568
++	 * i.e. a CONSTANT 0x568 page offset with a varying base, in the vmalloc
++	 * range — the signature of a static string at a fixed offset inside a
++	 * module allocation whose base is randomised per boot. The fault is a
++	 * level-3 translation fault (ESR 0x96000007), so the page is UNMAPPED,
++	 * not merely poisoned: the backing vmalloc mapping has been torn down.
++	 *
++	 * dev_uevent_name() returns dev->bus->name or dev->class->name, which for
++	 * a module-provided bus/class is static data inside that module. So a
++	 * device is outliving the module that owns its bus/class, and udevadm's
++	 * coldplug walk then reads freed module memory. That is a driver-lifetime
++	 * bug somewhere in the ~324 force-loaded modules; this does not fix it.
++	 *
++	 * What it does fix is the CONSEQUENCE. A panic here is fatal to a headless
++	 * unit: it burns an A/B retry counter, and twice left a device parked on
++	 * the bootloader's ramdump screen needing a physical power-cycle. Dropping
++	 * one uevent is strictly better, and mirrors what the !subsystem case a
++	 * few lines up already does.
++	 *
++	 * The pr_err also NAMES the offending kobject, which is the diagnostic we
++	 * could not otherwise get: lib/kobject_uevent.c's pr_debug()s are compiled
++	 * out here (CONFIG_DYNAMIC_DEBUG_CORE=y but not CONFIG_DYNAMIC_DEBUG), and
++	 * the crash is not reproducible at runtime — writing add+change to all
++	 * 3286 uevent files on a settled system never faults.
++	 */
++	{
++		char probe;
++
++		if (copy_from_kernel_nofault(&probe, subsystem, 1)) {
++			pr_err("kobject: '%s' (%p): %s: DROPPING uevent, unreadable subsystem ptr %px (kset %px)\n",
++			       kobject_name(kobj), kobj, __func__,
++			       subsystem, kset);
++			return 0;
++		}
++	}
++
+ 	/* environment buffer */
+ 	env = kzalloc(sizeof(struct kobj_uevent_env), GFP_KERNEL);
+ 	if (!env)

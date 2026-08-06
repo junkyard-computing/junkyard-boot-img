@@ -1,0 +1,45 @@
+#!/bin/sh
+# Cleanly detach the USB host role before the machine resets.
+#
+# WHY: the dongle is powered by the dock, not the phone, so it survives our
+# reboot. If we reset with xHCI still live, its host disappears mid-flight and
+# the dongle's USB link state machine is left orphaned — it then never
+# re-attaches to the newly booted host, and the unit is stranded with no
+# network, no screen and no buttons. Measured on 34291FDHS000WV: 1 strand in 13
+# reboots, and the phone side was provably healthy every time (role=host, xHCI
+# registered, SuperSpeed advertised, but no `usb 2-1: new SuperSpeed USB device`).
+#
+# The same hardware running stock Android does NOT do this, on the same kernel —
+# so it is not a hardware or driver limitation, it is a teardown our userspace
+# was not doing. Android tears the USB stack down deliberately before reset.
+#
+# Trying to revive an already-stuck dongle at the NEXT boot does not work (see
+# dongle-rehost, which failed on the real stuck case). Giving it a clean
+# disconnect on the way DOWN is the fix: a DR_SWAP away from host drops the
+# connection while the dongle is still healthy, so it resets its link state and
+# enumerates fresh on the next boot.
+#
+# Verified the mechanism on a healthy link: role host -> device -> host brought
+# the NIC back in 2s, so the swap really does force a disconnect/reconnect.
+#
+# systemd runs everything in /usr/lib/systemd/system-shutdown/ after the
+# filesystems are unmounted and immediately before reboot(2) — the last moment
+# we can touch sysfs, which is exactly what we want.
+#
+# Best-effort by design: never fail the shutdown. $1 is the verb
+# (reboot/poweroff/halt/kexec).
+PORT=/sys/class/typec/port0/data_role
+
+[ -w "$PORT" ] || exit 0
+
+case "$(cat "$PORT" 2>/dev/null)" in
+    *"[host]"*)
+        # Drop out of host role so the downstream device sees a real
+        # disconnect rather than its host vanishing.
+        echo device > "$PORT" 2>/dev/null
+        # Give the Type-C state machine a moment to actually transition; this
+        # is the last thing running, so a short sleep costs nothing.
+        sleep 2
+        ;;
+esac
+exit 0

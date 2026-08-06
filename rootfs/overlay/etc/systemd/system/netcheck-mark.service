@@ -1,0 +1,12 @@
+[Unit]
+Description=Commit the running A/B slot once the network is proven
+Documentation=man:pixel-bootctl(8)
+# Only meaningful once userspace networking has had a chance to come up.
+After=network.target NetworkManager.service
+
+[Service]
+Type=oneshot
+# --mark-only NEVER reboots, rolls back, or bounces the USB role. It only
+# commits a slot whose network it has just proven. See netcheck-recover for why
+# this is split from the escalation path.
+ExecStart=/usr/local/sbin/netcheck-recover --mark-only

@@ -1,0 +1,24 @@
+[Unit]
+Description=Commit the running A/B slot early, before the retry counter is spent
+
+[Timer]
+# ★ EARLY AND OFTEN, unlike netcheck-recover.timer's 5min/5min.
+#
+# flash-ssh switches to the new slot active-but-NOT-successful, so it is running
+# on borrowed retries until something commits it. netcheck-recover could not do
+# that job promptly: its first run is at OnBootSec=5min AND the OTA inhibit
+# suppresses it for up to 900s, leaving a ~20 minute window in which seven
+# reboots exhaust the counter and the bootloader rolls back to the OLD image —
+# silently, on a unit that is up and reachable throughout. Measured on
+# 34291FDHS000WV 2026-08-05: slot B ended `retry count: 0, successful: false`
+# after a 20-cycle reboot soak.
+#
+# 45s clears a normal boot (12-25s) and the bounded worst case (~88s) is covered
+# by the repeat. Cheap to re-run: committing an already-committed slot is a no-op.
+OnBootSec=45s
+OnUnitActiveSec=60s
+AccuracySec=5s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

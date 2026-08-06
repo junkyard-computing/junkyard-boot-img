@@ -1,0 +1,15 @@
+[Unit]
+Description=Raise this slot's boot-retry budget once per installed rootfs
+Documentation=man:pixel-bootctl(8)
+# Needs /var for its stamp and the devinfo node. Ordered before nothing: if it
+# is slow or fails it must not delay a boot on a device with no console.
+After=local-fs.target
+ConditionPathExists=/dev/disk/by-partlabel/devinfo
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/slot-retry-topup
+TimeoutStartSec=30
+
+[Install]
+WantedBy=multi-user.target

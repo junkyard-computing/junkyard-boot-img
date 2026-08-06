@@ -1,5 +1,28 @@
 # Refresh the login-banner dongle-MAC line when a USB-Ethernet dongle is
 # plugged or unplugged, so the banner tracks hotplug, not just boot-time state.
-# Restart (not start) is harmless for a RemainAfterExit oneshot and re-runs it.
-ACTION=="add|remove", SUBSYSTEM=="net", ENV{ID_BUS}=="usb", \
-  RUN+="/bin/systemctl --no-block restart dongle-mac-issue.service"
+#
+# ⚠ Uses ENV{SYSTEMD_WANTS}, NOT RUN+="systemctl ...". RUN+= holds the udev
+# worker until the command returns, and `systemctl` needs a D-Bus round trip to
+# PID1 — so whenever PID1 is busy, a cosmetic banner refresh turns into a wedged
+# udev worker. That is not hypothetical: on 34291FDHS000WV 2026-08-05, staging a
+# 4 GB OTA image starved PID1, a dongle re-enumeration landed mid-transfer, and
+#     Spawned '/bin/systemctl --no-block restart dongle-mac-issue.service'
+#     is taking longer than 59s to complete
+# extended the stall until softdog reset the device at 120s — which the
+# bootloader then reported as `0xbaba - Kernel PANIC`, i.e. our own banner rule
+# helped turn a healthy mid-OTA device into an apparent kernel crash.
+# (`--no-block` does not save you: it only skips waiting for the JOB, the
+# connect-and-enqueue to PID1 still blocks.)
+#
+# SYSTEMD_WANTS hands the unit to systemd as a property of the device and lets
+# the worker exit immediately, so a busy PID1 can never wedge udev here. The
+# trade is that it starts rather than restarts the unit, so the oneshot needs
+# RemainAfterExit=no to re-run on each hotplug — see dongle-mac-issue.service.
+ACTION=="add", SUBSYSTEM=="net", ENV{ID_BUS}=="usb", \
+  ENV{SYSTEMD_WANTS}+="dongle-mac-issue.service"
+
+# `remove` carries no SYSTEMD_WANTS semantics (the device is going away, so
+# there is nothing for systemd to bind the unit to). Use systemd-run, which
+# forks and returns immediately instead of waiting on a D-Bus job like systemctl.
+ACTION=="remove", SUBSYSTEM=="net", ENV{ID_BUS}=="usb", \
+  RUN+="/usr/bin/systemd-run --no-block --unit=dongle-mac-issue-refresh /usr/local/sbin/dongle-mac-issue"

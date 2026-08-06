@@ -1,0 +1,253 @@
+#!/bin/sh
+# Recover a USB-Ethernet dongle that failed to re-attach after a reboot.
+#
+# THE FAILURE THIS FIXES STRANDS A NETWORK-ONLY DEVICE.
+#
+# The dongle is powered by the dock/hub, not by the phone, so it stays powered
+# across the phone's reboot. When the phone resets, the dongle's USB link state
+# machine is left orphaned with its host gone, and it never re-attaches to the
+# newly booted host. Observed on 34291FDHS000WV: after a reboot the phone side
+# was provably healthy —
+#     exynos-dwc3 11210000.usb: set desired role to host
+#     xhci-hcd-exynos: xHCI Host Controller / new USB bus registered (1 and 2)
+#     Host supports USB 3.1 Enhanced SuperSpeed
+# — and yet no `usb 2-1: new SuperSpeed USB device` ever appeared. No dongle, no
+# address, no way in. Only a physical replug brought it back, which on a fielded
+# unit with no screen and no buttons means a truck roll.
+#
+# Re-running host init does NOT help: the boot path already does exactly that
+# and it is what failed. What works is forcing a Type-C DR_SWAP, which changes
+# CC-line state and makes the downstream device see a disconnect/reconnect —
+# the software equivalent of the replug. Measured: role device -> host, NIC back
+# in 2 seconds.
+#
+# Runs at boot, does nothing when the dongle is present, and is a no-op on units
+# that have no Type-C role control.
+set -u
+PORT=${PORT:-/sys/class/typec/port0/data_role}
+# ★ THE LEVER THAT ACTUALLY WORKS ON THE AOSP TRACK.
+#
+# /sys/class/typec/port0/data_role is mode 444 (READ-ONLY) on this build, so
+# every DR_SWAP write this script used to attempt failed with EACCES — the
+# healer has never once worked here, and it logged "role forced back to host"
+# unconditionally afterwards, reporting an action it never performed. Verified
+# on 34291FDHS000WV 2026-08-03:
+#     dongle-rehost: cannot create /sys/class/typec/port0/data_role: Permission denied
+#     -r--r--r--  /sys/class/typec/port0/data_role
+#
+# The vendor dwc3 exposes a writable OTG ID-pin emulation instead. From
+# dwc3-exynos.c dwc3_exynos_otg_id_store():
+#     dwc3_exynos_host_event(exynos->dev, !id);
+# i.e. writing 0 raises a HOST event (ID grounded = A-device = host) and
+# writing 1 drops back to device. That is the AOSP equivalent of the DR_SWAP.
+OTG_ID=${OTG_ID:-/sys/devices/platform/11210000.usb/dwc3_exynos_otg_id}
+GADGET_IF=${GADGET_IF:-usb0}
+SETTLE=${SETTLE:-30}      # seconds to allow normal enumeration first
+TRIES=${TRIES:-3}
+
+log() { logger -t dongle-rehost "$*"; echo "dongle-rehost: $*" > /dev/kmsg 2>/dev/null; }
+
+# A real wired NIC: a device symlink (excludes the ~44 virtual rmnet/gre/sit
+# interfaces this kernel creates), ARPHRD_ETHER, and not the gadget itself.
+have_nic() {
+    for d in /sys/class/net/*; do
+        n=$(basename "$d")
+        [ "$n" = "lo" ] && continue
+        [ "$n" = "$GADGET_IF" ] && continue
+        [ -e "$d/device" ] || continue
+        [ "$(cat "$d/type" 2>/dev/null)" = "1" ] && return 0
+    done
+    return 1
+}
+
+# ★★ IS THE USB GADGET ACTUALLY IN USE? IF SO, DO NOT TOUCH THE PORT.
+#
+# have_nic() deliberately ignores usb0, so a phone with no dongle looks NIC-less
+# — which is exactly a phone sitting on a USB cable to a laptop, being used over
+# the gadget. Every lever below (otg_id, dwc3 mode=host, TCPC unbind/rebind)
+# forces the port towards HOST, and that tears the gadget down.
+#
+# That is not theoretical: it is what made a gadget-only unit reachable over SSH
+# for ~30s after boot and then vanish from the host's USB bus entirely, over and
+# over, on 2026-08-05. Before the escalation ladder existed the writes were
+# no-ops ("role unchanged none") so this was harmless; making the ladder work
+# turned a harmless misfire into a service that destroys the connection it is
+# supposed to be repairing.
+#
+# ★ On a screenless, buttonless unit the gadget is a PATH IN. Breaking it to go
+# looking for a dongle that was never attached trades a working route for a
+# hypothetical one.
+#
+# carrier=1 is the right test: for CDC-NCM the device only sees carrier once a
+# host has configured the link, so it means a host is really there — not merely
+# that we brought usb0 up ourselves.
+gadget_in_use() {
+    [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ]
+}
+
+# Give normal enumeration a chance before intervening.
+#
+# Log the outcome UNCONDITIONALLY, including the boring success case. An earlier
+# version was silent when it found a NIC and exited, which meant that after a
+# strand there was no way to tell whether it had run and seen a dongle, or
+# misfired, or never started — the one question the log needed to answer.
+i=0
+while [ "$i" -lt "$SETTLE" ]; do
+    if have_nic; then
+        log "wired NIC present after ${i}s ($(ls /sys/class/net | wc -l) ifaces total) — nothing to do"
+        exit 0
+    fi
+    if gadget_in_use; then
+        log "USB gadget is connected to a host — leaving the port alone"
+        exit 0
+    fi
+    i=$((i + 1)); sleep 1
+done
+if gadget_in_use; then
+    log "USB gadget is connected to a host — leaving the port alone"
+    exit 0
+fi
+log "no wired NIC after ${SETTLE}s; ifaces=$(ls /sys/class/net | tr '\n' ' ')"
+
+# Pick a lever we can actually write. Report which, and REPORT FAILURE HONESTLY:
+# the previous version claimed "role forced back to host" even when every write
+# had been rejected, which turned a broken healer into a silent one.
+#
+# `[ -w ]` is not sufficient on its own here — test an actual write, because a
+# sysfs attribute can be mode-writable and still reject the value.
+METHOD=""
+if [ -w "$OTG_ID" ]; then
+    METHOD=otg_id
+elif [ -w "$PORT" ]; then
+    METHOD=data_role
+else
+    log "no writable role control (tried $OTG_ID and $PORT) — cannot re-host"
+    log "  $OTG_ID: $(ls -l "$OTG_ID" 2>&1 | awk '{print $1}')"
+    log "  $PORT: $(ls -l "$PORT" 2>&1 | awk '{print $1}')"
+    exit 0
+fi
+log "using $METHOD to force host mode"
+
+force_host() {
+    case "$METHOD" in
+        otg_id)    echo 0 > "$OTG_ID" 2>/dev/null ;;
+        data_role) echo host > "$PORT" 2>/dev/null ;;
+    esac
+}
+force_device() {
+    case "$METHOD" in
+        otg_id)    echo 1 > "$OTG_ID" 2>/dev/null ;;
+        data_role) echo device > "$PORT" 2>/dev/null ;;
+    esac
+}
+
+t=0
+while [ "$t" -lt "$TRIES" ]; do
+    t=$((t + 1))
+    # Re-check every round: this loop runs for ~90s, and someone plugging a
+    # laptop in mid-way must not have the cable yanked out from under them.
+    if gadget_in_use; then
+        log "gadget came up mid-run — stopping before we break it"
+        exit 0
+    fi
+    log "no wired NIC after ${SETTLE}s (attempt $t/$TRIES) — forcing host via $METHOD"
+    # Bounce through device so the downstream port sees a real disconnect,
+    # then assert host. On a port that simply never left device role (the PD
+    # case: sink role never triggers host), the second write is the one that
+    # matters.
+    force_device; sleep 3
+    if ! force_host; then
+        log "write to $METHOD FAILED — cannot force host mode; giving up"
+        exit 1
+    fi
+    i=0
+    while [ "$i" -lt 30 ]; do
+        if have_nic; then
+            log "dongle attached after forcing host via $METHOD (attempt $t)"
+            exit 0
+        fi
+        i=$((i + 1)); sleep 1
+    done
+done
+
+# ---------------------------------------------------------------------------
+# ESCALATION. otg_id is mode 644 so the loop above always *runs*, but on a
+# PD-powered hub it does nothing at all: the Type-C port manager owns the role,
+# and every write comes back
+#     exynos-dwc3 11210000.usb: set desired role to none
+#     exynos-dwc3 11210000.usb: role unchanged none
+# Measured on 35071FDHS0017C 2026-08-05, boot -1: three otg_id attempts here and
+# a fourth from netcheck-recover, all no-ops, `lsusb` empty the whole time, the
+# unit reachable only over the USB gadget. Every role knob under
+# /sys/class/typec/port0 (data_role, power_role, preferred_role, port_type) is
+# mode 444, and the usb_role switch has no `role` attribute — it never leaves
+# waiting_for_supplier. So there is no polite lever, and "we tried otg_id" is
+# not the same as "we tried".
+#
+# ⚠ This matters more than it looks: the fielded units have NO BATTERY, so they
+# must take power AND ethernet through the one port. PD-plus-hub is not a bench
+# quirk, it is the shipping topology — the exact case where otg_id is useless.
+#
+# Two levers that are actually writable, weakest first:
+#   1. dwc3's debugfs `mode` — asks the controller directly, bypassing the TCPM.
+#   2. unbind/rebind the TCPC driver — re-runs the whole Type-C attach state
+#      machine. This is the software equivalent of physically replugging, which
+#      is the one thing known to clear this state.
+# Both are last resorts, so they run only after the polite path has failed.
+DWC3_MODE=${DWC3_MODE:-/sys/kernel/debug/usb/11210000.dwc3/mode}
+TCPC_DRV=${TCPC_DRV:-/sys/bus/i2c/drivers/max77759tcpc}
+TCPC_DEV=${TCPC_DEV:-13-0025}
+
+wait_for_nic() {  # wait_for_nic <seconds> <what>
+    _n=0
+    while [ "$_n" -lt "$1" ]; do
+        if have_nic; then log "dongle attached after $2"; return 0; fi
+        _n=$((_n + 1)); sleep 1
+    done
+    log "$2 did not bring the dongle back within $1s"
+    return 1
+}
+
+if gadget_in_use; then
+	log "gadget in use — skipping escalation entirely"
+	exit 0
+fi
+if [ -w "$DWC3_MODE" ]; then
+    log "escalating: asking dwc3 directly for host mode via $DWC3_MODE"
+    if echo host > "$DWC3_MODE" 2>/dev/null; then
+        wait_for_nic 20 "dwc3 mode=host" && exit 0
+    else
+        log "write to $DWC3_MODE was rejected"
+    fi
+else
+    log "no $DWC3_MODE (debugfs not mounted or kernel lacks it) — skipping that step"
+fi
+
+if [ -w "$TCPC_DRV/unbind" ] && [ -e "$TCPC_DRV/$TCPC_DEV" ]; then
+    log "escalating: software replug — unbind/rebind $TCPC_DEV on max77759tcpc"
+    # A failed rebind leaves the port with NO manager at all, which is strictly
+    # worse than a wedged one, so treat the bind as the step that must succeed
+    # and say so loudly if it does not.
+    if echo "$TCPC_DEV" > "$TCPC_DRV/unbind" 2>/dev/null; then
+        sleep 2
+        if echo "$TCPC_DEV" > "$TCPC_DRV/bind" 2>/dev/null; then
+            log "TCPC rebound; waiting for the port to re-attach"
+            wait_for_nic 45 "TCPC unbind/rebind" && exit 0
+        else
+            log "CRITICAL: unbound $TCPC_DEV but REBIND FAILED — port has no manager"
+        fi
+    else
+        log "unbind of $TCPC_DEV was rejected"
+    fi
+else
+    log "no writable $TCPC_DRV/unbind for $TCPC_DEV — skipping the software replug"
+fi
+
+# Never leave a network-only device parked in device role. Only claim we did it
+# if the write actually succeeded.
+if force_host; then
+    log "dongle did NOT attach after $TRIES attempts + escalation; host role re-asserted via $METHOD"
+else
+    log "dongle did NOT attach after $TRIES attempts + escalation; AND re-asserting host FAILED"
+fi
+exit 1

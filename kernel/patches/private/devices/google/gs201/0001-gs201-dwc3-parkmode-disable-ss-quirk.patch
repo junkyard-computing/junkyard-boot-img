@@ -1,0 +1,45 @@
+diff --git a/dts/gs201-common.dtsi b/dts/gs201-common.dtsi
+index 5fcfce5..36997dc 100644
+--- a/dts/gs201-common.dtsi
++++ b/dts/gs201-common.dtsi
+@@ -97,6 +97,40 @@
+ 		/* http://b/171478776 : disabling U1/U2 speed up NCM tethering by >2x */
+ 		snps,dis-u1-entry-quirk;
+ 		snps,dis-u2-entry-quirk;
++
++		/*
++		 * Disable dwc3 SuperSpeed "park mode".
++		 *
++		 * WHY: sustained host-mode ingest over the USB-Ethernet dongle kills
++		 * the whole xHCI controller. Measured on 34291FDHS000WV 2026-08-03:
++		 *     xHCI host not responding to stop endpoint command
++		 *     xHCI host controller not responding, assume dead
++		 *     HC died; cleaning up
++		 *     r8152 ...: Tx status -2      <- consequence, NOT the cause
++		 * A Stop Endpoint command that does not complete makes the xHCI core
++		 * halt and kill the controller unconditionally (xhci-ring.c
++		 * xhci_handle_command_timeout(): "Bail out and tear down xhci if a
++		 * stop endpoint command failed" -> xhci_halt() + xhci_hc_died()), so a
++		 * single stalled endpoint takes the entire bus down and the device
++		 * loses its only network path.
++		 *
++		 * It is NOT a line-rate problem: ~89 Mb/s runs indefinitely (an 8.5 GB
++		 * rootfs staged fine), ~133 Mb/s kills it in 15-19s -- about 13% of the
++		 * 1000 Mb/s link.
++		 *
++		 * The mainline gs201 port does NOT have this bug: the identical flood
++		 * (dd | ssh 'cat > /dev/null') ran 130s on mainline 7.2.0-rc5 with zero
++		 * new dmesg lines, while this AOSP build died at 15s. Mainline's
++		 * gs201-felix.dts sets snps,parkmode-disable-ss-quirk; this DT never
++		 * did, even though the AOSP dwc3 core reads it (drivers/usb/dwc3/core.c
++		 * "snps,parkmode-disable-ss-quirk"). Park mode lets the dwc3 scheduler
++		 * park on a SuperSpeed endpoint and is a known source of stalls under
++		 * sustained transfer, which is why upstream carries the disable quirk.
++		 *
++		 * Note the U1/U2 levers above are already pulled and did NOT prevent
++		 * this -- do not re-try them.
++		 */
++		snps,parkmode-disable-ss-quirk;
+ 		xhci_l2_support = <1>;
+ 	};
+ };

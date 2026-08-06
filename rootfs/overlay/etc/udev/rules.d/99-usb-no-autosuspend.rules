@@ -1,0 +1,26 @@
+# Never autosuspend USB devices.
+#
+# THIS IS WHY THE DONGLE DROPS. Debian ships usbcore autosuspend enabled with a
+# 2s idle delay (/usr/lib/udev/rules.d/60-autosuspend.rules). The r8152
+# USB-Ethernet dongle gets suspended when idle and does not resume cleanly on
+# this xHCI, and the device then loses its only network path. Captured on
+# 34291FDHS000WV at t=2082s:
+#
+#   r8152 enx6c6e07171480: NETDEV WATCHDOG: transmit queue 0 timed out 5096 ms
+#   r8152 enx6c6e07171480: Tx timeout
+#   r8152 enx6c6e07171480: Tx status -2          <- -ENOENT, endpoint gone
+#   r8152 enx6c6e07171480: Get ether addr fail
+#   r8152-cfgselector 2-1: USB disconnect, device number 2
+#   xhci_exynos_check_port action=2 ... suspend=1 <- the port had suspended
+#
+# NetworkManager saw the interface vanish at the same instant
+# ("activated -> unmanaged, managed-type: 'removed'"). From outside, the device
+# is alive and answering nothing — which is how this presented for most of a
+# day as "the dongle is flaky" and "SSH hangs".
+#
+# Applied to ALL USB devices, not just the dongle, deliberately. The shipped
+# configuration has no screen, no volume keys and no power button: USB carries
+# both the only network path (dongle) and the only out-of-band path (gadget).
+# Suspending either to save a trivial amount of power on a mains-powered
+# appliance is a bad trade when the failure mode is an unreachable device.
+ACTION=="add", SUBSYSTEM=="usb", TEST=="power/control", ATTR{power/control}="on"

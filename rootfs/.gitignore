@@ -8,6 +8,13 @@
 !kmscon.env
 !overlay
 !overlay/**
+# The fleet's authorised PUBLIC keys (SSH_AUTHORIZED_KEYS). Tracked on purpose:
+# which key can log into the fleet is part of the image definition, and an
+# untracked one means another builder silently produces a keyless image — which
+# is not merely inconvenient, it makes every device that image builds invisible
+# to flash-nmap.sh's ownership gate. Public halves only; the private key lives
+# on the build host (~/.ssh/junkyard-fleet) and must never land here.
+!authorized_keys
 # ...but not the cross-compiled tool binaries the .build_pixel_* Make targets
 # drop in (re-ignore them; source-of-truth is each tools/pixel-* submodule).
 # Must come after !overlay/** to win.

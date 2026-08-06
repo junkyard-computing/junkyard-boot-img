@@ -13,9 +13,18 @@ Before=getty.target serial-getty@ttySAC0.service kmsconvt@tty1.service kmscon@tt
 
 [Service]
 Type=oneshot
-RemainAfterExit=yes
+# RemainAfterExit=no, deliberately. The paired udev rule now re-triggers this
+# via ENV{SYSTEMD_WANTS} instead of `systemctl restart` (see the rule for why —
+# a RUN+= systemctl call wedged a udev worker for 59s during an OTA and helped
+# softdog reset the device). SYSTEMD_WANTS issues a plain START, and starting a
+# unit that is already active because of RemainAfterExit=yes is a no-op, so the
+# banner would silently stop tracking hotplug. Exiting inactive makes each
+# hotplug a real re-run.
+#
+# Ordering is unaffected: Type=oneshot still holds Before=getty.target until
+# ExecStart completes, whether or not the unit stays active afterwards.
+RemainAfterExit=no
 ExecStart=/usr/local/sbin/dongle-mac-issue
-# Refresh on dongle hotplug too (paired udev rule re-triggers this unit).
 
 [Install]
 # Pulled in early (sysinit-adjacent) so it's ordered before getty.target, which

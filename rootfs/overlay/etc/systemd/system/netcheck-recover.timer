@@ -1,0 +1,19 @@
+[Unit]
+Description=Periodic network-loss recovery check
+# The device this ships on has NO screen and NO buttons — the network is the
+# only way in. A oneshot check at boot cannot help with a device that comes up
+# fine and loses reachability an hour later, which is exactly the failure we
+# have observed (system alive, ping and TCP still answering, but effectively
+# unreachable). Run it forever, not once.
+
+[Timer]
+# First check after boot has had time to settle (the r8152 dongle has been
+# measured enumerating as late as t=142s, so anything shorter risks acting on a
+# device that is merely still coming up).
+OnBootSec=5min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=timers.target

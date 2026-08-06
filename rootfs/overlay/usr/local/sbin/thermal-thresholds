@@ -1,0 +1,238 @@
+#!/bin/bash
+# Raise (or inspect) the kernel thermal-zone trip points at RUNTIME, on-device.
+#
+# On the AOSP/GKI felix kernel the thermal trips are writable through sysfs
+# (CONFIG_THERMAL_WRITABLE_TRIPS=y). Writing
+#   /sys/class/thermal/thermal_zoneN/trip_point_M_temp
+# does two things in one shot (see drivers/thermal/thermal_sysfs.c
+# trip_point_temp_store):
+#   1. calls the zone's ->set_trip_temp op, which reprograms the HARDWARE:
+#        - junction zones (BIG/MID/LITTLE/G3D/TPU/ISP, driver gs_tmu_v3)
+#          push the value into ACPM via exynos_acpm_tmu_set_threshold();
+#        - the skin_therm zone (driver s2mpg13-spmic-thermal) writes the
+#          S2MPG13 PMIC NTC_OT_FAULT register for its "hot" trip.
+#   2. persists tz->trips[trip].temperature, so the Linux core's own
+#      "critical" -> orderly_poweroff threshold moves as well.
+#
+# Why you'd want this on felix: the felix skin backstop (zone "skin_therm")
+# ships very low -- critical 56.5 C, hot 58.5 C (gs201-felix-thermal.dtsi).
+# On stock Android the thermal HAL throttles the SoC long before skin gets
+# there, so it's just a backstop; on a fanless bring-up board under our
+# Debian userspace it can trip as a nuisance shutdown. The junction zones
+# (100 C throttle / 120 C shutdown) still protect the die, so raising the
+# skin backstop is safe. Raising the 120 C junction "hot" trip is NOT --
+# that is the silicon limit; don't.
+#
+# IMPORTANT: these writes are VOLATILE. The DT values are restored on every
+# boot. To make a change durable, run this from a boot-time systemd unit --
+# see docs/thermal-thresholds.md for a ready-to-drop unit.
+#
+# Runs as root. See docs/thermal-thresholds.md for the full picture.
+
+set -euo pipefail
+
+# Override only for testing against a synthetic tree; defaults to the real sysfs.
+TZ_ROOT=${THERMAL_SYSFS_ROOT:-/sys/class/thermal}
+PROG=${0##*/}
+
+# --- Safety caps (Celsius). ---------------------------------------------------
+# Absolute silicon ceiling: never program a trip above this without --force.
+HARD_MAX_C=125
+# Skin thermistor / PMIC NTC fault register has a limited usable range; warn
+# past this even though it's below the hard cap.
+SKIN_WARN_C=85
+
+DRY_RUN=0
+FORCE=0
+
+die()  { echo "$PROG: error: $*" >&2; exit 1; }
+warn() { echo "$PROG: warning: $*" >&2; }
+
+usage() {
+	cat <<EOF
+Usage: $PROG [--show] [--dry-run] [--force]
+       $PROG --skin <C>
+       $PROG --zone <name> (--type <critical|hot|passive|active> | --trip <N>) (--temp <C> | --offset <C>)
+
+Inspect or raise kernel thermal-zone trip points live via sysfs.
+
+Modes:
+  (no args), --show     Print every zone, its trips (index/type/temp) and the
+                        current reading, then exit.
+
+  --skin <C>            Recommended felix knob. Raise the "skin_therm" backstop:
+                        its passive trip -> C-1, critical -> C, hot -> C+2
+                        (only the trips that exist are touched, preserving the
+                        stock 1 C / 2 C spacing). Example: --skin 72
+
+  --zone <name> ...     Advanced. Operate on an explicit zone. You MUST scope
+                        the trips with --type and/or --trip (refuses to rewrite
+                        a whole zone blindly). Then either:
+                          --temp <C>     set matched trips to an absolute C, or
+                          --offset <C>   add C degrees to each matched trip.
+
+Options:
+  --dry-run             Show the writes that would happen; change nothing.
+  --force               Allow values above the ${HARD_MAX_C} C silicon cap (dangerous).
+  -h, --help            This help.
+
+Temperatures accept one decimal place (e.g. 72 or 56.5). Writes are volatile;
+re-apply at boot with a systemd unit (see docs/thermal-thresholds.md).
+EOF
+}
+
+# Celsius (may have one decimal) -> millicelsius integer, via awk (no bash float).
+c_to_mc() { awk -v c="$1" 'BEGIN{printf "%d", (c*1000)+(c<0?-0.5:0.5)}'; }
+# millicelsius integer -> Celsius string with one decimal, for display.
+mc_to_c() { awk -v mc="$1" 'BEGIN{printf "%.1f", mc/1000}'; }
+
+# Echo the zone dir whose "type" equals $1, or nothing.
+find_zone_dir() {
+	local want=$1 d
+	for d in "$TZ_ROOT"/thermal_zone*; do
+		[ -r "$d/type" ] || continue
+		if [ "$(cat "$d/type")" = "$want" ]; then
+			echo "$d"
+			return 0
+		fi
+	done
+	return 1
+}
+
+# Emit "<index> <type> <temp_mC>" for each trip in zone dir $1.
+zone_trips() {
+	local d=$1 t idx type temp
+	for t in "$d"/trip_point_*_temp; do
+		[ -e "$t" ] || continue
+		idx=${t##*/trip_point_}; idx=${idx%_temp}
+		type=$(cat "$d/trip_point_${idx}_type" 2>/dev/null || echo "?")
+		temp=$(cat "$t" 2>/dev/null || echo "?")
+		echo "$idx $type $temp"
+	done
+}
+
+show_all() {
+	local d name cur
+	for d in "$TZ_ROOT"/thermal_zone*; do
+		[ -r "$d/type" ] || continue
+		name=$(cat "$d/type")
+		cur=$(cat "$d/temp" 2>/dev/null || echo "?")
+		printf '%-16s (%s)  now=%s C\n' "$name" "${d##*/}" "$(mc_to_c "$cur")"
+		while read -r idx type temp; do
+			printf '    trip %-2s  %-9s %6s C%s\n' \
+				"$idx" "$type" "$(mc_to_c "$temp")" \
+				"$([ -w "$d/trip_point_${idx}_temp" ] && echo '  [writable]')"
+		done < <(zone_trips "$d")
+	done
+}
+
+# Write $2 (millicelsius) to trip $idx==... of zone dir $1, index $2, temp $3.
+# Args: zone_dir index temp_mC label
+apply_trip() {
+	local d=$1 idx=$2 mc=$3 label=$4 f readback
+	f="$d/trip_point_${idx}_temp"
+	[ -e "$f" ] || die "no such trip: ${d##*/} trip $idx"
+
+	# Cap check.
+	local c; c=$(mc_to_c "$mc")
+	if awk -v mc="$mc" -v cap="$HARD_MAX_C" 'BEGIN{exit !(mc > cap*1000)}'; then
+		if [ "$FORCE" -ne 1 ]; then
+			die "refusing to set ${label} to ${c} C (> ${HARD_MAX_C} C silicon cap); use --force to override"
+		fi
+		warn "${label} -> ${c} C exceeds the ${HARD_MAX_C} C silicon cap (forced)"
+	fi
+
+	if [ "$DRY_RUN" -eq 1 ]; then
+		printf '    [dry-run] %s: trip %s (%s) -> %s C\n' "${d##*/}" "$idx" "$label" "$c"
+		return 0
+	fi
+
+	[ -w "$f" ] || die "$f is not writable (CONFIG_THERMAL_WRITABLE_TRIPS off, or trip not in writable mask)"
+	echo "$mc" > "$f" || die "write to $f failed"
+
+	# The kernel/driver may clamp; verify.
+	readback=$(cat "$f")
+	if [ "$readback" != "$mc" ]; then
+		warn "${label}: requested $(mc_to_c "$mc") C, kernel accepted $(mc_to_c "$readback") C (clamped)"
+	else
+		printf '    %s: trip %s (%s) -> %s C\n' "${d##*/}" "$idx" "$label" "$c"
+	fi
+}
+
+do_skin() {
+	local target_c=$1 d
+	d=$(find_zone_dir skin_therm) || die "no 'skin_therm' thermal zone on this device"
+
+	if awk -v c="$target_c" -v w="$SKIN_WARN_C" 'BEGIN{exit !(c > w)}'; then
+		warn "skin target ${target_c} C is above ${SKIN_WARN_C} C; the PMIC NTC fault range may clamp it"
+	fi
+
+	echo "Raising skin_therm backstop to ${target_c} C (passive $(awk -v c="$target_c" 'BEGIN{printf "%.1f",c-1}')/critical ${target_c}/hot $(awk -v c="$target_c" 'BEGIN{printf "%.1f",c+2}')):"
+	local idx type temp
+	while read -r idx type temp; do
+		case "$type" in
+			passive)  apply_trip "$d" "$idx" "$(c_to_mc "$(awk -v c="$target_c" 'BEGIN{print c-1}')")" "passive"  ;;
+			critical) apply_trip "$d" "$idx" "$(c_to_mc "$target_c")"                                    "critical" ;;
+			hot)      apply_trip "$d" "$idx" "$(c_to_mc "$(awk -v c="$target_c" 'BEGIN{print c+2}')")" "hot"      ;;
+			*)        : ;;  # leave active/other trips alone
+		esac
+	done < <(zone_trips "$d")
+}
+
+do_zone() {
+	local zone=$1 ftype=$2 ftrip=$3 abs=$4 off=$5 d matched=0
+	d=$(find_zone_dir "$zone") || die "no '$zone' thermal zone on this device"
+	[ -n "$ftype" ] || [ -n "$ftrip" ] || \
+		die "--zone requires --type and/or --trip (refusing to rewrite the whole zone)"
+	[ -n "$abs" ] || [ -n "$off" ] || die "--zone requires --temp or --offset"
+
+	local idx type temp newmc
+	while read -r idx type temp; do
+		[ -z "$ftrip" ] || [ "$idx" = "$ftrip" ] || continue
+		[ -z "$ftype" ] || [ "$type" = "$ftype" ] || continue
+		if [ -n "$abs" ]; then
+			newmc=$(c_to_mc "$abs")
+		else
+			newmc=$(( temp + $(c_to_mc "$off") ))
+		fi
+		apply_trip "$d" "$idx" "$newmc" "$type"
+		matched=1
+	done < <(zone_trips "$d")
+	[ "$matched" -eq 1 ] || die "no trips in '$zone' matched the given --type/--trip filter"
+}
+
+# --- Argument parsing ---------------------------------------------------------
+MODE=show
+SKIN_C=""
+ZONE=""; F_TYPE=""; F_TRIP=""; ABS_C=""; OFF_C=""
+
+while [ $# -gt 0 ]; do
+	case "$1" in
+		--show)     MODE=show ;;
+		--skin)     MODE=skin; SKIN_C=${2:?--skin needs a value}; shift ;;
+		--zone)     MODE=zone; ZONE=${2:?--zone needs a value}; shift ;;
+		--type)     F_TYPE=${2:?--type needs a value}; shift ;;
+		--trip)     F_TRIP=${2:?--trip needs a value}; shift ;;
+		--temp)     ABS_C=${2:?--temp needs a value}; shift ;;
+		--offset)   OFF_C=${2:?--offset needs a value}; shift ;;
+		--dry-run)  DRY_RUN=1 ;;
+		--force)    FORCE=1 ;;
+		-h|--help)  usage; exit 0 ;;
+		*)          die "unknown argument: $1 (try --help)" ;;
+	esac
+	shift
+done
+
+[ -d "$TZ_ROOT" ] || die "$TZ_ROOT missing -- no thermal sysfs (wrong kernel?)"
+
+case "$MODE" in
+	show) show_all; exit 0 ;;
+esac
+
+# Mutating modes need root (dry-run writes nothing, so allow it unprivileged).
+[ "$DRY_RUN" -eq 1 ] || [ "$(id -u)" -eq 0 ] || die "must run as root"
+
+case "$MODE" in
+	skin) do_skin "$SKIN_C" ;;
+	zone) do_zone "$ZONE" "$F_TYPE" "$F_TRIP" "$ABS_C" "$OFF_C" ;;
+esac
