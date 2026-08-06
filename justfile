@@ -236,6 +236,25 @@ clone_kernel_source:
     branch=$({{ _make }} -C {{ justfile_directory() }} print-KERNEL_BRANCH DEVICE={{ device }} | tail -1)
     src={{ _kernel_source_dir }}
     manifest={{ justfile_directory() }}/kernel/kernel-manifest.{{ device }}.xml
+
+    # ★ Catch an un-migrated checkout BEFORE starting an hour-long sync.
+    #
+    # A pre-split tree has kernel/source/ but no kernel/source-<device>/, so the
+    # sync below would happily start from nothing and re-fetch ~22 GB that is
+    # already sitting on this disk under the old name. Nothing would look wrong —
+    # it just takes an hour and burns the bandwidth.
+    if [ ! -d "$src" ] && [ -d {{ justfile_directory() }}/kernel/source ]; then
+        echo "REFUSING to sync: kernel/source/ exists but $src does not." >&2
+        echo "" >&2
+        echo "  This checkout predates the multi-device split. Syncing now would" >&2
+        echo "  re-download ~22 GB you already have. Move it into place first:" >&2
+        echo "" >&2
+        echo "      just migrate" >&2
+        echo "" >&2
+        echo "  (or set KERNEL_SYNC_ANYWAY=1 to sync a genuinely new tree)" >&2
+        [ "${KERNEL_SYNC_ANYWAY:-0}" = 1 ] || exit 1
+    fi
+
     echo "Cloning {{ device }} kernel from branch: $branch into $src"
     mkdir -p "$src"
     cd "$src"
