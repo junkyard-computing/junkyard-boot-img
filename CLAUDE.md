@@ -12,32 +12,54 @@ This repo is the **substrate / dev platform**. A constellation of sibling repos 
 
 The build is driven by a **Makefile with sentinel-tracked stages**; the justfile is a thin orchestration/env-setup layer that delegates to make. Reruns skip stages whose sentinels are already touched.
 
-Sentinel chain (all live at repo root, dotfile-named): `.create_image` → `.debootstrap` → `.build_kernel` → `.install_vendor_firmware` → `.install_packages` → `.install_kernel` → `.install_initramfs` → `.build_boot`. `.sync_vendor_firmware` is a sibling sentinel that `.install_vendor_firmware` depends on. `.build_pixel_bootctl` and `.build_pixel_ota` are two more sibling sentinels that `.install_packages` depends on — they cross-compile the on-device A/B tools into the overlay (see **On-device A/B + OTA tools**).
+Sentinel chain (all live under `build/<device>/`, dotfile-named): `.apply_kernel_patches` → `.create_image` → `.debootstrap` → `.build_kernel` → `.install_vendor_firmware` → `.install_packages` → `.install_kernel` → `.install_initramfs` → `.build_boot`. `.sync_vendor_firmware` is a sibling sentinel that `.install_vendor_firmware` depends on. `.build_pixel_bootctl` and `.build_pixel_ota` are two more sibling sentinels that `.install_packages` depends on — they cross-compile the on-device A/B tools into the overlay (see **On-device A/B + OTA tools**).
 
 First-time run:
 
 ```
-just clone_kernel_source          # repo init + sync; ~1hr
-just sync_vendor_firmware         # pull felix OTA, extract /vendor/firmware; ~2GB
-just all                          # everything else
-./flash-fastboot.sh
+just felix                        # everything for the Pixel Fold (repo sync ~1hr + OTA ~2GB on first run)
+just lynx                         # everything for the Pixel 7a
+just all                          # both
+DEVICE=felix ./flash-fastboot.sh <serial>
 ```
+
+**The build is multi-device.** `just felix` / `just lynx` / `just all` are the entry points; everything else takes `device=` (a just *variable*, so it goes BEFORE the recipe: `just device=lynx build_kernel`). Per-device delta lives in `devices/<device>.mk` (kernel branch, Bazel config+target, OTA url+sha, `SIZE`, `SUPER_BYTES`, hostname), included by the Makefile via `include devices/$(DEVICE).mk`. Everything else in the tree is SoC-level or userspace and is shared — felix and lynx are both gs201, and the port is board-level only.
+
+Each device gets its own artifact tree **and its own kernel checkout**:
+
+```
+build/<device>/                 sentinels, rootfs.img, super.img, boot.img, vendor_boot.img,
+                                module_order.txt, unpack/, vendor-firmware/
+kernel/source-<device>/         its own ~22 GB `repo` tree, on its own manifest branch
+kernel/kernel_version.<device>
+kernel/kernel-manifest.<device>.xml
+```
+
+The kernel trees are separate because `repo init -b <branch>` + `repo sync` is how the branch is selected, and a sync reverts everything under the tree — including the `kernel/patches/` content that `.apply_kernel_patches` exists to manage. One shared tree would have to re-init and re-sync on every device switch, so `just all` could never be a cheap no-op and uncommitted kernel work would be reverted twice per run.
+
+`rootfs/sysroot/` is deliberately still shared: it is only the mountpoint, and one device's `rootfs.img` is mounted there at a time. That is also why `just all` builds devices **sequentially** rather than in parallel.
+
+A pre-split checkout is migrated with **`just migrate`**, which `mv`s the old `boot/*.img`, root sentinels, `rootfs/{unpack,vendor-firmware,module_order.txt}`, `kernel/kernel_version` and `kernel/source` into the new layout. mtimes are preserved, so the next build is a no-op rather than a full rebuild. Idempotent.
 
 Individual stages are also exposed as justfile targets (`build_kernel`, `build_rootfs`, `install_apt_packages`, `update_kernel_modules_and_source`, `update_initramfs`, `build_boot_images`, `create_rootfs_image`, `mount_rootfs`, `unmount_rootfs`, `clean_rootfs`, `clean_kernel`). They all call `make` under the hood.
 
-Why the split: `just all` runs two make invocations in sequence so the second picks up the fresh `KERNEL_VERSION` written by `.build_kernel` (justfile `read()` is parse-time; an empty `kernel/kernel_version` at parse would otherwise propagate). Individual `update_*` / `build_boot_images` targets also re-read `kernel/kernel_version` at recipe time for the same reason.
+Why the split: a device build runs two make invocations in sequence so the second picks up the fresh `KERNEL_VERSION` written by `.build_kernel` (the justfile reads `kernel/kernel_version.<device>` at parse time; an empty value at parse would otherwise propagate). Individual `update_*` / `build_boot_images` targets also re-read it at recipe time for the same reason. That read is a `shell(... || true)`, not `read()`, because the file is a gitignored per-device artifact and `read()` on a missing file aborts the whole justfile on a fresh checkout.
+
+The Makefile's stage targets are the per-device sentinel **paths** (`$(BUILD_DIR)/.build_boot`), with the short names (`.build_boot`, …) kept as **`.PHONY` aliases**. The PHONY matters: a pre-split checkout still has real empty `.build_boot`-style files in the repo root, and without it make would treat those as up-to-date and silently skip the entire build.
 
 Targets are grouped (`[group('kernel')]`, `[group('rootfs')]`, `[group('boot')]`) — `just --list` shows them grouped.
 
 ## Architectural pieces that require reading multiple files
 
 ### Kernel build is AOSP's Bazel, not plain Make
-`kernel/source/` is a `repo`-managed AOSP kernel manifest checkout, driven by `kernel/source/tools/bazel` (the `BAZEL` env var). Custom kconfig options live in [kernel/custom_defconfig_mod/custom_defconfig](kernel/custom_defconfig_mod/custom_defconfig) — it's a **defconfig *fragment*** loaded via `--defconfig_fragment=//custom_defconfig_mod:custom_defconfig`, not a full defconfig. [BUILD.bazel](kernel/custom_defconfig_mod/BUILD.bazel) just `exports_files` it. `clone_kernel_source` symlinks `kernel/custom_defconfig_mod/` into the kernel source tree so bazel picks it up. When adding new CONFIG_* options you may need to run `nconfig` inside the kernel tree first to discover transitive dependencies — `just config_kernel` wraps that.
+`kernel/source-<device>/` is a `repo`-managed AOSP kernel manifest checkout (one per device — see the build-pipeline section), driven by `kernel/source-<device>/tools/bazel`. `BAZEL`, `KERNEL_SOURCE_DIR`, `KERNEL_BUILD_DIR` and `MODULE_ORDER_PATH` are all derived from `$(DEVICE)` in the Makefile with `:=`, which is why the justfile no longer exports them — a simple assignment beats the environment, so an export would be a silently-ignored second copy of the layout. Custom kconfig options live in [kernel/custom_defconfig_mod/custom_defconfig](kernel/custom_defconfig_mod/custom_defconfig) — it's a **defconfig *fragment*** loaded via `--defconfig_fragment=//custom_defconfig_mod:custom_defconfig`, not a full defconfig. [BUILD.bazel](kernel/custom_defconfig_mod/BUILD.bazel) just `exports_files` it. `clone_kernel_source` symlinks `kernel/custom_defconfig_mod/` into the kernel source tree so bazel picks it up. When adding new CONFIG_* options you may need to run `nconfig` inside the kernel tree first to discover transitive dependencies — `just config_kernel` wraps that.
 
-The kernel version string is extracted from the built `Image` and written to [kernel/kernel_version](kernel/kernel_version). That file drives all the `/lib/modules/<ver>/` paths, so the kernel must be rebuilt whenever the branch or version changes and every downstream rootfs target depends on that value being current.
+The kernel version string is derived from the module staging archive and written to `kernel/kernel_version.<device>`. That file drives all the `/lib/modules/<ver>/` paths, so the kernel must be rebuilt whenever the branch or version changes and every downstream rootfs target depends on that value being current.
+
+The `kernel/patches/` tree is shared across devices — the patches there are gs201/SoC-level or AOSP-common, so they apply into whichever tree is being built. A patch that neither applies nor is already applied aborts the build loudly, which is the intended behaviour if one ever stops being valid for one device's branch.
 
 ### Rootfs is an ext4 image, mounted during each build stage
-The rootfs starts life as `boot/rootfs.img`, created empty by `.create_image` (`fallocate` + `mkfs.ext4 -F -L rootfs`). Every subsequent stage mounts it at `rootfs/sysroot/` via `just mount_rootfs` (`sudo mount`), does its work, and unmounts via `just unmount_rootfs`. Contents are owned by root throughout — no ownership-flipping dance.
+The rootfs starts life as `build/<device>/rootfs.img`, created empty by `.create_image` (`truncate` + `mkfs.ext4 -F -L rootfs`). Every subsequent stage mounts it at `rootfs/sysroot/` via `just mount_rootfs` (`sudo mount`), does its work, and unmounts via `just unmount_rootfs`. Contents are owned by root throughout — no ownership-flipping dance.
 
 Why ext4 and not btrfs/squashfs: the GKI-built kernel silently strips `CONFIG_BTRFS_FS` and `CONFIG_SQUASHFS` from the final `.config` even when the custom fragment sets them `=y` — GKI enforces a locked filesystem allowlist. `ext4`, `f2fs`, and `erofs` are the allowlisted ones. Adding a new in-tree filesystem to GKI would require a different kernel build profile.
 
@@ -46,14 +68,14 @@ Debootstrap runs two-stage (foreign arch; qemu-user-static binfmt required on th
 The helper [rootfs/_enter](rootfs/_enter) exists for manually entering the sysroot with fakeroot (non-nspawn path, rarely used).
 
 ### Module loading — three stages, one force-list
-Kernel modules come from two staging archives the kernel build produces: `vendor_dlkm_staging_archive.tar.gz` and `system_dlkm_staging_archive.tar.gz`. `.install_kernel` unpacks both into `rootfs/unpack/`, rsyncs only `*.ko` into the sysroot, concatenates their `modules.order` files, runs `depmod` inside nspawn, and installs kernel headers under `/usr/src/linux-headers-<ver>` with a symlink from `/lib/modules/<ver>/build`.
+Kernel modules come from two staging archives the kernel build produces: `vendor_dlkm_staging_archive.tar.gz` and `system_dlkm_staging_archive.tar.gz`. `.install_kernel` unpacks both into `build/<device>/unpack/`, rsyncs only `*.ko` into the sysroot, concatenates their `modules.order` files, runs `depmod` inside nspawn, and installs kernel headers under `/usr/src/linux-headers-<ver>` with a symlink from `/lib/modules/<ver>/build`.
 
-It then composes [rootfs/module_order.txt](rootfs/module_order.txt) from three `modules.load` lists (`vendor_kernel_boot` + `vendor_dlkm` + `system_dlkm`), resolved through `modinfo -F name`, with `bcmdhd4389` and `exynos_mfc` sed'd out (so they're not loaded before `/etc/modprobe.d/blacklist.conf` takes effect). `.install_initramfs` passes that list as dracut's `--force-drivers` so the initramfs force-loads them at boot.
+It then composes `build/<device>/module_order.txt` from three `modules.load` lists (`vendor_kernel_boot` + `vendor_dlkm` + `system_dlkm`), resolved through `modinfo -F name`, with `bcmdhd4389` and `exynos_mfc` sed'd out (so they're not loaded before `/etc/modprobe.d/blacklist.conf` takes effect). `.install_initramfs` passes that list as dracut's `--force-drivers` so the initramfs force-loads them at boot.
 
 `rootfs/overlay/etc/modprobe.d/blacklist.conf` exists but is applied by the running userspace, not the initramfs — that's why the module_order.txt sed step matters.
 
 ### Vendor firmware — required to boot at all
-`sync_vendor_firmware` downloads the felix factory OTA (`_felix_ota_url`), extracts `payload.bin`, pulls only the `vendor` partition with `payload-dumper-go` (downloaded + pinned to `_payload_dumper_version`), and runs [tools/extract-partition-fs.sh](tools/extract-partition-fs.sh) to unpack it into `rootfs/vendor-firmware/extracted/`. The helper auto-detects EROFS vs ext4 and unwraps Android sparse framing via `simg2img` if needed — felix has shipped both formats across OTAs.
+`sync_vendor_firmware` downloads the device factory OTA (`OTA_URL`/`OTA_SHA256` from `devices/<device>.mk`, read back out of make at recipe time), extracts `payload.bin`, pulls only the `vendor` partition with `payload-dumper-go` (downloaded + pinned to `_payload_dumper_version`), and runs [tools/extract-partition-fs.sh](tools/extract-partition-fs.sh) to unpack it into `build/<device>/vendor-firmware/extracted/`. The helper auto-detects EROFS vs ext4 and unwraps Android sparse framing via `simg2img` if needed — felix has shipped both formats across OTAs.
 
 `.install_vendor_firmware` then rsyncs `extracted/firmware/` into `/vendor/firmware/` on the mounted sysroot. **This is mandatory**: the stock felix dtb's `/chosen/bootargs` carries `firmware_class.path=/vendor/firmware` (not something we set in boot.img's cmdline), and without `aoc.bin` the AOC coprocessor retry-loops indefinitely. The visible symptom is starved UART RX (login-prompt keystrokes get dropped). Empirically, the AOC failure also breaks the boot itself: `/dev/disk/by-partlabel/super` doesn't appear, dracut times out waiting for the rootfs, and the device drops to an emergency shell you can't type into. The exact mechanism isn't fully nailed down — plausible contributors include the firmware-loader uevent fallback tying up udev workers and AOC/GSA/ACPM sharing platform infrastructure that UFS leans on for FMP key handling (`fmp-id = <0>` in `gs201-ufs.dtsi`) — but the net "no `aoc.bin` → no boot" relationship is reproducible.
 
@@ -124,13 +146,13 @@ Two Rust tools are cross-compiled to static `aarch64-unknown-linux-musl` and ins
 - **pixel-ota** — the `update_engine` analog. `update <dir>` flashes the **inactive** slot's boot chain (`boot, init_boot, vendor_boot, vendor_kernel_boot, dtbo, vbmeta, vbmeta_system, vbmeta_vendor, pvmfw`) from a directory of `*.img`, fits-checks each, **refuses to flash the active slot**, then calls pixel-bootctl to switch **rollback-safe** (target marked active but NOT successful — a slot that never boots burns its retry budget and the bootloader falls back). `confirm` commits after a good boot (→ `mark-successful`; a post-boot service does this automatically). `flash-rootfs <img>` arms an in-place reflash of the **single, non-slotted `super`** — **destructive and rollback-free** (the rollback-capable A/B-rootfs design is the follow-up in the submodule's `PLAN.md`). Note: pixel-ota's own README describes a systemd shutdown-pivot for this, but on these images the reflash is actually done by the overlay's `90rootfs-flash` dracut pre-mount hook keyed on a `userdata:/pixel-ota/flash-pending` flag (see "rootfs cutover" above) — the shutdown pivot is inert here.
 
 ### dtbo partition must be re-flashed — critical
-The base `dtb.img` we pass to `vendor_boot.img` is only the SoC-level tree ([gs201.dtsi](kernel/source/private/devices/google/gs201/dts/gs201.dtsi)), where `serial_0`, the foldable panels, and most other felix-specific nodes are `status = "disabled"`. The felix variant overlays (`gs201-felix-*.dtbo`, packaged into `kernel/source/out/felix/dist/dtbo.img`) flip those to `status = "okay"` at boot time when the bootloader selects the variant matching the board ID. We don't bake the overlay into `vendor_boot.img`; the dtbo lives on its own `dtbo` partition.
+The base `dtb.img` we pass to `vendor_boot.img` is only the SoC-level tree ([gs201.dtsi](kernel/source-felix/private/devices/google/gs201/dts/gs201.dtsi)), where `serial_0`, the foldable panels, and most other felix-specific nodes are `status = "disabled"`. The felix variant overlays (`gs201-felix-*.dtbo`, packaged into `kernel/source-felix/out/felix/dist/dtbo.img`) flip those to `status = "okay"` at boot time when the bootloader selects the variant matching the board ID. We don't bake the overlay into `vendor_boot.img`; the dtbo lives on its own `dtbo` partition.
 
-Consequence: `fastboot flash dtbo kernel/source/out/felix/dist/dtbo.img` is mandatory, and [flash-fastboot.sh](flash-fastboot.sh) does it. Skipping it (or flashing a stock image afterward and only re-flashing our `boot`/`vendor_boot`/`super`) produces a half-configured DT where earlycon printk still reaches UART (MMIO poking, no driver needed) but `/dev/ttySAC0` never appears and the panel never lights up — the device boots to `graphical.target` but nothing interactive works.
+Consequence: `fastboot flash dtbo kernel/source-felix/out/felix/dist/dtbo.img` is mandatory, and [flash-fastboot.sh](flash-fastboot.sh) does it. Skipping it (or flashing a stock image afterward and only re-flashing our `boot`/`vendor_boot`/`super`) produces a half-configured DT where earlycon printk still reaches UART (MMIO poking, no driver needed) but `/dev/ttySAC0` never appears and the panel never lights up — the device boots to `graphical.target` but nothing interactive works.
 
 ## Flashing — three transports
 
-The same build outputs (`boot/boot.img`, `boot/vendor_boot.img`, `boot/rootfs.img`, plus `kernel/source/out/felix/dist/dtbo.img`) reach the device three ways (the SSH one has a fleet-wide wrapper):
+The same build outputs (`build/<device>/{boot,vendor_boot,rootfs,super}.img`, plus `kernel/source-felix/out/felix/dist/dtbo.img`) reach the device three ways (the SSH one has a fleet-wide wrapper):
 
 - **fastboot** — [flash-fastboot.sh](flash-fastboot.sh). Device sitting in the bootloader on USB-C. Full erase+flash of `boot` / `vendor_boot` / `dtbo` / `super` (+ `disable-verity`/`disable-verification`). The from-scratch and recovery path.
 - **SSH / OTA** — [flash-ssh.sh](flash-ssh.sh). Device already booted and reachable on the network (the image ships `openssh-server`); the userspace analog of an OTA, non-interactive for fleet use. It scp+installs `pixel-bootctl`/`pixel-ota` if missing, stages `rootfs.img` onto `userdata` (the GPT partition labelled `userdata`, `/dev/sda31`, at `/userdata` — staging must land off `super`), runs `pixel-ota update` to write+switch the inactive boot slot, then arms the rootfs reflash (stage image + `flash-pending` flag on userdata) so a single reboot's `90rootfs-flash` dracut hook writes `super`. Boot-chain half is A/B-safe; the rootfs half is destructive/rollback-free.
@@ -171,7 +193,8 @@ This repo is the **substrate / dev platform**; related work lives in sibling rep
 - Adding apt packages → one per line in [rootfs/packages.txt](rootfs/packages.txt) (read by the justfile at parse time and space-joined into the apt install invocation).
 - Adding kconfig options → append to [kernel/custom_defconfig_mod/custom_defconfig](kernel/custom_defconfig_mod/custom_defconfig). Remember transitive deps.
 - Adding sysroot files → put them under [rootfs/overlay/](rootfs/overlay/), not in `rootfs/sysroot/`.
-- `kernel_version`, `rootfs/module_order.txt`, `rootfs/sysroot/`, `rootfs/unpack/`, `boot/*.img`, and all sentinel dotfiles (`.create_image`, `.debootstrap`, etc.) are gitignored build artifacts.
+- `build/` (all per-device artifacts and sentinels), `kernel/source-*/`, `kernel/kernel_version.*` and `rootfs/sysroot/` are gitignored build artifacts. The pre-split paths (`boot/*.img`, `rootfs/unpack/`, `rootfs/module_order.txt`, the root-level sentinel dotfiles) stay ignored too, so an un-migrated checkout can't commit one.
+- Adding a device → a new `devices/<name>.mk` plus a one-line `just <name>` recipe. `SIZE` must be one half of that device's `super`, and `SUPER_BYTES` must be measured on real hardware (`fastboot getvar partition-size:super`), not copied.
 - `clone_kernel_source`'s `android_kernel_branch` argument is pinned to `android-gs-felix-6.1-android16` because the earlier android14 branch was deleted upstream. Changing the branch requires rebuilding kernel + rootfs modules in lockstep.
 - `just clean_rootfs` removes the image and per-stage sentinels; `.build_kernel` and `.sync_vendor_firmware` sentinels are preserved because they're expensive (~1hr kernel build, ~2GB OTA download). `just clean_kernel` is a separate knob.
 

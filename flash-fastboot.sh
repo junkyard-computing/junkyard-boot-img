@@ -5,12 +5,17 @@
 # defined in gs201.dtsi) to status="okay". Without it UART login and the
 # display silently go dead. Any prior "reflash to stock" wipes whatever
 # stock dtbo was there, so always re-flash ours.
+# Which DEVICE's build to flash (felix | lynx). Selects the per-device artifact
+# directory; see devices/<device>.mk and the DEVICE SELECTION block in the
+# Makefile. Env-only, because $1 is already the fastboot serial.
+DEVICE="${DEVICE:-felix}"
+
 # Image locations. Overridable so the SAME script works from a repo checkout and
 # from the standalone provisioning kit, which lays them out differently: the kit
 # sets IMAGE_DIR=images DTBO=images/dtbo.img. One tested flashing path, two
 # layouts, instead of a second copy that drifts.
-IMAGE_DIR="${IMAGE_DIR:-boot}"
-DTBO="${DTBO:-kernel/source/out/felix/dist/dtbo.img}"
+IMAGE_DIR="${IMAGE_DIR:-build/$DEVICE}"
+DTBO="${DTBO:-kernel/source-$DEVICE/out/$DEVICE/dist/dtbo.img}"
 
 # Which device to flash. REQUIRED — bare `fastboot` commands target "the single
 # attached device", and this script runs `erase super` (the rootfs) among others,
@@ -40,7 +45,30 @@ if ! fastboot devices | grep -q "^${SERIAL}[[:space:]]"; then
 	fastboot devices >&2
 	exit 2
 fi
-echo ">>> flashing $SERIAL ($(fastboot -s "$SERIAL" getvar product 2>&1 | head -1))"
+# ★ Refuse a cross-device flash. The bootloader reports what the hardware IS
+# (`getvar product` -> felix / lynx), so compare it against the build we are
+# about to write and stop if they disagree.
+#
+# This matters more here than anywhere else: felix and lynx are both gs201 and
+# both accept these fastboot commands happily, but the images are genuinely
+# incompatible (different kernel branch, different vendor firmware — and without
+# a matching aoc.bin the device does not boot at all). Meanwhile this script
+# erases `super` and flashes BOTH slots, so a wrong-device run destroys the
+# rootfs and both boot chains before anything gets a chance to reject it. The
+# SSH/OTA path already gates on the /etc/image-device stamp; this is the same
+# gate for the path that has no rootfs to read a stamp from yet.
+#
+# DEVICE_CHECK=0 overrides, for the rare deliberate case.
+PRODUCT=$(fastboot -s "$SERIAL" getvar product 2>&1 | sed -n 's/^product: *//p' | head -1)
+if [ "${DEVICE_CHECK:-1}" = 1 ] && [ -n "$PRODUCT" ] && [ "$PRODUCT" != "$DEVICE" ]; then
+	echo "refusing to flash: '$SERIAL' reports product '$PRODUCT', but these images" >&2
+	echo "were built for '$DEVICE' ($IMAGE_DIR)." >&2
+	echo "  build the right one:  just $PRODUCT" >&2
+	echo "  then flash it:        DEVICE=$PRODUCT $0 $SERIAL" >&2
+	echo "  (override with DEVICE_CHECK=0 if you really mean it)" >&2
+	exit 2
+fi
+echo ">>> flashing $SERIAL (product: ${PRODUCT:-unknown}, images: $IMAGE_DIR)"
 
 # Every command below goes through this, so none of them can pick a device.
 fb() { fastboot -s "$SERIAL" "$@"; }

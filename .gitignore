@@ -170,7 +170,19 @@ boot/super.img
 boot/boot.img
 boot/vendor_boot.img
 
-# Build-pipeline sentinel files written by the Makefile.
+# Per-device build output: sentinels, rootfs.img/super.img/boot images, the
+# module-order list, the kernel-staging unpack tree and the extracted vendor
+# firmware all live under build/<device>/ (see BUILD_DIR in the Makefile).
+/build/
+
+# Per-device kernel checkouts (kernel/source-felix, kernel/source-lynx). Each is
+# a ~22 GB `repo` tree on its own manifest branch.
+/kernel/source-*/
+
+# Build-pipeline sentinel files written by the Makefile. These moved under
+# build/<device>/ with the multi-device split (and are covered by /build/ above),
+# but the bare names stay ignored so a pre-split checkout — or a stray `make`
+# run from an older tree — never accidentally commits one.
 .create_image
 .debootstrap
 .apply_kernel_patches

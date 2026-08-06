@@ -235,14 +235,20 @@ else
 fi
 [ -z "$IDENTITY" ] || [ -r "$IDENTITY" ] || die "cannot read ssh key: $IDENTITY"
 
-ROOTFS_IMG_LOCAL="${ROOTFS_IMG:-$here/boot/rootfs.img}"
+# Which DEVICE's build this sweep ships. Passed through to flash-ssh.sh, and the
+# images below are read from that device's build dir. EXPECT_DEV is derived from
+# the image itself a few lines down, so the /etc/image-device gate still compares
+# against what is actually being shipped rather than against this variable.
+DEVICE="${DEVICE:-felix}"
+export DEVICE
+ROOTFS_IMG_LOCAL="${ROOTFS_IMG:-$here/build/$DEVICE/rootfs.img}"
 
 if [ "$DO_FLASH" = 1 ]; then
 	# flash-ssh.sh checks these too, per device — but discovering a missing
 	# rootfs.img after unit 700 has already rebooted leaves the fleet in mixed
 	# state for no reason.
-	for f in "${BOOT_IMG:-$here/boot/boot.img}" \
-	         "${VENDOR_BOOT_IMG:-$here/boot/vendor_boot.img}" \
+	for f in "${BOOT_IMG:-$here/build/$DEVICE/boot.img}" \
+	         "${VENDOR_BOOT_IMG:-$here/build/$DEVICE/vendor_boot.img}" \
 	         "$ROOTFS_IMG_LOCAL" \
 	         "${PIXEL_BOOTCTL_BIN:-$here/rootfs/overlay/usr/local/bin/pixel-bootctl}" \
 	         "${PIXEL_OTA_BIN:-$here/rootfs/overlay/usr/local/bin/pixel-ota}"; do

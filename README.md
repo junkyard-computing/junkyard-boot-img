@@ -26,31 +26,66 @@ Automated flow for building a Pixel Fold (felix) boot image trio — `boot.img`,
 The pipeline is Makefile-driven with sentinel files per stage, so reruns skip completed work.
 
 ```shell
-just clone_kernel_source          # once; ~1hr
-just sync_vendor_firmware         # once; ~2GB OTA download
-just all                          # full pipeline; produces boot/{boot,vendor_boot,rootfs}.img
+just felix     # build the Pixel Fold image
+just lynx      # build the Pixel 7a image
+just all       # build both
 ```
 
-`just all` takes optional args: `android_kernel_branch`, `size`, `debootstrap_release`, `root_password`, `hostname`, `user_login`, `user_password`, `fleet_id`. Defaults: `android-gs-felix-6.1-android16`, `4000M`, `trixie`, `0000`, `fold`, `kalm`, `0000`, empty.
+Each of those runs the whole pipeline for its device, including the first-time `repo` sync (~1hr) and the ~2GB vendor-firmware OTA download. Reruns are cheap.
 
-### What `just all` runs
+**Everything is per-device.** Both devices are gs201, but they need different kernel branches and different vendor firmware, so each gets its own artifact tree and its own kernel checkout:
+
+```
+build/<device>/       sentinels, rootfs.img, super.img, boot.img, vendor_boot.img,
+                      module_order.txt, unpack/, vendor-firmware/
+kernel/source-<device>/       its own `repo` checkout, on its own manifest branch
+kernel/kernel_version.<device>
+devices/<device>.mk           kernel branch, Bazel target, OTA url+sha, SIZE, SUPER_BYTES, hostname
+```
+
+Adding a third gs201 Pixel is a new `devices/<name>.mk` plus a one-line recipe.
+
+### Migrating an existing checkout
+
+A checkout from before the split has its artifacts at the old paths. Move them into place — mtimes are preserved, so the next build is a no-op instead of a from-scratch rebuild:
+
+```shell
+just migrate
+```
+
+Idempotent, and safe to run on a fresh checkout with nothing to move.
+
+### Overrides
+
+`device`, `size`, `hostname`, `root_password`, `user_login`, `user_password`, `fleet_id` and `debootstrap_release` are just **variables**, so they go *before* the recipe name, make-style:
+
+```shell
+just user_login=bob felix        # correct
+just felix user_login=bob        # WRONG — a positional argument to `felix`
+```
+
+Leave `size`/`hostname` unset to take the device fragment's values. `size` in particular is one half of `super` and must not exceed 4068 MiB.
+
+### What a device build runs
 
 It drives the Makefile's sentinel chain. Each stage writes a dotfile on success, so reruns skip finished work.
 
 | Stage | Does |
 | --- | --- |
-| `.create_image` | `fallocate` + `mkfs.ext4 -F -L rootfs` a fresh `boot/rootfs.img` |
+| `.create_image` | `truncate` + `mkfs.ext4 -F -L rootfs` a fresh `build/<device>/rootfs.img` |
 | `.debootstrap` | Two-stage debootstrap of `trixie` into the mounted image; sets root password and hostname |
-| `.build_kernel` | Bazel-builds the felix kernel with the custom defconfig fragment; writes `kernel/kernel_version` |
-| `.install_vendor_firmware` | Rsyncs `rootfs/vendor-firmware/extracted/firmware/` (from `sync_vendor_firmware`) into `/vendor/firmware/` on the mounted image — required for UART input |
+| `.build_kernel` | Bazel-builds the device's kernel (`BAZEL_TARGET` from its fragment) with the custom defconfig fragment; writes `kernel/kernel_version.<device>` |
+| `.install_vendor_firmware` | Rsyncs `build/<device>/vendor-firmware/extracted/firmware/` (from `sync_vendor_firmware`) into `/vendor/firmware/` on the mounted image — required for UART input |
 | `.install_packages` | `apt-get install` everything in [rootfs/packages.txt](rootfs/packages.txt); installs kmscon from a pinned Debian-pool `.deb` (trixie dropped it); creates `$(USER_LOGIN)` with passwordless sudo; masks `systemd-backlight@.service`; disables `dhcpcd`, enables `NetworkManager`, seeds a DHCP ethernet profile; rsyncs [rootfs/overlay/](rootfs/overlay/) into the sysroot |
-| `.install_kernel` | Copies modules from the kernel build's staging archives, runs `depmod`, installs kernel headers, composes `rootfs/module_order.txt` for dracut's force-drivers list (with `bcmdhd4389`/`exynos_mfc` stripped) |
+| `.install_kernel` | Copies modules from the kernel build's staging archives, runs `depmod`, installs kernel headers, composes `build/<device>/module_order.txt` for dracut's force-drivers list (with `bcmdhd4389`/`exynos_mfc` stripped) |
 | `.install_initramfs` | Runs `dracut` inside `systemd-nspawn` with `--force-drivers` from `module_order.txt` |
 | `.build_boot` | `mkbootimg` twice — `boot.img` (kernel + `root=` cmdline) and `vendor_boot.img` (dtb + vendor_ramdisk_fragment pointing at the dracut initramfs) |
 
-`just all` invokes make twice in sequence: first to build `.build_kernel`, then everything else with a freshly-read `KERNEL_VERSION`. That's because justfile's `read()` of `kernel/kernel_version` happens at parse time, before the kernel has been built on a fresh checkout.
+A device build invokes make twice in sequence: first to build `.build_kernel`, then everything else with a freshly-read `KERNEL_VERSION`. That's because the justfile reads `kernel/kernel_version.<device>` at parse time, before the kernel has been built on a fresh checkout.
 
-Individual stages are also exposed: `just build_kernel`, `just build_rootfs`, `just install_apt_packages`, `just update_kernel_modules_and_source`, `just update_initramfs`, `just build_boot_images`. See `just --list`.
+Individual stages are also exposed, and take `device=` like everything else: `just build_kernel`, `just build_rootfs`, `just install_apt_packages`, `just update_kernel_modules_and_source`, `just update_initramfs`, `just build_boot_images`, `just device=lynx build_kernel`. See `just --list`.
+
+`just clean` removes one device's images and sentinels (default felix), preserving the expensive kernel-build and OTA caches; `just clean_all` does both devices; `just clean_kernel` is the separate knob for the Bazel output.
 
 ## Flashing
 
@@ -61,6 +96,12 @@ fastboot oem disable-verification
 ```
 
 `flash-fastboot.sh` wraps flashing `boot.img` + `vendor_boot.img` + `super.img` over fastboot, with the device in the bootloader on USB. It requires an explicit serial (`$1` or `FASTBOOT_SERIAL`) because it erases `super`, and it flashes `super.img` — the full-flash image with **both** rootfs halves seeded — not `rootfs.img`, which is only one half.
+
+It reads `build/<device>/`, selected with `DEVICE=` (default felix), and **refuses a cross-device flash**: it compares `fastboot getvar product` against the images it is about to write and stops if they disagree. felix and lynx are both gs201 and both accept these commands happily, but the images are incompatible, and this is the path that erases `super` and writes both slots. `DEVICE_CHECK=0` overrides.
+
+```shell
+DEVICE=lynx ./flash-fastboot.sh 39271JEHN00059
+```
 
 For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then arms a rootfs reflash that the initramfs' `90rootfs-flash` **pre-mount hook** performs on the way back up — before root is mounted, and after verifying the staged image against its `sha256`/`size` sidecars. (Not a systemd shutdown pivot: `dracut-shutdown.service` is `/bin/true` on these images.) It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and stages the image on the `userdata` partition — mounting it if it isn't mounted.
 
@@ -73,7 +114,9 @@ For a **fleet**, `flash-nmap.sh` finds the devices first: it nmaps the given sub
 ./flash-nmap.sh --from-version 'v7.1*' --flash 10.0.0.0/24
 ```
 
-It flashes **nothing** without `--flash`. A device is a target only if it (1) authorizes our SSH key and grants it passwordless root, (2) runs our rootfs — gs201/felix device tree plus overlay-only markers — and (3) reports an `IMAGE_VERSION` matching `--from-version`. That last one is the gate that scales: you know what image the devices were built with even when you don't know their serials. `--fleet ID` additionally requires the build-time stamp in `/etc/junkyard-fleet` (`just all fleet_id=…`). Exclusions are by serial (`--exclude-serial-file`), which is the list that stays small.
+It flashes **nothing** without `--flash`. A device is a target only if it (1) authorizes our SSH key and grants it passwordless root, (2) runs our rootfs — gs201/felix device tree plus overlay-only markers — and (3) reports an `IMAGE_VERSION` matching `--from-version`. That last one is the gate that scales: you know what image the devices were built with even when you don't know their serials. `--fleet ID` additionally requires the build-time stamp in `/etc/junkyard-fleet` (`just fleet_id=… felix`). Exclusions are by serial (`--exclude-serial-file`), which is the list that stays small.
+
+Both SSH paths take `DEVICE=` too, and the device's own `/etc/image-device` stamp is checked against the image being shipped — the gate that stops a felix image reaching lynx hardware, which every other check would pass since lynx is also gs201.
 
 Because the rootfs half is not rollback-safe, a run is **canaried and waved**: `--canary 3` units go first and must come back on the new version or the run stops with the rest untouched, then `--wave 25` batches, each verified by re-scanning and matching serials (a reflashed device may take a new DHCP lease). `--max-fail 10` trips a circuit breaker. Devices already on the target version are skipped, so re-running the same command converges the fleet. Logs and the inventory land in `out/flash-nmap/<timestamp>/`.
 
