@@ -1,10 +1,18 @@
 #!/bin/bash
 #
-# The felix dtbo carries the board-variant overrides that flip serial_0,
-# the panels, and other felix-specific nodes from status="disabled" (as
-# defined in gs201.dtsi) to status="okay". Without it UART login and the
-# display silently go dead. Any prior "reflash to stock" wipes whatever
-# stock dtbo was there, so always re-flash ours.
+# dtbo handling is track-dependent:
+#  - AOSP: the felix dtbo carries board-variant overrides (serial_0, the panels,
+#    other felix nodes) that flip status="disabled" (gs201.dtsi) to "okay".
+#    Set DTBO=images/dtbo.img and it is flashed.
+#  - Mainline: the dtb is self-contained (full board description), so the slot
+#    must carry NO overlay. There is no dtbo.img; DTBO points at a path that does
+#    not exist, and the dtbo block below ERASES the partition and skips the flash.
+#
+# ⚠ NEVER flash a zeroed image as a stand-in for "empty". 16 MiB of 0x00 is not a
+# valid dt_table: the felix-14.4 bootloader parses it, derives a NULL dtb, and
+# data-aborts in miniheap_free/boot_from_images right after "[DTBO] SOC DTB:
+# index:0" — an unbootable slot. Erase (UNMAP), don't zero. The on-device OTA
+# (pixel-ota) does the same clear over the network via `blkdiscard`.
 # Image locations. Overridable so the SAME script works from a repo checkout and
 # from the standalone provisioning kit, which lays them out differently: the kit
 # sets IMAGE_DIR=images DTBO=images/dtbo.img. One tested flashing path, two
@@ -76,7 +84,14 @@ for slot in a b; do
 	fb erase vendor_boot_$slot || true
 	fb flash vendor_boot_$slot "$IMAGE_DIR/vendor_boot.img"
 	fb erase dtbo_$slot        || true
-	fb flash dtbo_$slot "$DTBO"
+	# Flash a real dtbo only if one exists (AOSP variant overlays). Mainline ships
+	# none, so the slot is left ERASED — the bootloader skips the overlay and boots
+	# the self-contained dtb. Never substitute a zeroed image (see header).
+	if [ -f "$DTBO" ]; then
+		fb flash dtbo_$slot "$DTBO"
+	else
+		echo ">>> $DTBO absent — leaving dtbo_$slot ERASED (mainline: self-contained dtb)"
+	fi
 	fb erase vendor_kernel_boot_$slot || true
 done
 
