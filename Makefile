@@ -8,12 +8,18 @@ RELEASE ?= trixie
 ROOT_PW ?= 0000
 USER_LOGIN ?= kalm
 USER_PW ?= 0000
+# SSH authorized_keys baked into the image (one public key per line). Ported from
+# the AOSP track — mainline was missing it, so mainline images shipped password-only
+# and flash-ssh.sh (BatchMode key auth) could never authenticate to a mainline unit.
+SSH_AUTHORIZED_KEYS ?= rootfs/authorized_keys
 HOSTNAME ?= fold
 # Pinned because trixie drops kmscon; snagged from the Debian pool arm64 builds.
 KMSCON_URL ?= http://ftp.us.debian.org/debian/pool/main/k/kmscon/kmscon_9.0.0-4_arm64.deb
-# felix's super partition is 2082816 × 4096B = 8136.9 MiB; 8100M leaves a small
-# margin so fastboot doesn't reject on a slightly-oversized image.
-SIZE ?= 8100M
+# felix's super partition is 2082816 × 4096B = 8136.9 MiB, split into TWO 4068 MiB
+# rootfs halves (A/B) that the initramfs maps one at a time via dm-linear (the
+# 90rootfs-slot dracut module). Size the image to fit ONE half — 4000M leaves
+# slack inside a 4068 MiB slot. Raising it past 4068 overruns slot A into slot B.
+SIZE ?= 4000M
 SYSROOT_DIR ?= rootfs/sysroot
 KERNEL_SOURCE_DIR ?= kernel/source
 KERNEL_BUILD_DIR ?= $(KERNEL_SOURCE_DIR)/out
@@ -100,7 +106,11 @@ all:
 
 .debootstrap: .create_image
 	just mount_rootfs
-	sudo debootstrap --variant=minbase --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR)
+	# --components: debootstrap defaults to `main` only and bakes that into the
+	# sysroot's sources.list. firmware-realtek (the r8152 dongle's errata patch —
+	# mandatory, see the network section of CLAUDE.md) ships in non-free-firmware,
+	# so enable it here or apt later reports "no installation candidate".
+	sudo debootstrap --variant=minbase --components=main,non-free-firmware --include=symlinks --arch=arm64 --foreign $(RELEASE) $(SYSROOT_DIR)
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) debootstrap/debootstrap --second-stage
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) symlinks -cr .
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
@@ -267,8 +277,15 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.install_packages: .debootstrap .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES)
+.install_packages: .debootstrap .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES) $(wildcard $(SSH_AUTHORIZED_KEYS))
 	just mount_rootfs
+	# Belt-and-suspenders for firmware-realtek: .debootstrap now enables
+	# non-free-firmware for fresh builds, but a sysroot debootstrapped before that
+	# fix (or kept across a rebuild) still carries a main-only sources.list, which
+	# makes firmware-realtek "no installation candidate". Add the component first.
+	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+		"grep -q non-free-firmware /etc/apt/sources.list \
+		|| sed -i '/^deb .* main/ s/$$/ non-free-firmware/' /etc/apt/sources.list"
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "apt-get update"
 	# Locale setup.
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
@@ -298,6 +315,20 @@ all:
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"echo '%sudo ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/99-sudo-nopasswd \
 		&& chmod 0440 /etc/sudoers.d/99-sudo-nopasswd"
+	# SSH authorized_keys — baked here (not via the overlay) because git can't track
+	# the 0600 mode / non-root ownership, same reason as the sudoers drop-in above.
+	@if [ -s "$(SSH_AUTHORIZED_KEYS)" ]; then \
+		echo "  installing SSH keys from $(SSH_AUTHORIZED_KEYS)"; \
+		sudo mkdir -p "$(SYSROOT_DIR)/home/$(USER_LOGIN)/.ssh"; \
+		sudo cp "$(SSH_AUTHORIZED_KEYS)" "$(SYSROOT_DIR)/home/$(USER_LOGIN)/.ssh/authorized_keys"; \
+		$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
+			"chown -R $(USER_LOGIN):$(USER_LOGIN) /home/$(USER_LOGIN)/.ssh \
+			&& chmod 0700 /home/$(USER_LOGIN)/.ssh \
+			&& chmod 0600 /home/$(USER_LOGIN)/.ssh/authorized_keys"; \
+		echo "  installed $$(grep -cvE '^[[:space:]]*(#|$$)' "$(SSH_AUTHORIZED_KEYS)") key(s) for $(USER_LOGIN)"; \
+	else \
+		echo "  WARNING: no $(SSH_AUTHORIZED_KEYS) — image is PASSWORD-ONLY; flash-ssh key auth will fail."; \
+	fi
 	# systemd-backlight@.service pulls felix into systemd "degraded" on every
 	# boot; mask it (symlink to /dev/null) to keep `systemctl is-system-running`
 	# green.
@@ -408,8 +439,8 @@ all:
 		--lz4 \
 		--show-modules \
 		--force \
-		--add "rescue bash" \
-		--kernel-cmdline "rd.shell"
+		--add "rescue bash rootfs-flash rootfs-slot" \
+		--kernel-cmdline "rd.shell=0 rd.emergency=reboot"
 	just unmount_rootfs
 	touch $@
 
@@ -489,7 +520,7 @@ all:
 	#                                          enter reason: reboot bootloader".
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/disk/by-partlabel/super rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/mapper/rootfs rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm udev.event_timeout=20" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
