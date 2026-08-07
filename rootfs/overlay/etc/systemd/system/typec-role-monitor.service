@@ -1,0 +1,14 @@
+[Unit]
+Description=Hold the USB-C data role at device on a PC attach (keep the gadget bound)
+Documentation=man:typec-role-monitor
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/typec-role-monitor
+Restart=always
+RestartSec=5
+Nice=5
+
+[Install]
+WantedBy=multi-user.target
