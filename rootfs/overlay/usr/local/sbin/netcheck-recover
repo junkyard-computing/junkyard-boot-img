@@ -1,47 +1,503 @@
 #!/bin/sh
-# Self-healing A/B network recovery (runs on the shared 'super' rootfs).
-# Wait up to DEADLINE for a real DHCP IP. If up -> mark THIS slot successful.
-# If not -> if the inactive slot is a good fallback, mark THIS slot unbootable
-# and reboot (immediate A/B rollback); else plain reboot (retry, never strand).
+# Network-loss recovery. Run PERIODICALLY by netcheck-recover.timer.
 #
-# NOTE: the mainline kernel cmdline has no androidboot.slot_suffix (it's
-# bootconfig-based), so pixel-bootctl can't self-detect the running slot -- we
-# derive it from devinfo (`status`) and pass --slot explicitly. AOSP tolerates
-# --slot too, so this works under both kernels.
+# This is the only recovery path on the shipped configuration: no screen, no
+# volume keys, no power button. If the device becomes unreachable over the
+# network there is nobody to press anything, so it has to rescue itself.
+#
+# The policy is deliberately asymmetric, because the two failure modes have
+# very different costs:
+#
+#   a slot that has NEVER proven network   -> probably a bad image. Reboot a
+#                                             few times, then mark it
+#                                             unbootable so the bootloader
+#                                             falls back to the other slot.
+#   a slot that HAS proven network before  -> the image is known good, so the
+#                                             fault is outside it (cable,
+#                                             switch, wedged dongle). Reboot,
+#                                             but NEVER roll back.
+#
+# That second rule is the important one. An earlier version escalated to
+# rollback purely on elapsed failures, which meant unplugging a working,
+# already-commissioned device for ~20 minutes would silently mark its good slot
+# unbootable and flip it to whatever the other slot happens to hold (an older
+# image, or stock Android). Losing a cable must not re-image the device.
+#
+# And if a proven slot has had no address since boot at all, we do not reboot
+# either: the overwhelmingly likely cause is that nothing is plugged in, and
+# rebooting will not plug anything in. Once it HAS held an address this boot,
+# losing it is a real fault and does get a reboot.
+#
+# For bench use, create /etc/netcheck-recover.disable and this exits at once.
 set -u
-DEADLINE=90
+DEADLINE=${DEADLINE:-60}          # seconds to wait for an address before acting
+REBOOT_BEFORE_ROLLBACK=${REBOOT_BEFORE_ROLLBACK:-3}
+GADGET_IF=${GADGET_IF:-usb0}
 BOOTCTL=/usr/local/bin/pixel-bootctl
+STATE=/var/lib/netcheck-recover
+COUNTER="$STATE/attempts"
+HADIP=/run/netcheck-recover.had-ip   # tmpfs: per-boot, cleared by a reboot
 
-cur_slot() {
+log() { logger -t netcheck-recover "$*"; echo "netcheck-recover: $*" > /dev/kmsg 2>/dev/null; }
+
+[ -e /etc/netcheck-recover.disable ] && { log "disabled by /etc/netcheck-recover.disable"; exit 0; }
+
+# ★ An OTA in progress inhibits this check, because the check cannot tell a dead
+# link from a saturated one.
+#
+# Observed on 34291FDHS000WV (2026-08-04): flash-ssh was pushing ~1 GB over the
+# wire when this timer fired, its gateway ping lost to the transfer, and it
+# concluded "lost network after having it ... rebooting" — killing the update
+# mid-flight and leaving the operator a bare `client_loop: send disconnect:
+# Broken pipe`. Nothing in that error points here.
+#
+# At fleet scale this is not an edge case: every OTA saturates the link for
+# minutes and this timer runs every 5, so a slice of every sweep would be
+# rebooted out from under itself, at random, on the devices with the slowest
+# links — the ones least able to afford a restart.
+#
+# /run (tmpfs) on purpose: an updater that dies without cleaning up leaves the
+# inhibit behind only until the next boot, which is the same event that would
+# have cleared the fault anyway. A persistent path could disable the only
+# recovery mechanism on a headless device indefinitely.
+# --mark-only: confirm the network and COMMIT THE SLOT, never escalate.
+#
+# Split out because the two jobs have opposite risk profiles. Marking a slot
+# successful is safe the instant the network is proven; escalating (reboot,
+# rollback) must stay slow and cautious. Running both off one 5-minute timer made
+# the safe half inherit the cautious half's delay, and that silently reverted a
+# freshly flashed device:
+#
+#   flash-ssh switches to the new slot active-but-NOT-successful (rollback-safe).
+#   The slot is only committed once netcheck proves network — first run at
+#   OnBootSec=5min. Meanwhile the OTA inhibit suppresses netcheck for up to 900s.
+#   So a newly flashed unit has a ~20 minute window in which SEVEN reboots
+#   exhaust the retry counter and the bootloader rolls back — correctly, but to
+#   the OLD image, silently, on a unit that is up and reachable the whole time.
+#
+# Observed on 34291FDHS000WV 2026-08-05 during a 20-cycle reboot soak: slot B
+# ended `retry count: 0, successful: false` and the device came back running the
+# previous image from slot A. Power flapping, a rack power-cycle, or an operator
+# retrying a unit that "looks stuck" all reproduce it in the field.
+MARK_ONLY=0
+[ "${1:-}" = "--mark-only" ] && MARK_ONLY=1
+
+INHIBIT=/run/netcheck-recover.inhibit
+INHIBIT_MAX_AGE=${INHIBIT_MAX_AGE:-900}
+# ★ --mark-only deliberately IGNORES the inhibit. The inhibit exists to stop an
+# in-flight OTA being rebooted out from under itself; committing a slot that has
+# demonstrably reached the network does not reboot anything, and suppressing it
+# is what leaves the freshly flashed slot uncommitted during the exact window the
+# retry counter is being spent.
+if [ "$MARK_ONLY" != 1 ] && [ -e "$INHIBIT" ]; then
+    _now=$(date +%s 2>/dev/null || echo 0)
+    _mt=$(stat -c %Y "$INHIBIT" 2>/dev/null || echo 0)
+    _age=$(( _now - _mt ))
+    [ "$_age" -lt 0 ] && _age=0
+    if [ "$_age" -lt "$INHIBIT_MAX_AGE" ]; then
+        log "inhibited: update in progress (${_age}s old, expires at ${INHIBIT_MAX_AGE}s)"
+        exit 0
+    fi
+    # ★ EXPIRED. An updater that died without cleaning up must NOT be able to
+    # switch off the only recovery mechanism this device has.
+    #
+    # The first version of this check had no expiry and justified itself with
+    # "/run is tmpfs, so it clears on the next boot". That reasoning is circular:
+    # the inhibit suppresses the reboot that would clear the inhibit. A flash-ssh
+    # killed mid-run, followed by the link dropping, would have left a screenless,
+    # buttonless device unable to rescue itself — permanently, and silently. That
+    # is a strictly worse failure than the mid-OTA reboot the inhibit exists to
+    # prevent, so the inhibit has to be the weaker of the two guarantees.
+    #
+    # Delete it as well as ignoring it, so this is reported once rather than every
+    # five minutes, and so the next updater starts from a clean slate.
+    log "inhibit file is ${_age}s old (>= ${INHIBIT_MAX_AGE}s) — an update died without clearing it; resuming recovery"
+    rm -f "$INHIBIT" 2>/dev/null || true
+fi
+
+# REACHABILITY, not address presence.
+#
+# The previous version asked "is there a global IPv4 on a non-gadget interface?"
+# and "is there anything in dnsmasq.leases?". Both were wrong, and on
+# 2026-08-02 they let a device sit unreachable for ~7 minutes without the
+# recovery logic ever firing once:
+#
+#   * A WEDGED LINK KEEPS ITS ADDRESS. The r8152 dongle stopped passing traffic
+#     in both directions while NetworkManager still reported the connection
+#     `activated` with 192.168.1.108, carrier up, and the kernel logged nothing
+#     at all. `wired_ip()` returned true throughout a total outage.
+#   * THE LEASE FILE IS NEVER PRUNED. dnsmasq.leases had 30 stale entries, so
+#     `[ -s ... ]` was true forever — on any unit that has ever been cabled to a
+#     PC, that single line made healthy() unconditionally true.
+#
+# `journalctl -t netcheck-recover` showed no entries for the whole outage: the
+# timer ran every 5 minutes and concluded "healthy" every time. On a device
+# whose only access is the network, that disables the entire safety net.
+#
+# So: prove we can actually exchange packets with a peer. Ping first; if ICMP is
+# filtered, fall back to whether the neighbour resolved (ARP), which is a weaker
+# but still real proof that L2 works and something answered.
+peer_reachable() {
+    _p="$1"
+    [ -n "$_p" ] || return 1
+    # ICMP is the strong test.
+    ping -c1 -W2 "$_p" >/dev/null 2>&1 && return 0
+    # ICMP may be filtered. Fall back to L2: FLUSH the neighbour entry first,
+    # then let the failed ping above have re-triggered resolution — an entry
+    # that comes back with an lladdr and is not FAILED/INCOMPLETE means the peer
+    # answered ARP, so the link really does pass packets.
+    #
+    # The flush matters: without it this is circular, because some targets are
+    # themselves discovered FROM the ARP table and a leftover STALE entry would
+    # "prove" reachability of a link that is wedged. STALE only means we knew
+    # the mapping once.
+    ip neigh flush to "$_p" 2>/dev/null
+    ping -c1 -W2 "$_p" >/dev/null 2>&1
+    ip neigh show to "$_p" 2>/dev/null \
+        | grep -q 'lladdr' \
+        && ! ip neigh show to "$_p" 2>/dev/null | grep -qE 'FAILED|INCOMPLETE' \
+        && return 0
+    return 1
+}
+
+# Build the wired probe target list at RUN TIME. Nothing here is hardcoded and
+# nothing is a single point of false failure:
+#
+#   * the default gateway(s) from the routing table
+#   * the DNS servers we were actually handed (resolv.conf)
+#   * the DHCP server that gave us the lease
+#   * anything already in the ARP table on a wired link
+#
+# Deliberately NOT just the gateway. Plenty of gateways drop ICMP, a gateway can
+# be down while the rest of the LAN is fine, and in the datacenter the peer that
+# matters is the controller rather than the router — so any one target being
+# unreachable must not read as "this device is off the network".
+#
+# Operators can pin their own targets (one IP per line) in
+#   /etc/netcheck-recover.targets
+# which REPLACES the discovered set — e.g. point a fleet at its control plane.
+wired_targets() {
+    if [ -s /etc/netcheck-recover.targets ]; then
+        grep -vE '^[[:space:]]*(#|$)' /etc/netcheck-recover.targets
+        return
+    fi
+    ip -4 route show default 2>/dev/null | awk -v g="$GADGET_IF" '$5 != g {print $3}'
+    awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null | grep -E '^[0-9]+\.'
+    # DHCP server for any non-gadget lease NM recorded
+    grep -sh '^SERVER_ADDRESS=' /var/lib/NetworkManager/*.lease 2>/dev/null | cut -d= -f2
+    # neighbours already known on a wired link (excludes the gadget subnet)
+    ip -4 neigh show 2>/dev/null | awk -v g="$GADGET_IF" '$3 != g && $1 ~ /^[0-9]/ {print $1}'
+}
+
+# Reachable = ANY discovered peer answers. Not "we hold an address".
+wired_reachable() {
+    for _t in $(wired_targets | sort -u); do
+        peer_reachable "$_t" && return 0
+    done
+    return 1
+}
+
+# Gadget path: the gadget's 10.42.0.1 is assigned unconditionally by
+# usb_gadget, so its presence proves nothing. Require carrier (for CDC-NCM the
+# device side only sees carrier once a host has configured the link) AND a peer
+# that actually answers — validated live, so a stale lease cannot vote.
+gadget_reachable() {
+    [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ] || return 1
+    for _l in $(awk '{print $3}' /var/lib/misc/dnsmasq.leases 2>/dev/null); do
+        peer_reachable "$_l" && return 0
+    done
+    return 1
+}
+
+# A wired network with NO default gateway (isolated bench switch) cannot be
+# proven either way by pinging a gateway that does not exist. Treat that as
+# healthy-but-unverified rather than escalating: a false "unhealthy" reboot-loops
+# a working device, which is strictly worse than a false "healthy" that merely
+# fails to rescue one. Logged so it is visible rather than silent.
+wired_unverifiable() {
+    [ -z "$(ip -4 route show default 2>/dev/null | awk -v g="$GADGET_IF" '$5 != g {print $3}')" ] || return 1
+    ip -4 -o addr show scope global 2>/dev/null \
+        | awk -v g="$GADGET_IF" '$2 != g {print $4}' | grep -qv '^169\.254\.'
+}
+
+healthy() {
+    wired_reachable && return 0
+    gadget_reachable && return 0
+    if wired_unverifiable; then
+        log "wired address present but no default gateway to probe — cannot verify reachability, not escalating"
+        return 0
+    fi
+    return 1
+}
+
+# ★ EVERY slot decision here is about the slot we are RUNNING ON, never the one
+# devinfo calls "active". Those are the same in steady state and differ in exactly
+# one window: after an OTA has switched the active slot but before the reboot that
+# boots it. That window is short but it is also precisely when this timer is most
+# likely to fire, because flash-ssh switches the slot and reboots seconds later.
+#
+# Reading "active" there is actively dangerous. Observed 2026-08-04 on
+# 35071FDHS0017C: a deploy switched active to slot A and then failed before
+# rebooting; this timer fired on the still-running slot B, saw a healthy network,
+# and marked *A* successful — certifying a slot that had never booted and whose
+# rootfs half was destroyed. A slot marked successful is one the bootloader has no
+# reason to abandon, so that can silently disarm the rollback it was meant to
+# protect. The whole premise of this script is that a slot must PROVE it has
+# network; only the running slot can prove anything.
+#
+# The running slot comes from the kernel, not from devinfo — androidboot.slot_suffix
+# is what the bootloader actually booted, and it cannot be changed out from under us
+# by a concurrent OTA the way the devinfo active bit can.
+running_slot() {
+    # AOSP: androidboot.slot_suffix in bootconfig is what the bootloader booted.
+    _rs=$(awk -F'"' '/androidboot\.slot_suffix/ {print substr($2, 2); exit}' \
+        /proc/bootconfig 2>/dev/null)
+    if [ -n "$_rs" ]; then printf '%s\n' "$_rs"; return 0; fi
+    # Mainline: the kernel exposes no androidboot.slot_suffix, so derive the
+    # active slot from devinfo via pixel-bootctl. (This is what the mainline
+    # kernel cmdline being bootconfig-less forces; the AOSP path above wins when
+    # slot_suffix IS present, since it's what the bootloader actually chose.)
     "$BOOTCTL" status 2>/dev/null | awk '
         tolower($1)=="slot:" {s=tolower($2)}
         $1=="active:" && $2=="true" {print s; exit}'
 }
 
+# Mark the RUNNING slot successful. pixel-bootctl cannot self-detect the slot on
+# mainline (no slot_suffix), so pass --slot explicitly from running_slot(). On
+# AOSP running_slot() returns the suffix and this is equivalent to the bare call.
+mark_running_successful() {
+    _s=$(running_slot)
+    "$BOOTCTL" mark-successful ${_s:+--slot "$_s"} >/dev/null 2>&1 || true
+}
+
+slot_field() {  # slot_field <field>  -> value for the RUNNING slot
+    _rs=$(running_slot)
+    [ -n "$_rs" ] || return 1
+    "$BOOTCTL" status 2>/dev/null | awk -v f="$1:" -v want="$_rs" '
+        tolower($1)=="slot:" {s=tolower($2); next}
+        {v[s FS $1]=$2}
+        END {print v[want FS f]}'
+}
+
+# --mark-only stops here: commit the slot if the network is proven, and NEVER
+# escalate. Exits 0 either way — an unproven slot is simply left uncommitted for
+# the next run to retry, which is the conservative behaviour. All the escalation
+# machinery below (bounce, reboot, mark-unbootable) stays on the slow timer.
+if [ "$MARK_ONLY" = 1 ]; then
+    i=0
+    while [ "$i" -lt "${MARK_DEADLINE:-20}" ]; do
+        if healthy; then
+            mark_running_successful
+            : > "$HADIP" 2>/dev/null
+            rm -f "$COUNTER"
+            log "network proven — slot committed (mark-only)"
+            exit 0
+        fi
+        i=$((i + 1)); sleep 1
+    done
+
+    # ⚠ DO NOT add "commit anyway when there is no wired NIC" here. It was tried
+    # and rejected 2026-08-05, and the reason is worth keeping.
+    #
+    # The tempting argument: the bootloader's retry counter drains whatever we
+    # decide, so a no-NIC unit gets rolled back by boot count even though the
+    # "never escalate without a NIC" guard refuses to roll it back — so we may as
+    # well commit and stop the counter.
+    #
+    # The argument is wrong because wired_nic_present() CANNOT DISTINGUISH a
+    # dongle that is absent from a dongle that failed to enumerate. Both present
+    # as no interface. An image that breaks USB enumeration — a bad r8152, a
+    # kernel regression, a botched module set — produces exactly the no-NIC
+    # signature, and that is precisely the case rollback exists for. Committing
+    # on no-NIC would disable rollback for the failures most likely to BE the
+    # image's fault. Observed the same day: a unit whose dongle was physically
+    # attached showed a completely empty `lsusb`.
+    #
+    # The counter-drain problem is real but belongs elsewhere: flash-fastboot.sh
+    # now writes the boot chain to BOTH slots, so a rollback lands on the same
+    # image instead of a stale/stock chain, and commits the slot at flash time
+    # over the USB gadget. That fixes the outcome without blinding the check.
+    log "network not proven within ${MARK_DEADLINE:-20}s — leaving the slot uncommitted (mark-only never escalates)"
+    exit 0
+fi
+
+# Give a transient blip a chance to clear before acting on it.
 i=0
 while [ "$i" -lt "$DEADLINE" ]; do
-    if ip -4 addr show scope global 2>/dev/null | grep -qE 'inet 192\.168\.'; then
-        s=$(cur_slot)
-        "$BOOTCTL" mark-successful ${s:+--slot "$s"} 2>/dev/null || true
-        logger -t netcheck-recover "network up; slot ${s:-?} marked successful"
+    if healthy; then
+        # Healthy. Commit this slot — this is what marks a slot good, and
+        # nothing else does, deliberately: a slot must PROVE it has network
+        # before the bootloader loses the ability to roll it back.
+        : "no --slot: pixel-bootctl defaults to the RUNNING slot, which is the only
+          one this health check can vouch for"
+        mark_running_successful
+        : > "$HADIP" 2>/dev/null
+        rm -f "$COUNTER"
         exit 0
     fi
-    i=$((i+1)); sleep 1
+    i=$((i + 1)); sleep 1
 done
 
-logger -t netcheck-recover "no IP after ${DEADLINE}s; evaluating A/B fallback"
-other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
-    tolower($1)=="slot:" {s=$2}
-    $1=="active:"     {a[s]=$2}
-    $1=="successful:" {ok[s]=$2}
-    $1=="unbootable:" {ub[s]=$2}
-    END { for (x in a) if (a[x]=="false" && ok[x]=="true" && ub[x]=="false") print "yes" }')
-s=$(cur_slot)
-if [ "$other_ok" = "yes" ]; then
-    logger -t netcheck-recover "inactive slot good; marking slot ${s:-?} unbootable + rebooting"
-    "$BOOTCTL" mark-unbootable ${s:+--slot "$s"} 2>/dev/null || true
-else
-    logger -t netcheck-recover "no good fallback; plain reboot to retry"
+# ★ TRY THE CHEAP FIX BEFORE THE EXPENSIVE ONE: bounce the USB host role.
+#
+# Rebooting was the only escalation here, which is a ~5-6 minute outage for a
+# fault that a host-role bounce clears in about two seconds. On this hardware the
+# overwhelmingly common cause of "no network" is the USB-Ethernet dongle — either
+# gone from the bus, or enumerated but wedged — and toggling dwc3_exynos_otg_id
+# rebuilds the controller and re-enumerates it in place. usb-host-recover already
+# does exactly this, but only when the kernel logs `HC died`; a link that dies
+# quietly produces no such message and fell straight through to a reboot.
+#
+# Covers both shapes, which is why it bounces unconditionally rather than
+# checking for the NIC first: dongle-rehost's have_nic() test would say "nothing
+# to do" for a NIC that is present but passing no traffic, and that is precisely
+# the case observed repeatedly on 34291FDHS000WV.
+#
+# Bounded and non-destructive: one attempt per invocation (the timer retries in 5
+# minutes), and a failed write just falls through to the existing escalation. A
+# reboot is still the answer if this does not help — it is now the second answer.
+OTG_ID=${OTG_ID:-/sys/devices/platform/11210000.usb/dwc3_exynos_otg_id}
+BOUNCE_SETTLE=${BOUNCE_SETTLE:-15}
+
+# ★★ NEVER BOUNCE THE PORT WHILE A HOST IS ATTACHED TO THE GADGET.
+#
+# gadget_reachable() requires BOTH carrier AND a leased peer that answers. The
+# state in between — carrier up, no peer answering — is a phone plugged into a
+# laptop whose interface has not taken a DHCP lease yet, or that filters ICMP.
+# healthy() is false there, so we would arrive here and bounce the role toward
+# HOST, destroying the very link someone is sitting on.
+#
+# Bouncing cannot fix that fault anyway: the problem is on the host side, and no
+# amount of role-forcing on the phone configures somebody's laptop. Someone
+# plugged that cable in; leave them their end to fix.
+#
+# In the field this never fires: a fielded unit has a dongle and no host, so
+# usb0 carrier is 0 and the bounce proceeds exactly as before. This only changes
+# behaviour on a bench or at the factory, where a human is by definition present.
+#
+# Same shape as the dongle-rehost bug fixed in 8f76ec2, which tore down gadget
+# sessions ~30s after every boot. This one is narrower — it needs the network to
+# already look broken, and only writes otg_id, which is frequently a no-op when
+# the Type-C manager owns the role — but it is the same mistake: attacking the
+# port to hunt for a dongle while the gadget is carrying the only way in.
+if [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ]; then
+    log "USB gadget has a host attached — not bouncing the port role"
+elif [ -w "$OTG_ID" ]; then
+    log "no network after ${DEADLINE}s — bouncing the USB host role before escalating"
+    if printf 1 > "$OTG_ID" 2>/dev/null && sleep 1 && printf 0 > "$OTG_ID" 2>/dev/null; then
+        j=0
+        while [ "$j" -lt "$BOUNCE_SETTLE" ]; do
+            if healthy; then
+                log "recovered by USB host bounce after ${j}s — no reboot needed"
+                mark_running_successful
+                : > "$HADIP" 2>/dev/null
+                rm -f "$COUNTER"
+                exit 0
+            fi
+            j=$((j + 1)); sleep 1
+        done
+        log "USB host bounce did not restore reachability within ${BOUNCE_SETTLE}s"
+    else
+        log "USB host bounce failed to write $OTG_ID"
+    fi
 fi
+
+proven=$(slot_field successful)
+[ "$proven" = true ] || proven=false
+
+# Is there any PHYSICAL wired NIC attached at all? This is the discriminator for
+# "nothing is plugged in", and it must be hardware presence — NOT address
+# history.
+#
+# Getting this wrong stranded a device on 2026-08-02. The rule used to be "a
+# proven slot that never held an address since boot must have nothing plugged
+# in, so don't reboot". But the dongle WAS plugged in; it had wedged and come up
+# dead, so no address was ever obtained. netcheck then logged
+#   "no address since boot ... assuming nothing is plugged in; not rebooting"
+# every 5 minutes while the device sat unreachable, and it took a manual reboot
+# to recover — on a unit whose only access is the network, that is the whole
+# failure.
+#
+# A NIC that is present but cannot reach anything is exactly the case we must
+# reboot for. Only genuine absence means "nobody plugged anything in".
+# Requires: a real device symlink (filters the ~44 virtual rmnet/gre/sit
+# interfaces this kernel creates), ARPHRD_ETHER, and not the gadget itself.
+wired_nic_present() {
+    for _d in /sys/class/net/*; do
+        _n=$(basename "$_d")
+        [ "$_n" = "lo" ] && continue
+        [ "$_n" = "$GADGET_IF" ] && continue
+        [ -e "$_d/device" ] || continue
+        [ "$(cat "$_d/type" 2>/dev/null)" = "1" ] || continue
+        return 0
+    done
+    return 1
+}
+
+# Nothing physically attached: sit still and stay debuggable rather than
+# reboot-looping a device that nobody has cabled. Gated on HARDWARE PRESENCE,
+# not on address history — see wired_nic_present() above for why. If a NIC is
+# present but dead, we fall through and reboot, which is the case that matters.
+# ★★ NO WIRED NIC => NEVER ESCALATE, whether or not this slot has proven itself.
+#
+# This guard used to require `proven = true`, which made it useless in the one
+# case that matters. A slot only becomes "proven" by observing a healthy network,
+# so a device whose NIC is dead can never prove ANY slot — and an unproven slot
+# falls straight through to: 3 reboots, mark-unbootable, roll back. The other slot
+# has the same dead NIC, so it burns down the same path, and the device ends up
+# with BOTH slots unbootable and nothing to boot.
+#
+# That is a device bricking itself over a hardware fault, on units with no screen
+# and no buttons. Believed to be what happened to 34291FDHS000WV on 2026-08-04:
+# freshly flashed (so neither slot was proven), came up gadget-only with no wired
+# NIC, and ended stuck at the bootloader splash.
+#
+# The rule the escalation is built on is "a slot that cannot reach the network is
+# probably a bad image". That inference is only valid if a NIC exists to fail. No
+# NIC at all is positive evidence the fault is NOT the image, and rolling back
+# cannot attach one — so rollback is guaranteed useless here and its downside is
+# unbounded. Stay up, stay debuggable over the USB gadget, and let a human decide.
+if ! wired_nic_present; then
+    # Refuses to escalate, and deliberately does NOT commit the slot either —
+    # see the matching note in the --mark-only path. A missing NIC and a NIC
+    # that failed to enumerate are indistinguishable here, so committing would
+    # switch off rollback for exactly the images most likely to deserve it.
+    log "no wired NIC attached — not rebooting or rolling back; leaving the slot uncommitted"
+    exit 0
+fi
+if [ "$proven" = true ] && [ ! -e "$HADIP" ]; then
+    log "wired NIC present but no address since boot on a proven slot — nothing plugged in; not rebooting"
+    exit 0
+fi
+if [ ! -e "$HADIP" ] && wired_nic_present; then
+    log "wired NIC present but never reachable this boot — treating as a dead link, escalating"
+fi
+
+mkdir -p "$STATE" 2>/dev/null
+attempts=$(cat "$COUNTER" 2>/dev/null)
+case "$attempts" in ''|*[!0-9]*) attempts=0 ;; esac
+attempts=$((attempts + 1))
+echo "$attempts" > "$COUNTER" 2>/dev/null
+sync
+
+if [ "$proven" = true ]; then
+    log "lost network after having it (attempt $attempts); slot proven good, rebooting without rollback"
+elif [ "$attempts" -gt "$REBOOT_BEFORE_ROLLBACK" ]; then
+    s=$(running_slot)
+    other_ok=$("$BOOTCTL" status 2>/dev/null | awk '
+        tolower($1)=="slot:" {s=$2}
+        $1=="active:"     {a[s]=$2}
+        $1=="unbootable:" {ub[s]=$2}
+        END { for (x in a) if (a[x]=="false" && ub[x]=="false") print "yes" }')
+    if [ "$other_ok" = "yes" ]; then
+        log "no network after ${DEADLINE}s (attempt $attempts) and this slot never proved network; marking slot ${s:-?} unbootable -> rollback"
+        "$BOOTCTL" mark-unbootable ${s:+--slot "$s"} >/dev/null 2>&1 || true
+    else
+        log "no network after ${DEADLINE}s (attempt $attempts); no usable fallback slot, plain reboot"
+    fi
+else
+    log "no network after ${DEADLINE}s (attempt $attempts/$REBOOT_BEFORE_ROLLBACK); rebooting"
+fi
+
 sync
 systemctl reboot -f 2>/dev/null || /sbin/reboot -f
