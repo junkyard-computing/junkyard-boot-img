@@ -447,6 +447,31 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	just unmount_rootfs
 	touch $@
 
+# WHY A PREFLIGHT: the toolchains are split across environments — the rootfs
+# stages need sudo (tools/dockershell, a Debian container), the kernel needs the
+# bazel FHS env, and these two stages need cargo. Nothing here can install cargo
+# (Nix lives only in flake.nix so this Makefile stays portable), but it can say
+# so. Without the check the failure is a bare "sh: line 2: cargo: not found"
+# several stages into a build, with nothing naming the missing toolchain, which
+# shell wanted it, or why a build that worked yesterday suddenly needs it —
+# these sentinels only re-trigger when a pixel-* submodule gitlink moves, so the
+# stage is usually already satisfied and invisible.
+define require_cargo
+	@command -v cargo >/dev/null 2>&1 || { \
+		printf '%s\n' \
+		  "ERROR: cargo not found, so $@ cannot cross-build." \
+		  "       These two stages build the on-device A/B tools for" \
+		  "       $(PIXEL_BOOTCTL_TARGET); they re-run whenever a pixel-*" \
+		  "       submodule gitlink moves. Build them where cargo lives, then" \
+		  "       re-run this build — the sentinels are picked up as-is:" \
+		  "" \
+		  "         NixOS:  nix develop -c make .build_pixel_bootctl .build_pixel_ota" \
+		  "         other:  rustup target add $(PIXEL_BOOTCTL_TARGET)" \
+		  "" \
+		  "       (tools/dockershell's container has no Rust toolchain by design.)" >&2; \
+		exit 1; }
+endef
+
 # Cross-compile pixel-bootctl to a fully static aarch64-musl binary and copy it
 # into the overlay tree. Links with the Rust toolchain's bundled rust-lld and
 # strips via rustc (-C strip), so no external aarch64 gcc/strip is needed — the
@@ -454,6 +479,7 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 # rustup's aarch64-unknown-linux-musl target installed. Static => no dynamic
 # loader, so it runs unchanged on the Debian rootfs.
 .build_pixel_bootctl: $(PIXEL_BOOTCTL_SOURCES)
+	$(require_cargo)
 	cd $(PIXEL_BOOTCTL_DIR) && \
 		RUSTFLAGS="-C linker=rust-lld -C strip=symbols" \
 		cargo build --release --target $(PIXEL_BOOTCTL_TARGET)
@@ -464,6 +490,7 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 # pixel-ota: identical cross-build recipe to pixel-bootctl (see the comment
 # above .build_pixel_bootctl for the static-musl rationale).
 .build_pixel_ota: $(PIXEL_OTA_SOURCES)
+	$(require_cargo)
 	cd $(PIXEL_OTA_DIR) && \
 		RUSTFLAGS="-C linker=rust-lld -C strip=symbols" \
 		cargo build --release --target $(PIXEL_BOOTCTL_TARGET)
