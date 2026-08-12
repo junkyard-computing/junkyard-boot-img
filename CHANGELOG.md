@@ -1,5 +1,19 @@
 # Changelog
 
+## [1.6.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.5.1...v1.6.0) (2026-08-12)
+
+
+### Features
+
+* **provisioning:** PowerShell scripts, so the kit works on the contractor's Windows PC ([e040d28](https://github.com/junkyard-computing/junkyard-boot-img/commit/e040d28774634ea53c1b2143f7e92604c4fef70c))
+
+
+### Bug Fixes
+
+* **build:** a pristine kernel tree is not drift — it aborted every post-sync build ([ea79f84](https://github.com/junkyard-computing/junkyard-boot-img/commit/ea79f84d9af13023f7af3ec9fb396bd19b19e8da))
+* **build:** the flake knew how to provide cargo and gave it to only one of three shells ([d4efffe](https://github.com/junkyard-computing/junkyard-boot-img/commit/d4efffe449a624f986284ec0395dba457ed53711))
+* **provisioning:** a failed flash exited 0, and `erase super` ran before the image check ([f358446](https://github.com/junkyard-computing/junkyard-boot-img/commit/f358446bd581b3c619089458a001640b69a3ae24))
+
 ## [1.5.1](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.5.0...v1.5.1) (2026-08-05)
 
 
