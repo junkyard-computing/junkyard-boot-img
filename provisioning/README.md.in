@@ -1,7 +1,13 @@
 # Flashing Junkyard Debian onto Pixel Fold
 
 This folder is everything needed to flash a batch of Pixel Folds. Work through
-the steps in order. **Everything you need is in here — do not download anything.**
+the steps in order. **Everything you need is in here — do not download anything**
+(Windows needs one extra download, `platform-tools`, which Google does not let
+us redistribute).
+
+**Linux and Windows are both supported.** Every step is the same on both; only
+the command differs, and both are given side by side throughout. On Windows,
+do the [Windows setup](#windows-setup) first.
 
 This kit builds:
 
@@ -14,8 +20,10 @@ This kit builds:
 
 **What you need**
 
-- A Linux machine with `adb` and `fastboot` (`platform-tools` from Google;
-  `fastboot` must be 33.0.1 or newer).
+- A machine with `adb` and `fastboot` (`platform-tools` from Google;
+  `fastboot` must be 33.0.1 or newer). Windows 10 or 11 works — the scripts run
+  on the **Windows PowerShell 5.1** that is already installed, so you do not
+  need to install PowerShell 7 (they run on PowerShell 7 too if you have it).
 - A **powered** USB hub. `super.img` is 7.9 GB per phone, so a batch of eight is
   ~63 GB through one USB controller. An unpowered hub will drop phones mid-flash.
 - ~50 GB free disk space.
@@ -23,8 +31,60 @@ This kit builds:
 **Check the kit arrived intact before you start:**
 
 ```
-sha256sum -c SHA256SUMS
+Linux     sha256sum -c SHA256SUMS
+Windows   .\verify-kit.ps1
 ```
+
+This reads every file (~11 GB) and takes a while. Everything must pass. **If
+anything is reported corrupt or missing, stop** — get the kit again. A truncated
+image does not fail loudly; it fails as a phone that flashes fine and then will
+not boot.
+
+---
+
+<a name="windows-setup"></a>
+## Windows setup
+
+*Linux users: skip to step 1.*
+
+**Unpack the kit with [7-Zip](https://www.7-zip.org/), not Explorer.** The
+archive is several GB and contains a 7.9 GB file. Explorer's built-in unzip is
+slow at this size and has been known to truncate; 7-Zip is not.
+
+Put the extracted `junkyard-provisioning` folder somewhere with a **short path**
+(`C:\junkyard` is ideal) and **not** inside `Program Files`, OneDrive, or any
+synced folder.
+
+Open PowerShell in that folder — Shift+right-click the folder → *Open PowerShell
+window here* — and allow the scripts to run **in this window only**:
+
+```
+Set-ExecutionPolicy -Scope Process -Bypass
+```
+
+That lasts until you close the window and changes nothing permanently. Run it
+again in any new PowerShell window. (If you would rather not, put
+`powershell -ExecutionPolicy Bypass -File ` in front of every `.\script.ps1`
+instead.)
+
+**Install platform-tools.** Download *SDK Platform-Tools for Windows* from
+<https://developer.android.com/tools/releases/platform-tools> and unzip it
+**into this folder**, so that this path exists:
+
+```
+junkyard-provisioning\platform-tools\fastboot.exe
+```
+
+The scripts look there first. Putting `platform-tools` on your `PATH` instead
+also works.
+
+⚠ **Windows also needs a driver for the phone's bootloader.** With a phone in
+fastboot, open Device Manager: if you see an unknown device, or `Android` with a
+yellow warning triangle, install Google's USB Driver (linked from the same
+page), then right-click that device → *Update driver* → *Browse my computer* →
+point it at the extracted driver folder → choose **Android Bootloader
+Interface**. A phone whose driver is missing simply does not appear in
+`fastboot devices`, with no other symptom.
 
 ---
 
@@ -41,7 +101,8 @@ Plug all the phones into the hub.
 ## Step 2 — Get them into fastboot
 
 ```
-./reboot-to-fastboot.sh
+Linux     ./reboot-to-fastboot.sh
+Windows   .\reboot-to-fastboot.ps1
 ```
 
 Phones you have not used before show an **"Allow USB debugging?"** dialog.
@@ -53,7 +114,8 @@ Wait until every phone shows the fastboot screen.
 ## Step 3 — Unlock the bootloaders
 
 ```
-./unlock-bootloaders.sh
+Linux     ./unlock-bootloaders.sh
+Windows   .\unlock-bootloaders.ps1
 ```
 
 ⚠ Each phone shows a confirmation you must accept with the **volume and power
@@ -64,10 +126,11 @@ buttons**. This cannot be automated.
 ## Step 4 — Flash Google's image
 
 ```
-./flash-google-batch.sh
+Linux     ./flash-google-batch.sh
+Windows   .\flash-google-batch.ps1
 ```
 
-This runs Google's own `flash-all.sh` (already unpacked in `factory/`) on every
+This runs Google's own flashing script (already unpacked in `factory/`) on every
 attached phone at once. Nothing to download and nothing to unzip.
 
 This step is not optional and it is not the same as step 5. It installs the
@@ -90,7 +153,8 @@ restarts.
 With every phone in fastboot:
 
 ```
-./flash-batch.sh
+Linux     ./flash-batch.sh
+Windows   .\flash-batch.ps1
 ```
 
 This flashes all attached phones at once and prints `OK` or `FAILED` per phone.
@@ -102,7 +166,8 @@ slow.
 If a phone fails, re-run just that one — you do not need to redo the batch:
 
 ```
-./flash-fastboot.sh <serial>
+Linux     ./flash-fastboot.sh <serial>
+Windows   .\flash-fastboot.ps1 <serial>
 ```
 
 The phones reboot themselves when finished.
@@ -129,8 +194,8 @@ Check these three lines on every phone:
 
 | Line | Must read | If it does not |
 |---|---|---|
-| `Image:` | `@IMAGE_VERSION@` | Re-flash: `./flash-fastboot.sh <serial>` |
-| `Kernel:` | `@KERNEL_VERSION@` | Re-flash: `./flash-fastboot.sh <serial>` |
+| `Image:` | `@IMAGE_VERSION@` | Re-flash that phone (end of step 5) |
+| `Kernel:` | `@KERNEL_VERSION@` | Re-flash that phone (end of step 5) |
 | `Boot:` | `slot A` | Fine if it says `slot B` — see "About slots" |
 
 `Battery:` and `IPv4:` will differ per phone and do not matter here.
@@ -173,14 +238,26 @@ has ever been on a network. Normal handling is fine.
 
 ## If something goes wrong
 
-**A phone is missing from `fastboot devices`.** It is not in fastboot, or the
-cable is charge-only. Try another cable first — this is the most common cause.
+**A phone is missing from `fastboot devices`.** In order of likelihood: the
+cable is charge-only (try another cable first), the phone is not actually in
+fastboot, or — on Windows — it has no bootloader driver (see
+[Windows setup](#windows-setup)).
 
-**`flash-fastboot.sh` says "not in fastboot — skipping".** That phone booted
+**The flashing script says "not in fastboot — skipping".** That phone booted
 while the batch ran. Put it back in fastboot and re-run it for that serial.
 
 **A phone reboots by itself during flashing.** Re-flash it. Tell us if the same
 phone does it more than once.
+
+**Windows: "running scripts is disabled on this system".** You skipped the
+`Set-ExecutionPolicy -Scope Process -Bypass` line, or you have opened a new
+PowerShell window since. Run it again in this window.
+
+**Windows: `fastboot.exe` or `adb.exe` not found.** platform-tools is not
+unzipped into this folder. See [Windows setup](#windows-setup).
+
+**Windows: the flash crawls.** Excluding this folder from Defender's real-time
+scanning helps; it is reading 7.9 GB per phone.
 
 **Anything you set aside:** send us the serial number and what its screen showed
 (a photo is ideal). The serial is on the fastboot screen and on the box.
