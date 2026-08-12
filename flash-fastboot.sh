@@ -43,64 +43,44 @@ fi
 echo ">>> flashing $SERIAL ($(fastboot -s "$SERIAL" getvar product 2>&1 | head -1))"
 
 # Every command below goes through this, so none of them can pick a device.
-fb() { fastboot -s "$SERIAL" "$@"; }
+#
+# ★★ AND IT ABORTS ON FAILURE. There is no `set -e` here (the slot-commit poll
+# at the end depends on non-zero returns being survivable), so for a long time a
+# failed `fb flash boot_a` simply carried on to the next command and the script
+# still exited 0 — which flash-batch.sh reports as `OK`. A phone that never
+# received its boot chain would ship looking flashed. Anything that must succeed
+# goes through fb; anything allowed to fail goes through fb_try.
+fb() {
+	local rc
+	fastboot -s "$SERIAL" "$@"
+	rc=$?
+	if [ "$rc" -ne 0 ]; then
+		echo "" >&2
+		echo "FAILED on $SERIAL: fastboot $* (exit $rc)" >&2
+		echo "The phone has NOT been left in a known state. Put it back into" >&2
+		echo "fastboot and re-run this script for that serial." >&2
+		exit 1
+	fi
+}
+
+# Best-effort: erasing a partition that does not exist on this device is fine,
+# and was previously written as `fb ... || true` — which stops working the
+# moment fb itself exits on failure.
+fb_try() { fastboot -s "$SERIAL" "$@" || true; }
 
 cd "$(dirname "$0")"
 
-# ★★ FLASH THE BOOT CHAIN TO BOTH SLOTS, and disable AVB on both.
+# ★★ CHECK EVERY IMAGE BEFORE TOUCHING THE PHONE.
 #
-# The old script flashed unsuffixed partitions, which target whichever slot is
-# active, so only ONE slot got our boot chain. `super` is not slotted and
-# super.img seeds both halves with our rootfs, so the other slot ended up
-# pairing a stock/stale kernel with our Debian rootfs half — provably different
-# chains on a live unit (boot_a cd09c736… vs boot_b 130f3a93…).
-#
-# That is the rollback target. A unit that rolls back — because its slot was
-# never committed and the bootloader's retry counter hit zero — lands on a
-# chain that cannot bring our system up, on hardware with no screen and no
-# buttons. Flashing both slots makes a rollback survivable instead of terminal.
-#
-# ⚠ The set-active dance is REQUIRED, not decoration: `oem disable-verification`
-# and `oem disable-verity` apply ONLY to the slot that is active when they run.
-# Flashing our unsigned repacked chain into a slot whose AVB is still enforcing
-# produces the silent-rollback failure documented for the OTA path — the flash
-# reports success, the hashes match, and the slot simply never boots.
-for slot in a b; do
-	echo ">>> preparing slot $slot (set-active, then disable AVB for THAT slot)"
-	fb --set-active=$slot
-	fb oem disable-verification
-	fb oem disable-verity
-	fb erase init_boot_$slot   || true
-	fb erase boot_$slot        || true
-	fb flash boot_$slot "$IMAGE_DIR/boot.img"
-	fb erase vendor_boot_$slot || true
-	fb flash vendor_boot_$slot "$IMAGE_DIR/vendor_boot.img"
-	fb erase dtbo_$slot        || true
-	fb flash dtbo_$slot "$DTBO"
-	fb erase vendor_kernel_boot_$slot || true
+# These checks used to sit further down, next to the partition each one feeds —
+# which put the super.img test AFTER `fb erase super`. A checkout missing
+# super.img therefore wiped the rootfs and only then refused to flash, leaving
+# the phone worse off than when it arrived. Nothing here writes to the device,
+# so all of it belongs before the first fastboot command.
+for _img in "$IMAGE_DIR/boot.img" "$IMAGE_DIR/vendor_boot.img" "$DTBO"; do
+	[ -f "$_img" ] || { echo "missing $_img — build it first (see CLAUDE.md)" >&2; exit 1; }
 done
 
-# Leave slot A active. Both slots now carry an identical, AVB-permissive chain,
-# so this is a choice of starting point rather than a fallback arrangement.
-fb --set-active=a
-
-fb erase super
-# ★ super.img, NOT rootfs.img — this is the FULL FLASH, and it is what leaves the
-# device in a valid A/B state.
-#
-# rootfs.img is one rootfs sized to fit ONE HALF of super. Flashing it here would
-# land it at offset 0 (slot A) and leave slot B holding whatever was there before,
-# so the very first OTA would switch into a half that has never contained a
-# filesystem. super.img is the whole partition with BOTH halves seeded from the
-# same rootfs, which establishes the invariant the design depends on: both halves
-# always contain something bootable.
-#
-# That matters most for the case with no recovery path. A device whose fallback
-# half is garbage looks completely healthy — it boots, it is reachable, nothing
-# reports a problem — right up until an update fails its retries and the
-# bootloader rolls back into an unmountable half. On a unit with no screen, no
-# buttons and no physical access, that is the difference between a failed update
-# and a dead device.
 if [ ! -f "$IMAGE_DIR/super.img" ]; then
 	echo "missing super.img — build it with: just build_super_image" >&2
 	echo "(rootfs.img alone is only half of super; flashing it would leave slot B" >&2
@@ -139,6 +119,63 @@ if [ -f "$IMAGE_DIR/rootfs.img" ]; then
 		fi
 	fi
 fi
+
+# ★★ FLASH THE BOOT CHAIN TO BOTH SLOTS, and disable AVB on both.
+#
+# The old script flashed unsuffixed partitions, which target whichever slot is
+# active, so only ONE slot got our boot chain. `super` is not slotted and
+# super.img seeds both halves with our rootfs, so the other slot ended up
+# pairing a stock/stale kernel with our Debian rootfs half — provably different
+# chains on a live unit (boot_a cd09c736… vs boot_b 130f3a93…).
+#
+# That is the rollback target. A unit that rolls back — because its slot was
+# never committed and the bootloader's retry counter hit zero — lands on a
+# chain that cannot bring our system up, on hardware with no screen and no
+# buttons. Flashing both slots makes a rollback survivable instead of terminal.
+#
+# ⚠ The set-active dance is REQUIRED, not decoration: `oem disable-verification`
+# and `oem disable-verity` apply ONLY to the slot that is active when they run.
+# Flashing our unsigned repacked chain into a slot whose AVB is still enforcing
+# produces the silent-rollback failure documented for the OTA path — the flash
+# reports success, the hashes match, and the slot simply never boots.
+for slot in a b; do
+	echo ">>> preparing slot $slot (set-active, then disable AVB for THAT slot)"
+	fb --set-active=$slot
+	fb oem disable-verification
+	fb oem disable-verity
+	fb_try erase init_boot_$slot
+	fb_try erase boot_$slot
+	fb      flash boot_$slot "$IMAGE_DIR/boot.img"
+	fb_try erase vendor_boot_$slot
+	fb      flash vendor_boot_$slot "$IMAGE_DIR/vendor_boot.img"
+	fb_try erase dtbo_$slot
+	fb      flash dtbo_$slot "$DTBO"
+	fb_try erase vendor_kernel_boot_$slot
+done
+
+# Leave slot A active. Both slots now carry an identical, AVB-permissive chain,
+# so this is a choice of starting point rather than a fallback arrangement.
+fb --set-active=a
+
+fb erase super
+# ★ super.img, NOT rootfs.img — this is the FULL FLASH, and it is what leaves the
+# device in a valid A/B state.
+#
+# rootfs.img is one rootfs sized to fit ONE HALF of super. Flashing it here would
+# land it at offset 0 (slot A) and leave slot B holding whatever was there before,
+# so the very first OTA would switch into a half that has never contained a
+# filesystem. super.img is the whole partition with BOTH halves seeded from the
+# same rootfs, which establishes the invariant the design depends on: both halves
+# always contain something bootable.
+#
+# That matters most for the case with no recovery path. A device whose fallback
+# half is garbage looks completely healthy — it boots, it is reachable, nothing
+# reports a problem — right up until an update fails its retries and the
+# bootloader rolls back into an unmountable half. On a unit with no screen, no
+# buttons and no physical access, that is the difference between a failed update
+# and a dead device.
+# (super.img presence and staleness are checked in the preflight above, before
+# `fb erase super` has had a chance to wipe anything.)
 fb flash super "$IMAGE_DIR/super.img"
 # fb oem uart disable
 fb reboot
