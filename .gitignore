@@ -179,6 +179,14 @@ boot/vendor_boot.img
 # a ~22 GB `repo` tree on its own manifest branch.
 /kernel/source-*/
 
+# The PRE-SPLIT tree path. Nothing on this branch builds from it — `just migrate`
+# moves it to kernel/source-felix — but it comes back the moment anyone builds
+# from `main`, which still uses it, and a stale one can sit here for a long time.
+# It used to be ignored by a tracked kernel/source/.gitignore, which the split
+# removed along with the path. Without this line the tree is untracked AND
+# unignored, so `git add -A` walks 100+ GB and `git status` never comes back.
+/kernel/source/
+
 # Build-pipeline sentinel files written by the Makefile. These moved under
 # build/<device>/ with the multi-device split (and are covered by /build/ above),
 # but the bare names stay ignored so a pre-split checkout — or a stray `make`
