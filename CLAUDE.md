@@ -183,6 +183,11 @@ The same build outputs (`build/<device>/{boot,vendor_boot,rootfs,super}.img`, pl
 
 Note: **fastboot and UART share the one Type-C port** — never `reboot bootloader` mid-UART-session. Switch slots in-OS with `pixel-bootctl set-active-slot` + reboot instead.
 
+**Device state: probe, never assume — this is a hard first-step rule, not advice.** felix has ONE Type-C port, so fastboot (USB) ⊥ UART ⊥ dongle ⊥ gadget are mutually exclusive; at most one is live at any instant. Before asserting which mode the device is in — or acting on that assumption — you MUST run an active probe *in the current turn*:
+- `fastboot devices` returning a serial ⇒ the port is USB/fastboot, and UART is therefore **not** flowing. `uartd status` reporting `connected=true` only means the host-side USB-serial *adapter* is plugged in; it says nothing about whether the phone is driving the line.
+- `uart peek`/`uart read` are **forensic history**, never live state — the daemon runs for days and its buffer can show a login prompt (or a service since removed) from a boot that happened long ago. To confirm the OS is actually up right now, use `uart run <cmd>` / `uart wait <regex>` (a fresh device-verified round-trip), not the buffer.
+- Rule of thumb: if you can't point at a probe command from *this* turn, you don't know the device's mode — so don't state it. This exact error (reading a stale UART buffer as if live, forgetting the one-port invariant) has been corrected repeatedly; it recurs whenever state is asserted from remembered/stale output instead of probed.
+
 ## Sibling repos
 
 This repo is the **substrate / dev platform**; related work lives in sibling repos under the `junkyard-computing` org, beside this one (`../<repo>`), not vendored. The ones relevant to *this* (android-GKI / Debian) track:
@@ -208,7 +213,7 @@ This repo is the **substrate / dev platform**; related work lives in sibling rep
 
 Beyond the obvious `just`, `repo`, `qemu-user-static`: `make`, `e2fsprogs` (for `mkfs.ext4`), `rsync`, `debootstrap`, `systemd-container` (for `systemd-nspawn`), `curl`, `unzip`, `xxd`. `erofs-utils` and `android-sdk-libsparse-utils` are optional and only kick in if a future felix OTA ships the vendor partition in those formats. `nmap` is needed only by [flash-nmap.sh](flash-nmap.sh) (both it and `openssh` are in the flake dev shell); `flash-nmap.sh --hosts-from FILE` skips the scan and needs neither.
 
-**⚠ The toolchains are split across two environments, and neither can do a whole build.** The rootfs stages (`mount_rootfs`, `systemd-nspawn`, the overlay rsync) need root, which is what `tools/dockershell` provides — it runs as uid 1000 *with passwordless sudo*, not as root, so the recipes call `sudo` internally. The Rust cross-builds (`.build_pixel_bootctl`, `.build_pixel_ota`) need the `rustToolchain` from `nix develop`, which the container does **not** have. So:
+**⚠ The toolchains are split across two environments, and neither can do a whole build.** The rootfs stages (`mount_rootfs`, `systemd-nspawn`, the overlay rsync) need root, which is what `tools/dockershell` provides — it runs as uid 1000 *with passwordless sudo*, not as root, so the recipes call `sudo` internally. The Rust cross-builds (`.build_pixel_bootctl`, `.build_pixel_ota`) need cargo, which the container does **not** have. So:
 
 ```shell
 nix develop -c make .build_pixel_ota .build_pixel_bootctl   # Rust, host side
@@ -216,4 +221,4 @@ tools/dockershell make .build_boot KERNEL_VERSION=… …       # rootfs stages,
 nix run .#bazel-fhs -- -c 'just build_kernel'               # kleaf, needs the FHS env
 ```
 
-This only bites when a sentinel that has been satisfied for weeks gets invalidated — bumping either pixel-* submodule gitlink re-triggers its cross-build, and a `tools/dockershell make .build_boot` then dies with a bare `/bin/sh: 2: cargo: not found` several stages in, with nothing to indicate which shell it wanted. Also note `debugfs` (e2fsprogs) is needed on `$PATH` for `flash-nmap.sh --flash`, which refuses to run without it rather than silently disarming its canary.
+This only bites when a sentinel that has been satisfied for weeks gets invalidated — bumping either pixel-* submodule gitlink re-triggers its cross-build. The Rust toolchain now lives in the flake's shared `buildToolsFor`, so **`nix develop`, `nix run .#build` and `nix run .#bazel-fhs` all carry cargo**; it used to be in `devShells.default` alone, which meant the one-command `nix run .#build` ran an hour of kernel and then died on a bare `cargo: not found` while `nix develop` built the same tree fine. The container is the one environment that still can't (by design — it's a Debian image), and both stages now preflight `command -v cargo` and print which toolchain is missing and how to supply it, instead of failing as `/bin/sh: 2: cargo: not found` several stages in with nothing to indicate which shell it wanted. Also note `debugfs` (e2fsprogs) is needed on `$PATH` for `flash-nmap.sh --flash`, which refuses to run without it rather than silently disarming its canary.

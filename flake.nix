@@ -16,6 +16,28 @@
       eachSystem = f: nixpkgs.lib.genAttrs systems
         (s: f (import nixpkgs { system = s; overlays = [ rust-overlay.overlays.default ]; }));
 
+      # Rust toolchain for cross-building tools/pixel-bootctl + tools/pixel-ota to
+      # fully static aarch64-musl binaries. Static musl means zero runtime deps, so
+      # the binary runs unchanged on the Debian rootfs regardless of its glibc/loader
+      # (an earlier glibc cross-build baked a Nix-store ld-linux path and failed to
+      # exec on-device with 203/EXEC). `targets` adds the aarch64-musl std lib
+      # alongside the host std — the host std is still needed so clap's proc-macro
+      # derive compiles for the build machine. No external C cross-linker is
+      # required: .build_pixel_bootctl links via the toolchain's bundled rust-lld,
+      # so the same `cargo build` line also works on non-Nix hosts that have
+      # rustup's aarch64-unknown-linux-musl target installed.
+      #
+      # ★ This belongs in buildToolsFor, NOT in devShells.default alone. It lived
+      # there, and buildToolsFor is the list that BOTH other entry points use — the
+      # `nix run .#build` app and the bazel FHS env. So the one-command build ran an
+      # hour of kernel, then died several stages later on a bare
+      # "sh: line 2: cargo: not found", while `nix develop` built the same tree
+      # fine. It only surfaces when a pixel-* submodule gitlink moves and
+      # re-triggers the cross-build, which is why it hid for so long.
+      rustToolchainFor = pkgs: pkgs.rust-bin.stable.latest.minimal.override {
+        targets = [ "aarch64-unknown-linux-musl" ];
+      };
+
       # Everything the build host needs, grouped by build stage.
       buildToolsFor = pkgs: with pkgs; [
         # --- orchestration ---
@@ -61,6 +83,9 @@
         lz4
         zstd
         gzip
+
+        # --- on-device A/B + OTA tools (.build_pixel_bootctl / .build_pixel_ota) ---
+        (rustToolchainFor pkgs)
       ];
 
       # AOSP / Bazel track (`main`, `feature/btrfs-root`): the vendored
@@ -88,26 +113,14 @@
           # (the AOSP/Bazel path brings its own hermetic toolchain).
           crossCC = pkgs.pkgsCross.aarch64-multiplatform.stdenv.cc;
           crossPrefix = crossCC.targetPrefix; # "aarch64-unknown-linux-gnu-"
-          # Rust toolchain for cross-building tools/pixel-bootctl to a fully
-          # static aarch64-musl binary. Static musl means zero runtime deps, so
-          # the binary runs unchanged on the Debian rootfs regardless of its
-          # glibc/loader (an earlier glibc cross-build baked a Nix-store
-          # ld-linux path and failed to exec on-device with 203/EXEC).
-          # `targets` adds the aarch64-musl std lib alongside the host std — the
-          # host std is still needed so clap's proc-macro derive compiles for the
-          # build machine. No external C cross-linker is required: the Makefile's
-          # .build_pixel_bootctl target links via the toolchain's bundled
-          # rust-lld, so the same `cargo build` line also works on non-Nix hosts
-          # that have rustup's aarch64-unknown-linux-musl target installed.
-          rustToolchain = pkgs.rust-bin.stable.latest.minimal.override {
-            targets = [ "aarch64-unknown-linux-musl" ];
-          };
+          # (rustToolchainFor now lives in buildToolsFor — see the note there for
+          # why keeping it here alone broke `nix run .#build`.)
         in
         {
           # Default: clean shell for the mainline kbuild track, the rootfs
           # stages, image packaging, and flashing.
           default = pkgs.mkShell {
-            packages = buildToolsFor pkgs ++ [ rustToolchain ];
+            packages = buildToolsFor pkgs;
             nativeBuildInputs = [ crossCC ];
             shellHook = ''
               export ARCH=arm64

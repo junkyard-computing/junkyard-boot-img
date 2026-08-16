@@ -77,6 +77,24 @@ set -uo pipefail
 SRC="${1:?usage: kernel-drift.sh <kernel_source_dir> [patch]...}"; shift
 PATCHES=("$@")
 
+# Every remaining argument must be one readable patch file. A bad argument is
+# not a cosmetic complaint here — it produces a FALSE ALL-CLEAR, which is the
+# one outcome this script must never emit. Hit while testing this file from an
+# interactive zsh: `kernel-drift.sh kernel/source $P` with P=$(find …) passes
+# the WHOLE list as a single argument, because zsh does not word-split unquoted
+# parameters the way bash does. Every per-patch test then matches no project and
+# is silently skipped, and — since the caller has already set --assume-unchanged
+# on exactly those files — git reports the tree unmodified too. Verdict: clean,
+# on a tree with a planted edit sitting in it. The Makefile passes a
+# space-separated $(PATCH_FILES) and is unaffected; hand invocations are not.
+for _p in ${PATCHES[@]+"${PATCHES[@]}"}; do
+	[ -f "$_p" ] && continue
+	printf '  FATAL: not a readable patch file: %q\n' "$_p" >&2
+	printf '  (pass each patch as its own argument — from zsh, use an array:\n' >&2
+	printf '   p=(kernel/patches/**/*.patch(N)); tools/kernel-drift.sh kernel/source $p)\n' >&2
+	echo fatal; exit 2
+done
+
 # The only project whose git state feeds CONFIG_LOCALVERSION_AUTO.
 VERSION_PROJECT="aosp"
 
@@ -163,7 +181,24 @@ for proj in "${PROJECTS[@]}"; do
 		[ "$(proj_of "$p")" = "$proj" ] || continue
 		abs=$(readlink -f "$p")
 		if ! (cd "$tgt" && git apply --check --reverse "$abs" >/dev/null 2>&1); then
-			say "DRIFT ($proj): $(basename "$p") is not cleanly applied"
+			# NOT-YET-APPLIED IS NOT DRIFT. This check runs BEFORE the apply
+			# stanza, so on a pristine tree — a fresh clone_kernel_source, or any
+			# `repo sync`, which is the documented path that also drops the
+			# .apply_kernel_patches sentinel — every patch is legitimately absent
+			# and the reverse-check fails for all of them. Treating that as drift
+			# made the FIRST build after a sync abort with "not cleanly applied"
+			# for a tree that had nothing wrong with it, and for a non-version
+			# project (gs201) it escalated to FATAL, so the build could never
+			# reach the code that would have applied the patch.
+			#
+			# A patch that applies FORWARD cleanly is provably absent and intact:
+			# the tree is HEAD, which is exactly the state the apply stanza
+			# expects. Only a patch that goes neither way is real drift — a
+			# partial application, or a tree edited out from under the patch.
+			if (cd "$tgt" && git apply --check "$abs" >/dev/null 2>&1); then
+				continue
+			fi
+			say "DRIFT ($proj): $(basename "$p") neither applies nor is already applied"
 			if [ "$proj" = "$VERSION_PROJECT" ]; then encodable=1; else fatal=1; fi
 			continue
 		fi

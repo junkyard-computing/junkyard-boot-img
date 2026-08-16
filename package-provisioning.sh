@@ -153,8 +153,8 @@ esac
 # The operator verifies phones by reading their displays, so a stale number here
 # would have them approving the wrong image — the template exists to make that
 # impossible to get wrong by hand.
-render_readme() {
-	local tpl="provisioning/README.md.in"
+render_doc() {
+	local tpl="$1" out="$2"
 	[ -f "$tpl" ] || die "missing $tpl"
 	sed -e "s|@DEVICE@|$DEVICE|g" \
 	    -e "s|@DEVICE_MODEL@|$DEVICE_MODEL|g" \
@@ -163,13 +163,13 @@ render_readme() {
 	    -e "s|@IMAGE_BUILD_DATE@|${BUILD_DATE_IMG:-unknown}|g" \
 	    -e "s|@FACTORY_BUILD@|$BUILD_ID|g" \
 	    -e "s|@PACKAGED_DATE@|$(date -u +%Y-%m-%d)|g" \
-	    "$tpl" > "$KIT/README.md"
+	    "$tpl" > "$KIT/$out"
 	# Leaving an unfilled @PLACEHOLDER@ in an operator-facing document is worse
 	# than failing here, so treat it as a build error.
-	if grep -q '@[A-Z_]*@' "$KIT/README.md"; then
-		echo "unfilled placeholders in README:" >&2
-		grep -o '@[A-Z_]*@' "$KIT/README.md" | sort -u | sed 's/^/  /' >&2
-		die "README template not fully rendered"
+	if grep -q '@[A-Z_]*@' "$KIT/$out"; then
+		echo "unfilled placeholders in $out:" >&2
+		grep -o '@[A-Z_]*@' "$KIT/$out" | sort -u | sed 's/^/  /' >&2
+		die "$tpl not fully rendered"
 	fi
 }
 
@@ -195,8 +195,18 @@ KIT="$STAGE/junkyard-provisioning"
 mkdir -p "$KIT/images" "$KIT/factory"
 
 say "staging scripts and README"
-render_readme
-cp provisioning/*.sh "$KIT/"
+# ONE README covering both host operating systems, not one per OS. The steps are
+# identical on Linux and Windows and only the command lines differ, so a second
+# document would be ~60% copied prose -- and the copied part is precisely what
+# the operator checks a phone against (which version string, how many minutes
+# before it counts as stuck). render_doc keeps the VERSIONS in it honest; it
+# cannot keep two sets of prose honest.
+render_doc provisioning/README.md.in README.md
+cp provisioning/*.sh  "$KIT/"
+# The Windows half of the kit: PowerShell twins of the same scripts, including
+# its own flash-fastboot.ps1 (there is no repo checkout on Windows to share one
+# with, the way flash-fastboot.sh is shared below).
+cp provisioning/*.ps1 "$KIT/"
 # The kit uses the SAME flashing script as our own phones, not a copy of it.
 cp flash-fastboot.sh "$KIT/"
 chmod +x "$KIT"/*.sh
@@ -208,9 +218,19 @@ chmod +x "$KIT"/*.sh
 say "staging images"
 ln -s "$here/$BUILD_DIR/boot.img"         "$KIT/images/boot.img"
 ln -s "$here/$BUILD_DIR/vendor_boot.img"  "$KIT/images/vendor_boot.img"
-ln -s "$here/"$SUPER_IMG""        "$KIT/images/super.img"
+ln -s "$here/$SUPER_IMG"       "$KIT/images/super.img"
 ln -s "$here/$DTBO"                 "$KIT/images/dtbo.img"
 printf '%s\n' "$VERSION" > "$KIT/images/VERSION"
+# ★ The kit's own statement of which device it is for. flash-fastboot.sh reads
+# this and REFUSES a phone whose `getvar product` disagrees.
+#
+# Without it that guard is dead in the kit: with no DEVICE set the script adopts
+# the hardware's answer, so DEVICE == PRODUCT by construction and the mismatch
+# test can never fire — in exactly the setting with the most risk (a contractor,
+# a batch of phones, unfamiliar hardware, and `erase super` in the script). The
+# repo checkout has both devices built and can legitimately pick; the kit holds
+# one device's images and must assert which.
+printf '%s\n' "$DEVICE" > "$KIT/images/DEVICE"
 
 # EXTRACT the factory image rather than shipping the zip.
 #
@@ -239,6 +259,12 @@ chmod +x "$KIT/factory"/*.sh 2>/dev/null || true
 # assuming the archive was laid out the way we expect.
 [ -f "$KIT/factory/flash-all.sh" ] \
 	|| die "no flash-all.sh after extracting $FACTORY — unexpected factory image layout"
+# flash-all.bat is what the Windows path runs, and it is checked with the same
+# force as its shell sibling: the two READMEs are shipped side by side, so a
+# factory image missing the .bat would leave a kit that only half works, and
+# the half that is broken is the one nobody here tests on.
+[ -f "$KIT/factory/flash-all.bat" ] \
+	|| die "no flash-all.bat after extracting $FACTORY — the Windows path (README step 4) needs it"
 [ -f "$KIT/factory/$INNER_ZIP" ] \
 	|| die "no $INNER_ZIP after extraction — the inner archive must stay zipped for 'fastboot update'"
 
@@ -262,14 +288,16 @@ factory build : $BUILD_ID   (factory image bundled under factory/)
 packaged       : $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 The factory image under factory/ MUST be the one used. The rootfs carries
-vendor firmware extracted from this same '"$DEVICE"' build, and pairing it with a
+vendor firmware extracted from this same $DEVICE build, and pairing it with a
 different build's bootloader and radio produces failures that look like our
 image is broken.
 
 Verify this kit before use:
-    sha256sum -c SHA256SUMS
+    Linux:    sha256sum -c SHA256SUMS
+    Windows:  powershell -ExecutionPolicy Bypass -File .\\verify-kit.ps1
 
-Then follow README.md from step 1.
+Then follow README.md from step 1. It covers both Linux and Windows; each
+step gives the command for both.
 EOF
 
 # -------------------------------------------------------------------- zip ---
@@ -281,4 +309,5 @@ say "done: $OUT_ABS  ($(du -h "$OUT_ABS" | cut -f1))"
 echo
 echo "  image version : $VERSION"
 echo "  factory build : $BUILD_ID"
-echo "  contents      : README.md, 6 scripts, 4 images, factory image, SHA256SUMS"
+echo "  contents      : README.md, 6 shell + 7 PowerShell scripts, 4 images,"
+echo "                  factory image, SHA256SUMS"
