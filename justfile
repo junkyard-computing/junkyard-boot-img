@@ -260,7 +260,20 @@ clone_kernel_source:
     # sync below would happily start from nothing and re-fetch ~22 GB that is
     # already sitting on this disk under the old name. Nothing would look wrong —
     # it just takes an hour and burns the bandwidth.
-    if [ ! -d "$src" ] && [ -d {{ justfile_directory() }}/kernel/source ]; then
+    #
+    # ★ Only when NO per-device tree exists at all. Once one does, the migration
+    # has happened, and whatever still sits at kernel/source/ is a DIFFERENT tree
+    # — a second checkout of some device, or the one `main` builds from. Either
+    # way it is not this device's tree and must not block bringing up a new one.
+    # Without that clause this guard blocked the first `just lynx` and told the
+    # user to run `just migrate`, which is not the answer for a device that has
+    # simply never been synced.
+    # Portable glob test (compgen is not reliably available in this shell).
+    have_device_tree=0
+    for _t in "{{ justfile_directory() }}"/kernel/source-*; do
+        if [ -d "$_t" ]; then have_device_tree=1; break; fi
+    done
+    if [ ! -d "$src" ] && [ -d {{ justfile_directory() }}/kernel/source ] && [ "$have_device_tree" = 0 ]; then
         echo "REFUSING to sync: kernel/source/ exists but $src does not." >&2
         echo "" >&2
         echo "  This checkout predates the multi-device split. Syncing now would" >&2
