@@ -326,8 +326,23 @@ print-%:
 .install_initramfs:       $(S_INITRD)
 .build_boot:              $(S_BOOT)
 
-$(S_CREATE):
-	mkdir -p $(BUILD_DIR)
+# The per-device artifact directory, an ORDER-ONLY prerequisite (the `|`) of
+# every sentinel below.
+#
+# Order-only, not normal: a directory's mtime changes every time a file is added
+# to it, so a normal prerequisite would make each finished stage look older than
+# its own output directory and re-trigger the whole chain on the next run.
+#
+# And on EVERY sentinel, not just the first. `mkdir -p` used to live in the
+# .create_image recipe alone, but .apply_kernel_patches does not depend on
+# .create_image — the kernel and rootfs halves of the graph are independent — so
+# on a device with no build/<device>/ yet, the first thing to run was
+#     touch: cannot touch 'build/lynx/.apply_kernel_patches': No such file or directory
+# felix never hit it because `just migrate` had already created build/felix/.
+$(BUILD_DIR):
+	mkdir -p $@
+
+$(S_CREATE): | $(BUILD_DIR)
 	mkdir -p $(SYSROOT_DIR)
 	# Use truncate, not fallocate: truncate makes a sparse file (8100M nominal but
 	# only the written blocks occupy host disk; `just trim_rootfs` keeps it that
@@ -337,7 +352,7 @@ $(S_CREATE):
 	sudo mkfs.ext4 -F -L rootfs $(ROOTFS_IMG)
 	touch $@
 
-$(S_DEBOOT): $(S_CREATE)
+$(S_DEBOOT): $(S_CREATE) | $(BUILD_DIR)
 	just device=$(DEVICE) mount_rootfs
 	# Trailing $(MIRROR) pins the archive to the snapshot.debian.org timestamp
 	# in rootfs/debian_snapshot; empty MIRROR => debootstrap's default mirror.
@@ -407,7 +422,7 @@ $(S_DEBOOT): $(S_CREATE)
 # exist, and aborts the whole build.
 PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune -o -name '*.patch' -print 2>/dev/null | sort)
 
-$(S_PATCH): $(PATCH_FILES)
+$(S_PATCH): $(PATCH_FILES) | $(BUILD_DIR)
 	# Decide whether the patched files may be hidden from git's dirty check.
 	#
 	# `-dirty` should mean "there is uncommitted work in this kernel", NOT "a patch
@@ -487,7 +502,7 @@ $(S_PATCH): $(PATCH_FILES)
 	done
 	touch $@
 
-$(S_KERNEL): $(S_PATCH) kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_defconfig_mod/custom_defconfig
+$(S_KERNEL): $(S_PATCH) kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_defconfig_mod/custom_defconfig | $(BUILD_DIR)
 	cd $(KERNEL_SOURCE_DIR); $(BAZEL) run \
 		--config=use_source_tree_aosp \
 		--config=stamp \
@@ -536,11 +551,11 @@ $(S_KERNEL): $(S_PATCH) kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_de
 	printf '%s\n' "$$KVER" > $(KERNEL_VERSION_FILE)
 	touch $@
 
-$(S_SYNCFW):
+$(S_SYNCFW): | $(BUILD_DIR)
 	just device=$(DEVICE) sync_vendor_firmware
 	touch $@
 
-$(S_INSTFW): $(S_DEBOOT) $(S_SYNCFW)
+$(S_INSTFW): $(S_DEBOOT) $(S_SYNCFW) | $(BUILD_DIR)
 	just device=$(DEVICE) mount_rootfs
 	sudo mkdir -p $(SYSROOT_DIR)/vendor/firmware
 	# --chown=root:root for the same reason as the overlay rsync: the extracted
@@ -607,7 +622,7 @@ endef
 # the fleet's keys must rebuild the image) but must not be a hard prerequisite
 # when absent, or a fresh checkout without one would fail with "No rule to make
 # target". The absent case is handled with a loud warning in the recipe instead.
-$(S_PKGS): $(S_DEBOOT) .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt $(wildcard $(SSH_AUTHORIZED_KEYS))
+$(S_PKGS): $(S_DEBOOT) .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt $(wildcard $(SSH_AUTHORIZED_KEYS)) | $(BUILD_DIR)
 	just device=$(DEVICE) mount_rootfs
 	# apt tuning for the snapshot.debian.org mirror (all harmless on the live
 	# mirror, so written unconditionally):
@@ -768,7 +783,7 @@ $(S_PKGS): $(S_DEBOOT) .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE
 	just device=$(DEVICE) unmount_rootfs
 	touch $@
 
-$(S_INSTK): $(S_KERNEL) $(S_PKGS)
+$(S_INSTK): $(S_KERNEL) $(S_PKGS) | $(BUILD_DIR)
 	just device=$(DEVICE) mount_rootfs
 	sudo mkdir -p $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)
 	sudo cp $(KERNEL_BUILD_DIR)/modules.builtin $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/
@@ -882,7 +897,7 @@ $(S_INSTK): $(S_KERNEL) $(S_PKGS)
 	just device=$(DEVICE) unmount_rootfs
 	touch $@
 
-$(S_INITRD): $(S_INSTK) $(S_PKGS) $(S_INSTFW)
+$(S_INITRD): $(S_INSTK) $(S_PKGS) $(S_INSTFW) | $(BUILD_DIR)
 	just device=$(DEVICE) mount_rootfs
 	# Bundle aoc.bin into the initramfs at the path firmware_class.path
 	# (/vendor/firmware, set by the dtb's /chosen/bootargs) points at.
@@ -1043,7 +1058,7 @@ install_arm_blobs: $(S_PKGS)
 # /etc/cmdline.d for dracut's own parsing, where systemd-udevd never sees it.
 # Being on the real cmdline also means it applies in the real root too, where
 # the same wedge otherwise burns 130s post-boot.
-$(S_BOOT): $(S_INITRD) $(S_INSTFW)
+$(S_BOOT): $(S_INITRD) $(S_INSTFW) | $(BUILD_DIR)
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
 		--cmdline "root=/dev/mapper/rootfs udev.event_timeout=20" \
