@@ -1,5 +1,20 @@
 # Changelog
 
+## [1.7.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.6.0...v1.7.0) (2026-08-18)
+
+
+### Features
+
+* **build:** multi-device build — felix + lynx as equal citizens ([0ae7d2b](https://github.com/junkyard-computing/junkyard-boot-img/commit/0ae7d2b501282b15b2099e8e3a2d000762740086))
+
+
+### Bug Fixes
+
+* **build:** a half-finished debootstrap poisoned the image permanently ([4acd3b8](https://github.com/junkyard-computing/junkyard-boot-img/commit/4acd3b8bb7f7d7143b40cbb1c6b7ed580b82e0ca))
+* **build:** create build/&lt;device&gt;/ before ANY sentinel writes into it ([8334a2c](https://github.com/junkyard-computing/junkyard-boot-img/commit/8334a2c4482107fc7da98e76c0d85845e7c59932))
+* **build:** the migrate guard blocked bringing up a NEW device ([5badfed](https://github.com/junkyard-computing/junkyard-boot-img/commit/5badfed0da3137448953ee1573ee67f05658ec53))
+* **gitignore:** ignore the pre-split kernel/source path ([8b656f3](https://github.com/junkyard-computing/junkyard-boot-img/commit/8b656f351daff42db0f2c37c9d5949b2462f51d8))
+
 ## [1.6.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.5.1...v1.6.0) (2026-08-12)
 
 
