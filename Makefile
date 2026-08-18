@@ -353,6 +353,25 @@ $(S_CREATE): | $(BUILD_DIR)
 	touch $@
 
 $(S_DEBOOT): $(S_CREATE) | $(BUILD_DIR)
+	# ★ START FROM AN EMPTY FILESYSTEM, ALWAYS.
+	#
+	# debootstrap's first stage unpacks each .deb with plain `tar`, which does
+	# NOT overwrite. Run it over a sysroot that already has content and it dies:
+	#     tar: ./etc/apt/apt.conf.d/01autoremove: Cannot open: File exists
+	#     E: Tried to extract package, but tar failed.
+	#
+	# So ANY interrupted debootstrap — a dropped connection to the (slow,
+	# rate-limited) snapshot mirror, a Ctrl-C, a failure in this recipe after the
+	# unpack — leaves the image populated but the sentinel unwritten. Every retry
+	# then fails on the FIRST package, with an error naming tar rather than the
+	# actual problem, and the only cure was `just clean_rootfs` — which nothing
+	# told you about. Measured on the first lynx bring-up.
+	#
+	# mkfs is cheap here (the image is sparse and nothing but debootstrap owns
+	# this filesystem), and it makes the stage genuinely re-runnable. Unmount
+	# first: mkfs on a mounted image would corrupt it.
+	just device=$(DEVICE) unmount_rootfs
+	sudo mkfs.ext4 -F -L rootfs $(ROOTFS_IMG)
 	just device=$(DEVICE) mount_rootfs
 	# Trailing $(MIRROR) pins the archive to the snapshot.debian.org timestamp
 	# in rootfs/debian_snapshot; empty MIRROR => debootstrap's default mirror.
