@@ -1,14 +1,73 @@
-.PHONY: all clean clean_image stamp_version install_arm_blobs
+.PHONY: all clean clean_image stamp_version install_arm_blobs print-%
 
 # This Makefile is driven by the justfile; most variables come in via env.
 # Targets with a leading "." are sentinel files that track whether a stage has
 # completed successfully, so reruns skip already-finished work.
 
+# ═══ DEVICE SELECTION ════════════════════════════════════════════════════════
+#
+# Which gs201 Pixel this build targets. Selects the per-device config fragment
+# (kernel branch, Bazel target/config, vendor-firmware OTA, super size, hostname).
+# Default felix, so a bare `make` / `just all` behaves exactly as it did before
+# the multi-device split. `make ... DEVICE=lynx` (or `just device=lynx all`)
+# builds the other one.
+#
+# DEVICE is also STAMPED INTO THE IMAGE (/etc/image-device, and IMAGE_DEVICE in
+# os-release) by stamp_version, and flash-nmap.sh refuses to write an image to a
+# device whose stamp disagrees. That gate matters specifically because lynx is
+# ALSO gs201 — `//private/devices/google/lynx:gs201_lynx_dist` — so flash-nmap's
+# device-tree match (default 'felix|gs201') accepts a lynx device just as happily
+# as a felix one, and IMAGE_VERSION is derived from the commit and kernel, so two
+# images built from ONE commit for TWO devices are byte-identical in every other
+# field the tool compares. The images are genuinely incompatible (different
+# kernel branch, different vendor firmware), and a MIGRATION writes the whole
+# partition and destroys both halves before anything can reject it. See the
+# IMAGE_DEVICE stamp in stamp_version.
+# ★ NO DEFAULT, deliberately. felix and lynx are equal citizens, and a default is
+# a preference: it silently decides which device a bare command acts on. An
+# unnoticed default costs an hour of rebuild at best, and writes the wrong
+# device's image to real hardware at worst. `just felix` / `just lynx` / `just
+# all` supply it; anything else must say so.
+#
+# This is the single enforcement point — the justfile passes DEVICE= through on
+# every make call, so a `just mount_rootfs` with no device stops here rather than
+# quietly operating on build//.
+ifeq ($(strip $(DEVICE)),)
+$(error DEVICE is not set. Use `just felix` / `just lynx` / `just all`, or pass DEVICE=<device> (known: $(patsubst devices/%.mk,%,$(wildcard devices/*.mk))))
+endif
+ifeq ($(wildcard devices/$(DEVICE).mk),)
+$(error unknown DEVICE '$(DEVICE)' — no devices/$(DEVICE).mk (known: $(patsubst devices/%.mk,%,$(wildcard devices/*.mk))))
+endif
+include devices/$(DEVICE).mk
+
+# All per-device build artifacts — sentinels, rootfs.img, super.img, boot images,
+# the extracted vendor firmware, the module-order list and the kernel-staging
+# unpack tree — live under here, so felix and lynx never clobber each other and
+# switching between them is incremental. The expensive caches are per-device too:
+# the ~1hr kernel build lands in out/$(BAZEL_CONFIG)/dist and the ~2GB OTA under
+# $(BUILD_DIR)/vendor-firmware/. `build/` is gitignored.
+BUILD_DIR := build/$(DEVICE)
+
+# Per-device sentinel paths. .build_pixel_bootctl / .build_pixel_ota stay at the
+# repo root (see below) because they are device-agnostic gs201 binaries — one
+# build feeds both devices' overlay.
+S_PATCH  := $(BUILD_DIR)/.apply_kernel_patches
+S_CREATE := $(BUILD_DIR)/.create_image
+S_DEBOOT := $(BUILD_DIR)/.debootstrap
+S_KERNEL := $(BUILD_DIR)/.build_kernel
+S_SYNCFW := $(BUILD_DIR)/.sync_vendor_firmware
+S_INSTFW := $(BUILD_DIR)/.install_vendor_firmware
+S_PKGS   := $(BUILD_DIR)/.install_packages
+S_INSTK  := $(BUILD_DIR)/.install_kernel
+S_INITRD := $(BUILD_DIR)/.install_initramfs
+S_BOOT   := $(BUILD_DIR)/.build_boot
+
 RELEASE ?= trixie
 ROOT_PW ?= 0000
 USER_LOGIN ?= kalm
 USER_PW ?= 0000
-HOSTNAME ?= fold
+# HOSTNAME, SIZE and SUPER_BYTES come from devices/$(DEVICE).mk — see the fragment
+# for each. The justfile passes them on the command line only when overridden.
 # Public SSH keys baked into the image for $(USER_LOGIN), one per line.
 #
 # ★ This is not a convenience — without it the OTA path destroys its own access.
@@ -35,17 +94,31 @@ SSH_AUTHORIZED_KEYS ?= rootfs/authorized_keys
 -include rootfs/kmscon.env
 KMSCON_URL ?= https://snapshot.debian.org/file/19dae225043718dfcbf02b50a7fcbedbfe4ab262
 KMSCON_SHA256 ?= 5a200898513a82cac4f9262f7c20fe4b2bfc6d1d57045ab5f7d9ee0b9ca07a4f
-# felix's super partition is 2082816 × 4096B = 8136.9 MiB; 8100M leaves a small
-# margin so fastboot doesn't reject on a slightly-oversized image.
-# Sized to fit ONE HALF of `super`, not all of it. super is 8136 MiB, split into
-# two 4068 MiB rootfs slots that the initramfs maps one at a time (see the
-# rootfs-slot dracut module); 4000M leaves a little slack inside a half. Raising
-# this past 4068 silently produces an image that overruns slot A into slot B.
-SIZE ?= 4000M
+# SYSROOT_DIR is the MOUNTPOINT, not content, so it is deliberately shared
+# between devices: only one device's $(ROOTFS_IMG) is ever mounted there at a
+# time, and the content all lives in that per-device image.
 SYSROOT_DIR ?= rootfs/sysroot
 
-KERNEL_SOURCE_DIR ?= kernel/source
-KERNEL_BUILD_DIR ?= $(KERNEL_SOURCE_DIR)/out/felix/dist
+# One `repo` checkout PER DEVICE, each pinned to its own manifest branch
+# ($(KERNEL_BRANCH) from the device fragment).
+#
+# ★ Why not one shared tree: `repo init -b <branch>` + `repo sync` is how the
+# branch is selected, and a sync reverts EVERYTHING under the tree — including
+# the kernel/patches/ content, which is the whole reason .apply_kernel_patches
+# exists. A shared tree would therefore have to re-init and re-sync on every
+# switch between devices, so building both could never be a cheap no-op rerun,
+# and any uncommitted kernel work would be reverted twice per `just all`.
+# Separate trees cost ~22 GB each and make each device's kernel independent.
+KERNEL_SOURCE_DIR := kernel/source-$(DEVICE)
+# Bazel builds into out/<config>/dist; BAZEL_CONFIG comes from the device
+# fragment. `:=` rather than `?=` so it always tracks $(DEVICE) even if the
+# justfile leaves a stale KERNEL_BUILD_DIR in the environment.
+KERNEL_BUILD_DIR := $(KERNEL_SOURCE_DIR)/out/$(BAZEL_CONFIG)/dist
+# Per-device, because the two devices build different kernel branches and every
+# /lib/modules/<ver>/ path downstream keys on this value. Kept under kernel/
+# rather than $(BUILD_DIR) because the justfile reads it at PARSE time, before
+# any recipe (and therefore before $(BUILD_DIR)) exists. Gitignored.
+KERNEL_VERSION_FILE := kernel/kernel_version.$(DEVICE)
 APT_PACKAGES_FILE ?= rootfs/packages.txt
 
 # Sysroot-relative paths retired from rootfs/overlay/. See the rm -f in
@@ -56,8 +129,18 @@ RETIRED_OVERLAY_PATHS ?= \
 	etc/systemd/system/multi-user.target.wants/slot-autocommit.service \
 	etc/systemd/system/multi-user.target.wants/netcheck-recover.service \
 	etc/systemd/system/multi-user.target.wants/mark-slot-successful.service
-MODULE_ORDER_PATH ?= rootfs/module_order.txt
-ROOTFS_IMG ?= boot/rootfs.img
+# Per-device: this list is composed from THIS device's kernel staging archives
+# and is consumed by dracut --force-drivers. Sharing one path between devices
+# lets a lynx build leave a lynx module list behind that a later felix
+# .install_initramfs (re-triggered by, say, an overlay edit, without
+# .install_kernel re-running) would force-load into a felix initramfs.
+MODULE_ORDER_PATH := $(BUILD_DIR)/module_order.txt
+# Kernel module/header staging is unpacked here. Per-device for the same reason:
+# tar overlays and never deletes, so a shared tree mixes two kernels' modules.
+UNPACK_DIR := $(BUILD_DIR)/unpack
+ROOTFS_IMG := $(BUILD_DIR)/rootfs.img
+BOOT_IMG := $(BUILD_DIR)/boot.img
+VENDOR_BOOT_IMG := $(BUILD_DIR)/vendor_boot.img
 
 # ═══ FULL-FLASH IMAGE (`super.img`) ══════════════════════════════════════════
 #
@@ -85,19 +168,29 @@ ROOTFS_IMG ?= boot/rootfs.img
 # defining property is that nobody can reach it. Seeding both costs one extra
 # 4068 MiB write, once, and makes the first real upgrade rollback-safe.
 #
-# ⚠ SUPER_BYTES is felix's `super` and must match the TARGET device, not the build
-# host. Confirmed identical on all three felixes: 0x1FC800000 = 8136 MiB exactly.
-# The initramfs halves the REAL device at runtime, so a wrong value here does not
-# corrupt anything — it produces an image that does not line up with the mapping,
-# which the hook's fit check then rejects.
-SUPER_IMG   ?= boot/super.img
-SUPER_BYTES ?= 8531214336
+# ⚠ SUPER_BYTES must match the TARGET device, not the build host. It comes from
+# devices/$(DEVICE).mk. The initramfs halves the REAL device at runtime, so a
+# wrong value here does not corrupt anything — it produces an image that does not
+# line up with the mapping, which the hook's fit check then rejects.
+#
+# Measured on both devices so far: felix and lynx are byte-identical at
+# 0x1FC800000 = 8136 MiB exactly. That coincidence is NOT a licence to hardcode
+# it — it stays per-device because a third gs201 Pixel need not match.
+SUPER_IMG := $(BUILD_DIR)/super.img
 # Half, 4K-aligned exactly as rootfs-slot.sh computes it (sectors/2, minus %8).
 SUPER_HALF_BYTES := $(shell echo $$(( ( ($(SUPER_BYTES)/512/2) - ($(SUPER_BYTES)/512/2) % 8 ) * 512 )))
 MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
-BAZEL ?= kernel/source/tools/bazel
+# ABSOLUTE, deliberately: .build_kernel does `cd $(KERNEL_SOURCE_DIR); $(BAZEL)`,
+# so a path relative to the repo root stops resolving the moment we cd into the
+# tree. This used to work by accident — the justfile exported BAZEL as an
+# absolute path, overriding the Makefile's relative `?=` default. That export is
+# gone (the layout is derived from $(DEVICE) here now), so the absoluteness has
+# to be stated rather than inherited.
+BAZEL := $(abspath $(KERNEL_SOURCE_DIR))/tools/bazel
 OVERLAY_DIR ?= rootfs/overlay
-VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
+# Per-device: each device's OTA supplies its own /vendor/firmware. Also keeps the
+# ~2GB download cached per-device, so switching back and forth doesn't re-fetch.
+VENDOR_FIRMWARE_STAGE := $(BUILD_DIR)/vendor-firmware/extracted
 
 # ARM NDA GPU userland blobs (Mali Vulkan + OpenCL). Committed only as an
 # age-encrypted, rootfs-rooted overlay tarball, encrypted to every pubkey in
@@ -179,29 +272,10 @@ BUILD_DATE ?= $(shell date -u +%Y-%m-%d)
 # variable set, no file, and the marker-count identity check still applies.
 FLEET_ID ?=
 
-# Which DEVICE this image is built for. Stamped into /etc/image-device so the
-# image can be matched against the hardware before it is written.
-#
-# ★ Nothing else in the rootfs identifies the target. IMAGE_VERSION is derived
-# from the commit and the kernel, so two images built from one commit for two
-# different devices are byte-identical in every field flash-nmap.sh compares:
-# same version, same fleet id, same overlay markers.
-#
-# ★★ And the device-tree check does NOT separate them, because lynx (Pixel 7a) is
-# ALSO gs201 — `//private/devices/google/lynx:gs201_lynx_dist`. flash-nmap's
-# default `--match 'felix|gs201'` therefore matches a lynx device just as happily
-# as a felix one. So without this stamp every gate in the tool passes for a
-# felix image aimed at lynx hardware: it authorises our key, it runs our overlay,
-# it reports the expected version, it carries the right fleet id. The images are
-# genuinely incompatible — different kernel branch, different vendor firmware —
-# and an in-layout upgrade would at least fail AVB on the inactive slot and roll
-# back, but a MIGRATION writes the whole partition and destroys both halves
-# before anything gets the chance to reject it.
-#
-# Default felix so this branch (felix-only) keeps building unchanged; on the
-# multi-device branch DEVICE is already the real variable that selects
-# devices/$(DEVICE).mk, so this picks it up with no further wiring.
-DEVICE ?= felix
+# NOTE: DEVICE is defined at the top of this file, where it also selects
+# devices/$(DEVICE).mk. It is stamped into the image by stamp_version — see the
+# DEVICE SELECTION block for why that stamp is what stops a felix image being
+# written to lynx hardware.
 
 # Wrap nspawn invocations through tools/nspawn-wrap.sh so each one starts
 # from a known-good sysroot/dev (no leftover mounts, no stale /dev/pts).
@@ -222,7 +296,53 @@ all:
 	@echo "Use 'just all' instead so KERNEL_VERSION and friends are exported."
 	@just --list
 
-.create_image:
+# Report a variable's resolved value, e.g. `make print-ROOTFS_IMG DEVICE=lynx`.
+# The justfile uses this so it never has to re-derive the build layout.
+print-%:
+	@echo "$($*)"
+
+# Friendly stage names. The REAL targets are the per-device sentinel paths
+# ($(BUILD_DIR)/.build_boot and friends), but `make .build_boot DEVICE=lynx` is
+# what the justfile invokes and what everyone types by hand, so keep the short
+# names working as phony aliases.
+#
+# .PHONY matters here beyond the usual reason: a pre-split checkout still has
+# real, empty `.build_boot`-style files sitting in the repo root. Without PHONY,
+# make would see those as up-to-date targets and do nothing at all — silently
+# skipping the entire build, which is precisely the class of failure the sentinel
+# comments elsewhere in this file keep warning about. (`just migrate` relocates
+# them, but this must not depend on that having been run.)
+.PHONY: .create_image .debootstrap .apply_kernel_patches .build_kernel \
+        .sync_vendor_firmware .install_vendor_firmware .install_packages \
+        .install_kernel .install_initramfs .build_boot
+.create_image:            $(S_CREATE)
+.debootstrap:             $(S_DEBOOT)
+.apply_kernel_patches:    $(S_PATCH)
+.build_kernel:            $(S_KERNEL)
+.sync_vendor_firmware:    $(S_SYNCFW)
+.install_vendor_firmware: $(S_INSTFW)
+.install_packages:        $(S_PKGS)
+.install_kernel:          $(S_INSTK)
+.install_initramfs:       $(S_INITRD)
+.build_boot:              $(S_BOOT)
+
+# The per-device artifact directory, an ORDER-ONLY prerequisite (the `|`) of
+# every sentinel below.
+#
+# Order-only, not normal: a directory's mtime changes every time a file is added
+# to it, so a normal prerequisite would make each finished stage look older than
+# its own output directory and re-trigger the whole chain on the next run.
+#
+# And on EVERY sentinel, not just the first. `mkdir -p` used to live in the
+# .create_image recipe alone, but .apply_kernel_patches does not depend on
+# .create_image — the kernel and rootfs halves of the graph are independent — so
+# on a device with no build/<device>/ yet, the first thing to run was
+#     touch: cannot touch 'build/lynx/.apply_kernel_patches': No such file or directory
+# felix never hit it because `just migrate` had already created build/felix/.
+$(BUILD_DIR):
+	mkdir -p $@
+
+$(S_CREATE): | $(BUILD_DIR)
 	mkdir -p $(SYSROOT_DIR)
 	# Use truncate, not fallocate: truncate makes a sparse file (8100M nominal but
 	# only the written blocks occupy host disk; `just trim_rootfs` keeps it that
@@ -232,8 +352,27 @@ all:
 	sudo mkfs.ext4 -F -L rootfs $(ROOTFS_IMG)
 	touch $@
 
-.debootstrap: .create_image
-	just mount_rootfs
+$(S_DEBOOT): $(S_CREATE) | $(BUILD_DIR)
+	# ★ START FROM AN EMPTY FILESYSTEM, ALWAYS.
+	#
+	# debootstrap's first stage unpacks each .deb with plain `tar`, which does
+	# NOT overwrite. Run it over a sysroot that already has content and it dies:
+	#     tar: ./etc/apt/apt.conf.d/01autoremove: Cannot open: File exists
+	#     E: Tried to extract package, but tar failed.
+	#
+	# So ANY interrupted debootstrap — a dropped connection to the (slow,
+	# rate-limited) snapshot mirror, a Ctrl-C, a failure in this recipe after the
+	# unpack — leaves the image populated but the sentinel unwritten. Every retry
+	# then fails on the FIRST package, with an error naming tar rather than the
+	# actual problem, and the only cure was `just clean_rootfs` — which nothing
+	# told you about. Measured on the first lynx bring-up.
+	#
+	# mkfs is cheap here (the image is sparse and nothing but debootstrap owns
+	# this filesystem), and it makes the stage genuinely re-runnable. Unmount
+	# first: mkfs on a mounted image would corrupt it.
+	just device=$(DEVICE) unmount_rootfs
+	sudo mkfs.ext4 -F -L rootfs $(ROOTFS_IMG)
+	just device=$(DEVICE) mount_rootfs
 	# Trailing $(MIRROR) pins the archive to the snapshot.debian.org timestamp
 	# in rootfs/debian_snapshot; empty MIRROR => debootstrap's default mirror.
 	# --components: debootstrap defaults to `main` only, and writes the
@@ -261,7 +400,7 @@ all:
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) symlinks -cr .
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo root:$(ROOT_PW) | chpasswd"
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) sh -c "echo $(HOSTNAME) > /etc/hostname"
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 	touch $@
 
 # Must build inside the flake's FHS shell so kleaf's host tools (python3, perl, bash,
@@ -302,7 +441,7 @@ all:
 # exist, and aborts the whole build.
 PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune -o -name '*.patch' -print 2>/dev/null | sort)
 
-.apply_kernel_patches: $(PATCH_FILES)
+$(S_PATCH): $(PATCH_FILES) | $(BUILD_DIR)
 	# Decide whether the patched files may be hidden from git's dirty check.
 	#
 	# `-dirty` should mean "there is uncommitted work in this kernel", NOT "a patch
@@ -382,14 +521,14 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	done
 	touch $@
 
-.build_kernel: .apply_kernel_patches kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_defconfig_mod/custom_defconfig
+$(S_KERNEL): $(S_PATCH) kernel/custom_defconfig_mod/BUILD.bazel kernel/custom_defconfig_mod/custom_defconfig | $(BUILD_DIR)
 	cd $(KERNEL_SOURCE_DIR); $(BAZEL) run \
 		--config=use_source_tree_aosp \
 		--config=stamp \
-		--config=felix \
+		--config=$(BAZEL_CONFIG) \
 		--config=local \
 		--defconfig_fragment=//custom_defconfig_mod:custom_defconfig \
-		//private/devices/google/felix:gs201_felix_dist
+		$(BAZEL_TARGET)
 	@echo "Updating kernel version string"
 	# Derive KERNEL_VERSION from the module staging archive, NOT from `strings Image`.
 	#
@@ -423,20 +562,20 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	           | grep -oE 'lib/modules/[^/]+' | head -n 1 | cut -d/ -f3); \
 	if [ -z "$$KVER" ]; then \
 		echo "ERROR: could not determine kernel version from vendor_dlkm_staging_archive.tar.gz"; \
-		echo "       REFUSING to blank kernel/kernel_version (an empty value breaks"; \
+		echo "       REFUSING to blank $(KERNEL_VERSION_FILE) (an empty value breaks"; \
 		echo "       every /lib/modules/<ver>/ path and wipes the module tree)."; \
 		exit 1; \
 	fi; \
 	echo "  kernel version: $$KVER"; \
-	printf '%s\n' "$$KVER" > kernel/kernel_version
+	printf '%s\n' "$$KVER" > $(KERNEL_VERSION_FILE)
 	touch $@
 
-.sync_vendor_firmware:
-	just sync_vendor_firmware
+$(S_SYNCFW): | $(BUILD_DIR)
+	just device=$(DEVICE) sync_vendor_firmware
 	touch $@
 
-.install_vendor_firmware: .debootstrap .sync_vendor_firmware
-	just mount_rootfs
+$(S_INSTFW): $(S_DEBOOT) $(S_SYNCFW) | $(BUILD_DIR)
+	just device=$(DEVICE) mount_rootfs
 	sudo mkdir -p $(SYSROOT_DIR)/vendor/firmware
 	# --chown=root:root for the same reason as the overlay rsync: the extracted
 	# staging tree is owned by the build user (uid 1000 = $(USER_LOGIN) on the
@@ -444,7 +583,7 @@ PATCH_FILES := $(shell find kernel/patches -path kernel/patches/rejected -prune 
 	# owns /vendor/firmware and everything in it — including aoc.bin, which the
 	# firmware loader reads and without which the device does not boot.
 	sudo rsync -a --chown=root:root $(VENDOR_FIRMWARE_STAGE)/firmware/ $(SYSROOT_DIR)/vendor/firmware/
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 	touch $@
 
 # WHY A PREFLIGHT: the toolchains are split across environments — the rootfs
@@ -502,8 +641,8 @@ endef
 # the fleet's keys must rebuild the image) but must not be a hard prerequisite
 # when absent, or a fresh checkout without one would fail with "No rule to make
 # target". The absent case is handled with a loud warning in the recipe instead.
-.install_packages: .debootstrap .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt $(wildcard $(SSH_AUTHORIZED_KEYS))
-	just mount_rootfs
+$(S_PKGS): $(S_DEBOOT) .build_pixel_bootctl .build_pixel_ota $(APT_PACKAGES_FILE) $(OVERLAY_FILES) version.txt $(wildcard $(SSH_AUTHORIZED_KEYS)) | $(BUILD_DIR)
+	just device=$(DEVICE) mount_rootfs
 	# apt tuning for the snapshot.debian.org mirror (all harmless on the live
 	# mirror, so written unconditionally):
 	#   Check-Valid-Until false  - snapshot Release files carry an old
@@ -660,11 +799,11 @@ endef
 	# `stamp_version` target (run by `just all` after .build_boot) so it is
 	# recomputed every build and reflects the actual kernel, not whatever was
 	# stamped the first time this (sentinel-gated) stage ran. See IMAGE_VERSION.
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 	touch $@
 
-.install_kernel: .build_kernel .install_packages
-	just mount_rootfs
+$(S_INSTK): $(S_KERNEL) $(S_PKGS) | $(BUILD_DIR)
+	just device=$(DEVICE) mount_rootfs
 	sudo mkdir -p $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)
 	sudo cp $(KERNEL_BUILD_DIR)/modules.builtin $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/
 	sudo cp $(KERNEL_BUILD_DIR)/modules.builtin.modinfo $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/
@@ -690,13 +829,13 @@ endef
 	# the sysroot sweep ran, and the module shipped anyway.
 	for staging in vendor_dlkm system_dlkm; \
 	do \
-		sudo rm -rf rootfs/unpack/"$$staging"; \
-		sudo mkdir -p rootfs/unpack/"$$staging" && \
+		sudo rm -rf $(UNPACK_DIR)/"$$staging"; \
+		sudo mkdir -p $(UNPACK_DIR)/"$$staging" && \
 		sudo tar \
 			-xvzf $(KERNEL_BUILD_DIR)/"$$staging"_staging_archive.tar.gz \
-			-C rootfs/unpack/"$$staging"; \
-		sudo rsync -avK --include='*/' --include='*.ko' --exclude='*' rootfs/unpack/"$$staging"/ $(SYSROOT_DIR)/; \
-		sudo sh -c "cat rootfs/unpack/\"$$staging\"/lib/modules/$(KERNEL_VERSION)/modules.order \
+			-C $(UNPACK_DIR)/"$$staging"; \
+		sudo rsync -avK --include='*/' --include='*.ko' --exclude='*' $(UNPACK_DIR)/"$$staging"/ $(SYSROOT_DIR)/; \
+		sudo sh -c "cat $(UNPACK_DIR)/\"$$staging\"/lib/modules/$(KERNEL_VERSION)/modules.order \
 			>> $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/modules.order"; \
 	done
 	@echo "Updating System.map"
@@ -708,11 +847,11 @@ endef
 		--filesyms /boot/System.map-$(KERNEL_VERSION) \
 		$(KERNEL_VERSION)
 	@echo "Copying kernel headers"
-	sudo mkdir -p rootfs/unpack/kernel_headers
+	sudo mkdir -p $(UNPACK_DIR)/kernel_headers
 	sudo tar \
 		-xvzf $(KERNEL_BUILD_DIR)/kernel-headers.tar.gz \
-		-C rootfs/unpack/kernel_headers
-	sudo cp -r rootfs/unpack/kernel_headers $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION)
+		-C $(UNPACK_DIR)/kernel_headers
+	sudo cp -r $(UNPACK_DIR)/kernel_headers $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION)
 	sudo ln -rsf $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION) $(SYSROOT_DIR)/lib/modules/$(KERNEL_VERSION)/build
 	sudo cp $(KERNEL_BUILD_DIR)/kernel_aarch64_Module.symvers $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION)/
 	sudo cp $(KERNEL_BUILD_DIR)/vmlinux.symvers $(SYSROOT_DIR)/usr/src/linux-headers-$(KERNEL_VERSION)/
@@ -774,11 +913,11 @@ endef
 	sudo find $(SYSROOT_DIR)/boot -mindepth 1 -maxdepth 1 \
 		\( -name 'initrd.img-*' -o -name 'System.map-*' \) \
 		! -name '*-$(KERNEL_VERSION)' -exec rm -f {} +
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 	touch $@
 
-.install_initramfs: .install_kernel .install_packages .install_vendor_firmware
-	just mount_rootfs
+$(S_INITRD): $(S_INSTK) $(S_PKGS) $(S_INSTFW) | $(BUILD_DIR)
+	just device=$(DEVICE) mount_rootfs
 	# Bundle aoc.bin into the initramfs at the path firmware_class.path
 	# (/vendor/firmware, set by the dtb's /chosen/bootargs) points at.
 	# Without it, the AOC coprocessor retry-loops in dracut and starves
@@ -833,7 +972,7 @@ endef
 		--install /vendor/firmware/aoc.bin \
 		--kernel-cmdline "rd.shell=0 rd.emergency=reboot" \
 		--force-drivers "$$(tr '\n' ' ' < $(MODULE_ORDER_PATH))"
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 	touch $@
 
 # Always-run provenance stamp (PHONY, no sentinel) — see IMAGE_VERSION comment.
@@ -843,8 +982,8 @@ endef
 # prior IMAGE_* lines before re-appending, so re-stamping never accumulates.
 # Depends only on the rootfs existing (.install_packages), but is itself PHONY so
 # it re-executes on every build regardless of sentinels.
-stamp_version: .install_packages
-	just mount_rootfs
+stamp_version: $(S_PKGS)
+	just device=$(DEVICE) mount_rootfs
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c \
 		"sed -i --follow-symlinks '/^IMAGE_VERSION=/d; /^IMAGE_BUILD_DATE=/d; /^IMAGE_DEVICE=/d' /etc/os-release; \
 		echo 'IMAGE_VERSION=\"$(IMAGE_VERSION)\"' >> /etc/os-release; \
@@ -861,7 +1000,7 @@ ifneq ($(strip $(FLEET_ID)),)
 else
 	$(NSPAWN) -D $(SYSROOT_DIR) sh -c "rm -f /etc/junkyard-fleet"
 endif
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 	@echo "stamped IMAGE_VERSION=$(IMAGE_VERSION)"
 
 # Decrypt + install the ARM NDA GPU userland blobs into the rootfs. PHONY (no
@@ -873,13 +1012,13 @@ endif
 # the blobs land in rootfs.img (flashed to super), not in boot/vendor_boot.img;
 # `just all` runs this after .build_boot. ldconfig refreshes the loader cache so
 # a freshly-installed .so is found at runtime.
-install_arm_blobs: .install_packages
-	just mount_rootfs
+install_arm_blobs: $(S_PKGS)
+	just device=$(DEVICE) mount_rootfs
 	SECRETS_DIR=$(SECRETS_DIR) ARM_BLOBS_ENC=$(ARM_BLOBS_ENC) \
 		ARM_RECIPIENTS=$(ARM_RECIPIENTS) ARM_NDA_KEY=$(ARM_NDA_KEY) \
 		$(ARM_BLOBS_SCRIPT) install $(SYSROOT_DIR)
 	$(NSPAWN_WRAP) -D $(SYSROOT_DIR) ldconfig || true
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 
 # NO usbcore.quirks here — see below.
 #
@@ -938,32 +1077,35 @@ install_arm_blobs: .install_packages
 # /etc/cmdline.d for dracut's own parsing, where systemd-udevd never sees it.
 # Being on the real cmdline also means it applies in the real root too, where
 # the same wedge otherwise burns 130s post-boot.
-.build_boot: .install_initramfs .install_vendor_firmware
+$(S_BOOT): $(S_INITRD) $(S_INSTFW) | $(BUILD_DIR)
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/Image.lz4 \
 		--cmdline "root=/dev/mapper/rootfs udev.event_timeout=20" \
 		--header_version 4 \
-		-o boot/boot.img \
+		-o $(BOOT_IMG) \
 		--pagesize 2048 \
 		--os_version 15.0.0 \
 		--os_patch_level 2025-02
-	just mount_rootfs
+	just device=$(DEVICE) mount_rootfs
 	sudo $(MKBOOTIMG) \
 		--ramdisk_name "" \
 		--vendor_ramdisk_fragment $(INITRAMFS_PATH) \
 		--dtb $(KERNEL_BUILD_DIR)/dtb.img \
 		--header_version 4 \
-		--vendor_boot boot/vendor_boot.img \
+		--vendor_boot $(VENDOR_BOOT_IMG) \
 		--pagesize 2048 \
 		--os_version 15.0.0 \
 		--os_patch_level 2025-02
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 	touch $@
 
+# Scoped to $(DEVICE): `make clean DEVICE=lynx` leaves the felix build alone.
+# The kernel-build and OTA-sync sentinels are deliberately NOT removed — they
+# guard the ~1hr kernel build and ~2GB download, and both are already per-device.
 clean_image:
-	just unmount_rootfs
+	just device=$(DEVICE) unmount_rootfs
 	rm -f $(ROOTFS_IMG)
-	rm -f .create_image .debootstrap .install_vendor_firmware .install_packages .install_kernel .install_initramfs .build_boot
+	rm -f $(S_CREATE) $(S_DEBOOT) $(S_INSTFW) $(S_PKGS) $(S_INSTK) $(S_INITRD) $(S_BOOT)
 
 clean: clean_image
 	# ★ super.img MUST be removed here, and `all` rebuilds it (both changed
@@ -980,8 +1122,8 @@ clean: clean_image
 	# package-provisioning.sh reads the version FROM super.img, so the contractor
 	# kit would have told an operator to expect 1.4.0 on screen while shipping a
 	# 1.5.0 boot chain.
-	rm -f boot/boot.img boot/vendor_boot.img boot/super.img
-	sudo rm -rf rootfs/unpack
+	rm -f $(BOOT_IMG) $(VENDOR_BOOT_IMG) $(SUPER_IMG)
+	sudo rm -rf $(UNPACK_DIR)
 
 # Build the full-flash `super.img`: the whole partition with both halves seeded
 # from $(ROOTFS_IMG). See the SUPER_IMG block near the top for why both.
@@ -989,25 +1131,31 @@ clean: clean_image
 # Not part of .build_boot, but `just all` does invoke it — see the justfile. It is
 # needed for a fastboot flash or a layout
 # migration, and it is another 8 GiB of build output. `just build_super_image`.
+# Depends on the BUILD SENTINEL, not on $(ROOTFS_IMG) as a bare file. Two
+# reasons: a bare file prerequisite has no rule, so a missing rootfs.img fails
+# with "No rule to make target" instead of building it; and more importantly it
+# would happily seed super.img from a STALE rootfs, which is exactly the
+# half-updated-boot/ failure documented in `clean` above.
 .PHONY: super_image
-super_image: $(ROOTFS_IMG)
+super_image: $(S_BOOT)
 	@set -e; \
 	half=$(SUPER_HALF_BYTES); \
 	isz=$$(stat -c%s "$(ROOTFS_IMG)"); \
 	if [ "$$isz" -gt "$$half" ]; then \
 		echo "ERROR: $(ROOTFS_IMG) is $$isz bytes but a half of super is only $$half."; \
-		echo "       Lower _rootfs_size in the justfile — an image that does not fit a"; \
+		echo "       Lower SIZE in devices/$(DEVICE).mk — an image that does not fit a"; \
 		echo "       half cannot be used for A/B at all, and seeding it here would just"; \
 		echo "       overwrite the start of the other half."; \
 		exit 1; \
 	fi; \
-	echo "super.img: $(SUPER_BYTES) bytes, two halves of $$half, seeded from a $$isz-byte rootfs"; \
+	echo "super.img ($(DEVICE)): $(SUPER_BYTES) bytes, two halves of $$half, seeded from a $$isz-byte rootfs"; \
 	rm -f "$(SUPER_IMG)"; \
 	truncate -s $(SUPER_BYTES) "$(SUPER_IMG)"; \
 	dd if="$(ROOTFS_IMG)" of="$(SUPER_IMG)" bs=4M conv=notrunc status=none; \
 	: 'seek_bytes, NOT seek in bs units: half/4194304 truncates to 0 whenever the'; \
 	: 'half is not a whole number of blocks, which would stack both copies at'; \
 	: 'offset 0 and leave slot B empty — silently, since the image still builds.'; \
-	: 'It is exact for felix (1017 x 4M) and would not be for another device.'; \
+	: 'It happens to be exact for felix and lynx alike (both 8136 MiB -> 1017 x 4M),'; \
+	: 'but SUPER_BYTES is per-device and a third gs201 Pixel need not divide evenly.'; \
 	dd if="$(ROOTFS_IMG)" of="$(SUPER_IMG)" bs=4M oflag=seek_bytes seek=$$half conv=notrunc status=none; \
 	echo "  wrote $(SUPER_IMG) (apparent $$(stat -c%s "$(SUPER_IMG)"), on disk $$(du -h --apparent-size=never "$(SUPER_IMG)" 2>/dev/null | cut -f1 || du -h "$(SUPER_IMG)" | cut -f1))"

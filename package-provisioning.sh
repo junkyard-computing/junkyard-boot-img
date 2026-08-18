@@ -7,13 +7,17 @@
 # factory image, into one self-contained archive. The recipient needs nothing
 # from the internet and nothing from this repo.
 #
-#   ./package-provisioning.sh --factory ~/Downloads/felix-cp1a.260405.005-factory-*.zip
+#   ./package-provisioning.sh --device felix \
+#       --factory ~/Downloads/felix-cp1a.260405.005-factory-*.zip
+#
+# A kit is device-specific end to end, and --device is required: the devices are
+# equal citizens and nothing here guesses which one you meant.
 #
 # ★ THE FACTORY IMAGE IS BUNDLED, NOT DOWNLOADED BY THE RECIPIENT, AND IT MUST
 #   MATCH THE BUILD THIS REPO PINS.
 #
-# The rootfs ships /vendor/firmware extracted from a specific felix OTA — the
-# one pinned as _felix_ota_url in the justfile. Those blobs are matched to the
+# The rootfs ships /vendor/firmware extracted from a specific OTA — the one
+# pinned as OTA_URL in devices/<device>.mk. Those blobs are matched to the
 # bootloader, radio and firmware of that same build. If the phones are flashed
 # with a factory image from a different build, our vendor blobs end up paired
 # with mismatched firmware. That is not a clean failure: AOC, UFS and the
@@ -30,12 +34,14 @@ cd "$here"
 
 FACTORY=""
 OUT=""
+DEVICE="${DEVICE:-}"
 while [ $# -gt 0 ]; do
 	case "$1" in
 		--factory) FACTORY="${2:-}"; shift 2 ;;
 		--out)     OUT="${2:-}"; shift 2 ;;
+		--device)  DEVICE="${2:-}"; shift 2 ;;
 		-h|--help)
-			echo "usage: $0 --factory <felix-factory.zip> [--out <kit.zip>]"; exit 0 ;;
+			echo "usage: $0 --device <felix|lynx> --factory <factory.zip> [--out <kit.zip>]"; exit 0 ;;
 		*) echo "unknown argument: $1" >&2; exit 2 ;;
 	esac
 done
@@ -43,12 +49,26 @@ done
 die() { echo "ERROR: $*" >&2; exit 1; }
 say() { echo ">>> $*"; }
 
+# ------------------------------------------------------------------ device ---
+# ★ REQUIRED, no default. A kit is device-specific end to end — boot images,
+# factory zip, vendor firmware and the operator README all have to agree — and
+# the devices are equal citizens, so nothing here guesses which one you meant.
+known_devices=$(ls devices/*.mk 2>/dev/null | sed 's|devices/||; s|\.mk$||' | tr '\n' ' ')
+[ -n "$DEVICE" ] || die "--device is required (known: ${known_devices:-none})"
+[ -f "devices/$DEVICE.mk" ] || die "unknown device '$DEVICE' (known: ${known_devices:-none})"
+
 # ---------------------------------------------------------------- build id ---
-OTA_URL=$(grep -oP '_felix_ota_url\s*:=\s*"\K[^"]+' justfile) \
-	|| die "could not read _felix_ota_url from justfile"
-BUILD_ID=$(basename "$OTA_URL" | sed -n 's/^felix-ota-\([a-z0-9.]*\)-.*$/\1/p')
+# The OTA pin lives in devices/<device>.mk now, so ask make rather than grepping
+# the justfile (where it used to be). --no-print-directory matters: without it
+# make's "Entering directory" lines land in the captured value.
+OTA_URL=$(make --no-print-directory print-OTA_URL DEVICE="$DEVICE" 2>/dev/null | tail -1) \
+	|| die "could not read OTA_URL from devices/$DEVICE.mk"
+[ -n "$OTA_URL" ] || die "could not read OTA_URL from devices/$DEVICE.mk"
+BUILD_ID=$(basename "$OTA_URL" | sed -n "s/^${DEVICE}-ota-\([a-z0-9.]*\)-.*\$/\1/p")
 [ -n "$BUILD_ID" ] || die "could not derive a build id from: $OTA_URL"
-say "this repo pins felix build: $BUILD_ID"
+DEVICE_MODEL=$(make --no-print-directory print-DEVICE_MODEL DEVICE="$DEVICE" 2>/dev/null | tail -1)
+[ -n "$DEVICE_MODEL" ] || DEVICE_MODEL="$DEVICE"
+say "this repo pins $DEVICE ($DEVICE_MODEL) build: $BUILD_ID"
 
 # ------------------------------------------------------------ factory image ---
 [ -n "$FACTORY" ] || die "--factory <zip> is required (we ship it; the recipient must not download one)"
@@ -56,28 +76,31 @@ say "this repo pins felix build: $BUILD_ID"
 
 command -v unzip >/dev/null || die "unzip is required to verify the factory image"
 
-# Verify by CONTENTS. A factory zip for build X contains image-felix-X.zip; the
-# outer filename is not authoritative and is routinely renamed on the way here.
-say "verifying the factory image is build $BUILD_ID"
-if ! unzip -l "$FACTORY" 2>/dev/null | grep -q "image-felix-${BUILD_ID}\.zip"; then
+# Verify by CONTENTS. A factory zip for build X contains image-<device>-X.zip;
+# the outer filename is not authoritative and is routinely renamed on the way here.
+INNER_ZIP="image-${DEVICE}-${BUILD_ID}.zip"
+say "verifying the factory image is $DEVICE build $BUILD_ID"
+if ! unzip -l "$FACTORY" 2>/dev/null | grep -q "${INNER_ZIP//./\\.}"; then
 	echo "" >&2
-	echo "The factory image does not contain image-felix-${BUILD_ID}.zip." >&2
-	echo "It is a different build from the one this repo pins." >&2
+	echo "The factory image does not contain $INNER_ZIP." >&2
+	echo "It is a different build (or a different device) from the one this repo pins." >&2
 	echo "" >&2
 	echo "What it does contain:" >&2
-	unzip -l "$FACTORY" 2>/dev/null | grep -oE 'image-felix-[a-z0-9.]+\.zip' | sort -u | sed 's/^/  /' >&2
+	unzip -l "$FACTORY" 2>/dev/null | grep -oE 'image-[a-z]+-[a-z0-9.]+\.zip' | sort -u | sed 's/^/  /' >&2
 	echo "" >&2
-	echo "Either fetch the factory image for ${BUILD_ID}, or change _felix_ota_url" >&2
-	echo "in the justfile and REBUILD — the rootfs carries vendor firmware from" >&2
+	echo "Either fetch the factory image for ${BUILD_ID}, or change OTA_URL in" >&2
+	echo "devices/$DEVICE.mk and REBUILD — the rootfs carries vendor firmware from" >&2
 	echo "the pinned build and the two have to agree." >&2
 	exit 1
 fi
 say "factory image OK"
 
 # ------------------------------------------------------------------ images ---
-DTBO="kernel/source/out/felix/dist/dtbo.img"
-for f in boot/boot.img boot/vendor_boot.img boot/super.img "$DTBO"; do
-	[ -f "$f" ] || die "missing $f — build it first (see CLAUDE.md; super.img needs 'just build_super_image')"
+BUILD_DIR="build/$DEVICE"
+DTBO="kernel/source-$DEVICE/out/$DEVICE/dist/dtbo.img"
+SUPER_IMG="$BUILD_DIR/super.img"
+for f in "$BUILD_DIR/boot.img" "$BUILD_DIR/vendor_boot.img" "$SUPER_IMG" "$DTBO"; do
+	[ -f "$f" ] || die "missing $f — build it first: just $DEVICE"
 done
 
 # Read the version out of super.img itself — the artifact actually shipped —
@@ -85,9 +108,20 @@ done
 # contents, but "normally" is how a stale image ships.
 DEBUGFS=$(command -v debugfs || ls -d /nix/store/*e2fsprogs*/bin/debugfs 2>/dev/null | head -1)
 [ -n "$DEBUGFS" ] || die "debugfs (e2fsprogs) not found — needed to read the image version"
-VERSION=$("$DEBUGFS" -R 'cat /etc/image-version' boot/super.img 2>/dev/null | tr -d '\0\n')
-[ -n "$VERSION" ] || die "could not read /etc/image-version from boot/super.img"
-DEVICE=$("$DEBUGFS" -R 'cat /etc/image-device' boot/super.img 2>/dev/null | tr -d '\0\n')
+VERSION=$("$DEBUGFS" -R 'cat /etc/image-version' "$SUPER_IMG" 2>/dev/null | tr -d '\0\n')
+[ -n "$VERSION" ] || die "could not read /etc/image-version from $SUPER_IMG"
+
+# ★ Cross-check the image's own stamp against the kit we were asked to build.
+# The two can disagree — build/<device>/ says which tree the file came from,
+# /etc/image-device says what the build STAMPED into it — and shipping a kit
+# whose README names one device while its super.img is another is exactly the
+# cross-device hazard the stamp exists to catch. Unstamped images predate the
+# stamp and are allowed through with a warning, same as flash-nmap.sh.
+IMAGE_DEVICE=$("$DEBUGFS" -R 'cat /etc/image-device' "$SUPER_IMG" 2>/dev/null | tr -d '\0\n')
+if [ -n "$IMAGE_DEVICE" ] && [ "$IMAGE_DEVICE" != "$DEVICE" ]; then
+	die "$SUPER_IMG is stamped '$IMAGE_DEVICE' but this kit is for '$DEVICE' — rebuild with 'just $DEVICE'"
+fi
+[ -n "$IMAGE_DEVICE" ] || say "WARNING: $SUPER_IMG carries no /etc/image-device stamp (predates it)"
 
 # The README tells the operator exactly what the phone's SCREEN should say, so
 # these values must come from the image being shipped — not from the working
@@ -95,16 +129,19 @@ DEVICE=$("$DEBUGFS" -R 'cat /etc/image-device' boot/super.img 2>/dev/null | tr -
 #
 # /etc/os-release is a symlink into /usr/lib, and debugfs does not follow
 # symlinks, so read the real file.
-BUILD_DATE_IMG=$("$DEBUGFS" -R 'cat /usr/lib/os-release' boot/super.img 2>/dev/null \
+BUILD_DATE_IMG=$("$DEBUGFS" -R 'cat /usr/lib/os-release' "$SUPER_IMG" 2>/dev/null \
 	| sed -n 's/^IMAGE_BUILD_DATE="\(.*\)"$/\1/p' | head -1)
-KERNEL_VERSION=$("$DEBUGFS" -R 'ls -l /lib/modules' boot/super.img 2>/dev/null \
+KERNEL_VERSION=$("$DEBUGFS" -R 'ls -l /lib/modules' "$SUPER_IMG" 2>/dev/null \
 	| tr ' ' '\n' | grep -m1 -E '^[0-9]+\.[0-9]+\.')
-[ -n "$KERNEL_VERSION" ] || die "could not read the kernel version from boot/super.img"
+[ -n "$KERNEL_VERSION" ] || die "could not read the kernel version from $SUPER_IMG"
 
-say "image version: $VERSION  (device: ${DEVICE:-unstamped})"
+say "image version: $VERSION  (device: $DEVICE, stamp: ${IMAGE_DEVICE:-unstamped})"
 say "kernel version: $KERNEL_VERSION"
 
-[ -n "$OUT" ] || OUT="junkyard-provisioning-${VERSION}.zip"
+# Device in the filename: two devices built from one commit produce the SAME
+# IMAGE_VERSION (it is derived from the commit and kernel), so without it the
+# second kit silently overwrites the first.
+[ -n "$OUT" ] || OUT="junkyard-provisioning-${DEVICE}-${VERSION}.zip"
 # Resolve now, so --out with an absolute or relative path both land where the
 # caller meant rather than inside the staging directory.
 case "$OUT" in
@@ -119,10 +156,12 @@ esac
 render_doc() {
 	local tpl="$1" out="$2"
 	[ -f "$tpl" ] || die "missing $tpl"
-	sed -e "s|@IMAGE_VERSION@|$VERSION|g" \
+	sed -e "s|@DEVICE@|$DEVICE|g" \
+	    -e "s|@DEVICE_MODEL@|$DEVICE_MODEL|g" \
+	    -e "s|@IMAGE_VERSION@|$VERSION|g" \
 	    -e "s|@KERNEL_VERSION@|$KERNEL_VERSION|g" \
 	    -e "s|@IMAGE_BUILD_DATE@|${BUILD_DATE_IMG:-unknown}|g" \
-	    -e "s|@FELIX_BUILD@|$BUILD_ID|g" \
+	    -e "s|@FACTORY_BUILD@|$BUILD_ID|g" \
 	    -e "s|@PACKAGED_DATE@|$(date -u +%Y-%m-%d)|g" \
 	    "$tpl" > "$KIT/$out"
 	# Leaving an unfilled @PLACEHOLDER@ in an operator-facing document is worse
@@ -177,11 +216,21 @@ chmod +x "$KIT"/*.sh
 # and sha256sum follows them too — so the archive is identical while ~11 GB of
 # pointless copying is skipped.
 say "staging images"
-ln -s "$here/boot/boot.img"         "$KIT/images/boot.img"
-ln -s "$here/boot/vendor_boot.img"  "$KIT/images/vendor_boot.img"
-ln -s "$here/boot/super.img"        "$KIT/images/super.img"
+ln -s "$here/$BUILD_DIR/boot.img"         "$KIT/images/boot.img"
+ln -s "$here/$BUILD_DIR/vendor_boot.img"  "$KIT/images/vendor_boot.img"
+ln -s "$here/$SUPER_IMG"       "$KIT/images/super.img"
 ln -s "$here/$DTBO"                 "$KIT/images/dtbo.img"
 printf '%s\n' "$VERSION" > "$KIT/images/VERSION"
+# ★ The kit's own statement of which device it is for. flash-fastboot.sh reads
+# this and REFUSES a phone whose `getvar product` disagrees.
+#
+# Without it that guard is dead in the kit: with no DEVICE set the script adopts
+# the hardware's answer, so DEVICE == PRODUCT by construction and the mismatch
+# test can never fire — in exactly the setting with the most risk (a contractor,
+# a batch of phones, unfamiliar hardware, and `erase super` in the script). The
+# repo checkout has both devices built and can legitimately pick; the kit holds
+# one device's images and must assert which.
+printf '%s\n' "$DEVICE" > "$KIT/images/DEVICE"
 
 # EXTRACT the factory image rather than shipping the zip.
 #
@@ -189,12 +238,12 @@ printf '%s\n' "$VERSION" > "$KIT/images/VERSION"
 # flash-all.sh ended up. Extracting it here means step 4 is just "run
 # factory/flash-all.sh".
 #
-# ⚠ The INNER image-felix-<build>.zip stays a zip. `fastboot update` takes an
+# ⚠ The INNER image-<device>-<build>.zip stays a zip. `fastboot update` takes an
 # archive, not a directory — unpacking that one would break the flash.
 say "extracting the factory image"
 unzip -q "$FACTORY" -d "$KIT/factory" || die "could not extract $FACTORY"
 
-# Google's factory zips wrap everything in a single felix-<build>/ directory.
+# Google's factory zips wrap everything in a single <device>-<build>/ directory.
 # Flatten it so the path in the README is stable regardless of that convention.
 shopt -s nullglob dotglob
 inner=( "$KIT/factory"/*/ )
@@ -216,8 +265,8 @@ chmod +x "$KIT/factory"/*.sh 2>/dev/null || true
 # the half that is broken is the one nobody here tests on.
 [ -f "$KIT/factory/flash-all.bat" ] \
 	|| die "no flash-all.bat after extracting $FACTORY — the Windows path (README step 4) needs it"
-[ -f "$KIT/factory/image-felix-${BUILD_ID}.zip" ] \
-	|| die "no image-felix-${BUILD_ID}.zip after extraction — the inner archive must stay zipped for 'fastboot update'"
+[ -f "$KIT/factory/$INNER_ZIP" ] \
+	|| die "no $INNER_ZIP after extraction — the inner archive must stay zipped for 'fastboot update'"
 
 printf '%s\n' "$BUILD_ID" > "$KIT/factory/BUILD_ID"
 
@@ -234,12 +283,12 @@ Junkyard Debian provisioning kit
 ================================
 
 image version : $VERSION
-target device : ${DEVICE:-felix}
-felix build    : $BUILD_ID   (factory image bundled under factory/)
+target device : $DEVICE
+factory build : $BUILD_ID   (factory image bundled under factory/)
 packaged       : $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 The factory image under factory/ MUST be the one used. The rootfs carries
-vendor firmware extracted from this same felix build, and pairing it with a
+vendor firmware extracted from this same $DEVICE build, and pairing it with a
 different build's bootloader and radio produces failures that look like our
 image is broken.
 
@@ -259,6 +308,6 @@ rm -f "$OUT"
 say "done: $OUT_ABS  ($(du -h "$OUT_ABS" | cut -f1))"
 echo
 echo "  image version : $VERSION"
-echo "  felix build   : $BUILD_ID"
+echo "  factory build : $BUILD_ID"
 echo "  contents      : README.md, 6 shell + 7 PowerShell scripts, 4 images,"
 echo "                  factory image, SHA256SUMS"

@@ -1,7 +1,7 @@
-# Flashing Junkyard Debian onto Pixel Fold
+# Flashing Junkyard Debian onto @DEVICE_MODEL@
 
-This folder is everything needed to flash a batch of Pixel Folds. Work through
-the steps in order. **Everything you need is in here — do not download anything**
+This folder is everything needed to flash a batch of @DEVICE_MODEL@ (@DEVICE@) units.
+Work through the steps in order. **Everything you need is in here — do not download anything**
 (Windows needs one extra download, `platform-tools`, which Google does not let
 us redistribute).
 
@@ -15,7 +15,7 @@ This kit builds:
 |---|---|
 | Image version | `@IMAGE_VERSION@` |
 | Kernel version | `@KERNEL_VERSION@` |
-| Google build | `@FELIX_BUILD@` (bundled under `factory/`) |
+| Google build | `@FACTORY_BUILD@` (bundled under `factory/`) |
 | Packaged | @PACKAGED_DATE@ |
 
 **What you need**
@@ -137,7 +137,7 @@ This step is not optional and it is not the same as step 5. It installs the
 bootloader and radio firmware, which our image never touches.
 
 ⚠ **Do not substitute a different Google build.** Our system carries hardware
-firmware taken from build `@FELIX_BUILD@` and it has to match the bootloader and
+firmware taken from build `@FACTORY_BUILD@` and it has to match the bootloader and
 radio installed here. A mismatch does not fail cleanly — it looks like our
 software is broken.
 

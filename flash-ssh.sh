@@ -36,7 +36,8 @@
 # bricks the root and needs fastboot/recovery. The boot-chain half is A/B-safe.
 #
 # Usage: ./flash-ssh.sh [user@]host
-#   Env: SSH_OPTS                       extra ssh/scp options (e.g. "-i key")
+#   Env: DEVICE                         which build to ship (default felix)
+#        SSH_OPTS                       extra ssh/scp options (e.g. "-i key")
 #        USERDATA_MNT                   device staging mountpoint (default /userdata)
 #        USERDATA_DEV                   staging partition (default: the GPT
 #                                       partition labelled `userdata`)
@@ -54,11 +55,31 @@ here="$(cd "$(dirname "$0")" && pwd)"
 # binaries. Both pixel-bootctl and pixel-ota are cross-built into the overlay by
 # the Makefile (.build_pixel_bootctl / .build_pixel_ota), so we read them from
 # there.
-BOOT_IMG="${BOOT_IMG:-$here/boot/boot.img}"
-VENDOR_BOOT_IMG="${VENDOR_BOOT_IMG:-$here/boot/vendor_boot.img}"
+# Which DEVICE's build to ship (felix | lynx) — selects the per-device artifact
+# directory. The device's own /etc/image-device stamp is what flash-nmap.sh
+# checks before writing; this only picks which images we read locally.
+#
+# ★ REQUIRED, no default. Unlike the fastboot path there is nothing safe to
+# derive it from: the target's stamp says what it CURRENTLY runs, which is not
+# the same question as what we intend to ship (and is absent entirely on an
+# unstamped or migrating unit). felix and lynx are equal citizens, so rather than
+# prefer one, ask. The rootfs half of this is a destructive in-place write.
+DEVICE="${DEVICE:-}"
+[ -n "$DEVICE" ] || {
+	echo "refusing to flash: DEVICE is not set." >&2
+	echo "  DEVICE=felix $0 $HOST     (or lynx)" >&2
+	exit 2
+}
+[ -d "$here/build/$DEVICE" ] || {
+	echo "refusing to flash: no build for '$DEVICE' at $here/build/$DEVICE" >&2
+	echo "  build it first:  just $DEVICE" >&2
+	exit 2
+}
+BOOT_IMG="${BOOT_IMG:-$here/build/$DEVICE/boot.img}"
+VENDOR_BOOT_IMG="${VENDOR_BOOT_IMG:-$here/build/$DEVICE/vendor_boot.img}"
 # Note: `-` not `:-` so an explicit empty DTBO_IMG= skips dtbo (unset = default).
-DTBO_IMG="${DTBO_IMG-$here/kernel/source/out/felix/dist/dtbo.img}"
-ROOTFS_IMG="${ROOTFS_IMG:-$here/boot/rootfs.img}"
+DTBO_IMG="${DTBO_IMG-$here/kernel/source-$DEVICE/out/$DEVICE/dist/dtbo.img}"
+ROOTFS_IMG="${ROOTFS_IMG:-$here/build/$DEVICE/rootfs.img}"
 PIXEL_BOOTCTL_BIN="${PIXEL_BOOTCTL_BIN:-$here/rootfs/overlay/usr/local/bin/pixel-bootctl}"
 PIXEL_OTA_BIN="${PIXEL_OTA_BIN:-$here/rootfs/overlay/usr/local/bin/pixel-ota}"
 

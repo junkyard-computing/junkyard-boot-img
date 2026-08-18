@@ -1,16 +1,28 @@
 #!/bin/bash
 #
+# Run from the script's own directory throughout, so every relative path below
+# (IMAGE_DIR, DTBO, the kit's images/) means the same thing regardless of where
+# the caller invoked this from.
+cd "$(dirname "$0")" || exit 1
+#
 # The felix dtbo carries the board-variant overrides that flip serial_0,
 # the panels, and other felix-specific nodes from status="disabled" (as
 # defined in gs201.dtsi) to status="okay". Without it UART login and the
 # display silently go dead. Any prior "reflash to stock" wipes whatever
 # stock dtbo was there, so always re-flash ours.
-# Image locations. Overridable so the SAME script works from a repo checkout and
-# from the standalone provisioning kit, which lays them out differently: the kit
-# sets IMAGE_DIR=images DTBO=images/dtbo.img. One tested flashing path, two
-# layouts, instead of a second copy that drifts.
-IMAGE_DIR="${IMAGE_DIR:-boot}"
-DTBO="${DTBO:-kernel/source/out/felix/dist/dtbo.img}"
+# Which DEVICE's build to flash (felix | lynx). Selects the per-device artifact
+# directory; see devices/<device>.mk and the DEVICE SELECTION block in the
+# Makefile. Env-only, because $1 is already the fastboot serial.
+#
+# ★ NO DEFAULT. It is ASKED OF THE HARDWARE (`getvar product`, below) when unset.
+# A default here would be a preference between equal devices, and the wrong one
+# writes a felix image over a lynx — this script erases `super` and flashes both
+# slots, so that is not recoverable by rolling back. Asking the bootloader what
+# it is beats guessing, and means the plain `./flash-fastboot.sh <serial>` form
+# is correct for either device with nothing to remember.
+#
+# Set DEVICE explicitly to assert an expectation instead; a mismatch then aborts.
+DEVICE="${DEVICE:-}"
 
 # Which device to flash. REQUIRED — bare `fastboot` commands target "the single
 # attached device", and this script runs `erase super` (the rootfs) among others,
@@ -40,7 +52,67 @@ if ! fastboot devices | grep -q "^${SERIAL}[[:space:]]"; then
 	fastboot devices >&2
 	exit 2
 fi
-echo ">>> flashing $SERIAL ($(fastboot -s "$SERIAL" getvar product 2>&1 | head -1))"
+# ★ Ask the hardware what it is, then either adopt that (DEVICE unset) or check
+# the caller's expectation against it (DEVICE set).
+#
+# This matters more here than anywhere else: felix and lynx are both gs201 and
+# both accept these fastboot commands happily, but the images are genuinely
+# incompatible (different kernel branch, different vendor firmware — and without
+# a matching aoc.bin the device does not boot at all). Meanwhile this script
+# erases `super` and flashes BOTH slots, so a wrong-device run destroys the
+# rootfs and both boot chains before anything gets a chance to reject it. The
+# SSH/OTA path gates on the /etc/image-device stamp; this is the equivalent for
+# the path that has no rootfs to read a stamp from yet.
+#
+# ★★ IN THE PROVISIONING KIT, THE KIT ITSELF IS THE AUTHORITY.
+#
+# Deriving DEVICE from `getvar product` is right in a repo checkout, where both
+# devices are built and we simply pick the matching one. It is WRONG in the kit,
+# where images/ holds exactly ONE device's images: derived-from-hardware would
+# make DEVICE equal PRODUCT by construction, so the mismatch test below could
+# never fire — and the kit is precisely where the risk is highest (a contractor,
+# unfamiliar hardware, a batch of phones, and `erase super` in the script).
+#
+# So package-provisioning.sh stamps images/DEVICE with the device the kit was
+# built for, and that wins over the hardware's answer. Plugging a lynx into a
+# felix kit now aborts instead of flashing felix images onto it.
+KIT_DEVICE=""
+if [ -z "$DEVICE" ] && [ -r "${IMAGE_DIR:-images}/DEVICE" ]; then
+	KIT_DEVICE=$(tr -d " \t\r\n" < "${IMAGE_DIR:-images}/DEVICE")
+	[ -z "$KIT_DEVICE" ] || DEVICE="$KIT_DEVICE"
+fi
+
+# DEVICE_CHECK=0 skips the comparison, for the rare deliberate case.
+PRODUCT=$(fastboot -s "$SERIAL" getvar product 2>&1 | sed -n 's/^product: *//p' | head -1)
+if [ -z "$DEVICE" ]; then
+	[ -n "$PRODUCT" ] || {
+		echo "refusing to flash: '$SERIAL' did not report a product, and no DEVICE was set." >&2
+		echo "pass DEVICE=<device> explicitly." >&2
+		exit 2
+	}
+	DEVICE="$PRODUCT"
+	echo ">>> device not specified; adopting the bootloader's answer: $DEVICE"
+elif [ "${DEVICE_CHECK:-1}" = 1 ] && [ -n "$PRODUCT" ] && [ "$PRODUCT" != "$DEVICE" ]; then
+	if [ -n "$KIT_DEVICE" ]; then
+		echo "refusing to flash: '$SERIAL' is a '$PRODUCT', but this kit was built" >&2
+		echo "for '$KIT_DEVICE' (images/DEVICE). Use the $PRODUCT kit for this phone." >&2
+	else
+		echo "refusing to flash: '$SERIAL' reports product '$PRODUCT', but DEVICE=$DEVICE." >&2
+		echo "  build the right one:  just $PRODUCT" >&2
+		echo "  then flash it:        DEVICE=$PRODUCT $0 $SERIAL" >&2
+	fi
+	echo "  (override with DEVICE_CHECK=0 if you really mean it)" >&2
+	exit 2
+fi
+
+# Image locations. Resolved AFTER the device is known. Overridable so the SAME
+# script works from a repo checkout and from the standalone provisioning kit,
+# which lays them out differently: the kit sets IMAGE_DIR=images
+# DTBO=images/dtbo.img. One tested flashing path, two layouts, instead of a
+# second copy that drifts.
+IMAGE_DIR="${IMAGE_DIR:-build/$DEVICE}"
+DTBO="${DTBO:-kernel/source-$DEVICE/out/$DEVICE/dist/dtbo.img}"
+echo ">>> flashing $SERIAL (product: ${PRODUCT:-unknown}, images: $IMAGE_DIR)"
 
 # Every command below goes through this, so none of them can pick a device.
 #
@@ -68,8 +140,6 @@ fb() {
 # moment fb itself exits on failure.
 fb_try() { fastboot -s "$SERIAL" "$@" || true; }
 
-cd "$(dirname "$0")"
-
 # ★★ CHECK EVERY IMAGE BEFORE TOUCHING THE PHONE.
 #
 # These checks used to sit further down, next to the partition each one feeds —
@@ -78,11 +148,11 @@ cd "$(dirname "$0")"
 # the phone worse off than when it arrived. Nothing here writes to the device,
 # so all of it belongs before the first fastboot command.
 for _img in "$IMAGE_DIR/boot.img" "$IMAGE_DIR/vendor_boot.img" "$DTBO"; do
-	[ -f "$_img" ] || { echo "missing $_img — build it first (see CLAUDE.md)" >&2; exit 1; }
+	[ -f "$_img" ] || { echo "missing $_img — build it first: just $DEVICE" >&2; exit 1; }
 done
 
 if [ ! -f "$IMAGE_DIR/super.img" ]; then
-	echo "missing super.img — build it with: just build_super_image" >&2
+	echo "missing super.img — build it with: just $DEVICE" >&2
 	echo "(rootfs.img alone is only half of super; flashing it would leave slot B" >&2
 	echo " unseeded and the first OTA would have no valid rollback target.)" >&2
 	exit 1
@@ -90,9 +160,9 @@ fi
 
 # ★ REFUSE A STALE super.img.
 #
-# super.img is NOT built by `just all` — it is another 8 GiB and only fastboot
-# and a layout migration need it — and `just clean` did not remove it either
-# until this was found. So an ordinary rebuild leaves fresh boot.img and
+# super.img IS built by `just <device>` now (and removed by `just clean`), but
+# that was not always so: it used to be skipped as another 8 GiB that only
+# fastboot and a layout migration need. An ordinary rebuild then left fresh boot.img and
 # vendor_boot.img beside a super.img containing the PREVIOUS rootfs, with
 # nothing to warn you: it is gitignored, so `git status` stays clean throughout.
 #
@@ -113,8 +183,8 @@ if [ -f "$IMAGE_DIR/rootfs.img" ]; then
 			echo "refusing to flash: super.img is STALE." >&2
 			echo "  super.img  : $_sv" >&2
 			echo "  rootfs.img : $_rv" >&2
-			echo "super.img is not rebuilt by 'just all'. Regenerate it:" >&2
-			echo "    just build_super_image" >&2
+			echo "Regenerate super.img:" >&2
+			echo "    just device=$DEVICE build_super_image" >&2
 			exit 1
 		fi
 	fi

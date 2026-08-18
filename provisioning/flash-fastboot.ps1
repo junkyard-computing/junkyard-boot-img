@@ -110,6 +110,28 @@ if (Test-Path -LiteralPath $versionFile) {
 }
 
 $product = (& $fastboot -s $Serial getvar product 2>&1 | Select-Object -First 1)
+
+# ** REFUSE A PHONE THIS KIT WAS NOT BUILT FOR.
+#
+# images\DEVICE is written by package-provisioning.sh and names the one device
+# this kit holds images for. felix and lynx are both gs201 and both accept every
+# fastboot command here happily, but the images are incompatible -- and this
+# script erases `super` and writes both slots, so a wrong-device run destroys the
+# phone's rootfs and both boot chains before anything can reject it.
+#
+# Matched loosely: `getvar product` output is the raw fastboot line, which
+# carries the value plus decoration that differs across platform-tools versions.
+$deviceFile = Join-Path $ImageDir 'DEVICE'
+if (Test-Path -LiteralPath $deviceFile) {
+	$kitDevice = ("" + (Get-Content -LiteralPath $deviceFile -TotalCount 1)).Trim()
+	if ($kitDevice -and ($product -notmatch [regex]::Escape($kitDevice))) {
+		Die ("this kit is for '$kitDevice', but $Serial reports: $product`n" +
+			"    Use the kit built for that phone. Flashing this one would`n" +
+			"    erase its rootfs and write a boot chain it cannot run.")
+	}
+	if ($kitDevice) { Say ("kit device: $kitDevice") }
+}
+
 Say "flashing $Serial ($product)"
 
 # Every fastboot command goes through this, so none of them can pick a device.
