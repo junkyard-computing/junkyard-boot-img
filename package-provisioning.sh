@@ -61,9 +61,30 @@ known_devices=$(ls devices/*.mk 2>/dev/null | sed 's|devices/||; s|\.mk$||' | tr
 # The OTA pin lives in devices/<device>.mk now, so ask make rather than grepping
 # the justfile (where it used to be). --no-print-directory matters: without it
 # make's "Entering directory" lines land in the captured value.
-OTA_URL=$(make --no-print-directory print-OTA_URL DEVICE="$DEVICE" 2>/dev/null | tail -1) \
-	|| die "could not read OTA_URL from devices/$DEVICE.mk"
-[ -n "$OTA_URL" ] || die "could not read OTA_URL from devices/$DEVICE.mk"
+# ★ Say WHICH tool is missing, not which file looks unreadable.
+#
+# This used to be `make ... 2>/dev/null || die "could not read OTA_URL from
+# devices/$DEVICE.mk"`, which swallowed make's own error. Run outside the dev
+# shell you get `make: command not found` (exit 127) on a suppressed stderr, and
+# the script blames devices/<device>.mk — a file that is present, tracked and
+# perfectly fine. Same shape as the bare `cargo: not found` the Makefile's
+# preflight was added to stop.
+command -v make >/dev/null 2>&1 || die "make is not on PATH.
+    This script reads the pinned OTA out of devices/$DEVICE.mk via make, and
+    also needs unzip/zip/sha256sum/debugfs. Run it inside the dev shell:
+        nix develop -c ./$(basename "$0") --device $DEVICE --factory <zip>"
+
+# stderr is captured rather than discarded, so a real make failure (an unknown
+# DEVICE, a syntax error in the fragment) is reported instead of guessed at.
+_mk_err=$(mktemp)
+OTA_URL=$(make --no-print-directory print-OTA_URL DEVICE="$DEVICE" 2>"$_mk_err" | tail -1)
+if [ -z "$OTA_URL" ]; then
+	echo "ERROR: could not read OTA_URL for '$DEVICE'." >&2
+	[ -s "$_mk_err" ] && { echo "make said:" >&2; sed 's/^/    /' "$_mk_err" >&2; }
+	rm -f "$_mk_err"
+	exit 1
+fi
+rm -f "$_mk_err"
 BUILD_ID=$(basename "$OTA_URL" | sed -n "s/^${DEVICE}-ota-\([a-z0-9.]*\)-.*\$/\1/p")
 [ -n "$BUILD_ID" ] || die "could not derive a build id from: $OTA_URL"
 DEVICE_MODEL=$(make --no-print-directory print-DEVICE_MODEL DEVICE="$DEVICE" 2>/dev/null | tail -1)
