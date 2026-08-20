@@ -1,5 +1,13 @@
 # Changelog
 
+## [1.7.1](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.7.0...v1.7.1) (2026-08-20)
+
+
+### Bug Fixes
+
+* **build:** `just clean` required a device and so did nothing ([fb2e284](https://github.com/junkyard-computing/junkyard-boot-img/commit/fb2e28426d68a7b33cbaef9073adddef0291225d))
+* **build:** `just clean` required a device and so did nothing ([fa0458e](https://github.com/junkyard-computing/junkyard-boot-img/commit/fa0458eb74fdebe54406e6eee0180bf1dd4f950e))
+
 ## [1.7.0](https://github.com/junkyard-computing/junkyard-boot-img/compare/v1.6.0...v1.7.0) (2026-08-18)
 
 
