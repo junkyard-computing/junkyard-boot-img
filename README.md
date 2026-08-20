@@ -85,7 +85,7 @@ A device build invokes make twice in sequence: first to build `.build_kernel`, t
 
 Individual stages are also exposed, and take `device=` like everything else: `just build_kernel`, `just build_rootfs`, `just install_apt_packages`, `just update_kernel_modules_and_source`, `just update_initramfs`, `just build_boot_images`, `just device=lynx build_kernel`. See `just --list`.
 
-`just clean` removes one device's images and sentinels (`device=` is required, as everywhere), preserving the expensive kernel-build and OTA caches; `just clean_all` does both devices; `just clean_kernel` is the separate knob for the Bazel output.
+`just clean` removes built images and sentinels for **every** device, pairing with `just all`; `just device=lynx clean` narrows it to one. It preserves the expensive kernel-build and OTA caches. `just clean_rootfs` and `just clean_kernel` follow the same rule, the latter being the separate knob for the Bazel output.
 
 ## Flashing
 
@@ -98,7 +98,7 @@ DEVICE=lynx ./flash-fastboot.sh <serial>  # or asserted
 
 It reads `build/<device>/`. With no `DEVICE=` it **asks the hardware** — `fastboot getvar product` — and uses that, so the plain form is correct for either device; set `DEVICE=` to assert an expectation instead and a mismatch aborts. felix and lynx are both gs201 and both accept these commands happily, but the images are incompatible, and this is the path that erases `super` and writes both slots. `DEVICE_CHECK=0` overrides.
 
-**No command in this repo has a default device.** felix and lynx are equal citizens, and a default is a preference — it silently decides which device a bare command acts on. `just felix` / `just lynx` / `just all` say it for you; `flash-fastboot.sh` asks the bootloader; everything else requires it and lists the known devices if you forget. The one enforcement point is the Makefile, which errors on an empty or unknown `DEVICE`.
+**No command in this repo has a default device.** felix and lynx are equal citizens, and a default is a preference — it silently decides which device a bare command acts on. `just felix` / `just lynx` / `just all` say it for you; the whole-fleet recipes (`clean`, `clean_rootfs`, `clean_kernel`) read "unset" as *every* device, pairing with `just all`; `flash-fastboot.sh` asks the bootloader; and the single-device recipes require it, listing the known devices if you forget. The one enforcement point is the Makefile, which errors on an empty or unknown `DEVICE`.
 
 For a device that is **already running and reachable over the network**, `flash-ssh.sh [user@]host` updates it in place over SSH instead — no fastboot, no USB. It flashes the inactive boot slot with `pixel-ota` and switches to it, then arms a rootfs reflash that the initramfs' `90rootfs-flash` **pre-mount hook** performs on the way back up — before root is mounted, and after verifying the staged image against its `sha256`/`size` sidecars. (Not a systemd shutdown pivot: `dracut-shutdown.service` is `/bin/true` on these images.) It checks the device for the `pixel-ota`/`pixel-bootctl` binaries and copies any that are missing, and stages the image on the `userdata` partition — mounting it if it isn't mounted.
 

@@ -27,16 +27,19 @@
 #
 # ★ EMPTY BY DESIGN — there is no default device. felix and lynx are equal
 # citizens, and a default is a preference: it silently decides which device a
-# bare command acts on. `just felix` / `just lynx` / `just all` set it for you;
-# the lower-level recipes (mount_rootfs, clean, sync_vendor_firmware, ...) need
-# it spelled out: `just device=lynx clean`.
+# bare command acts on. `just felix` / `just lynx` / `just all` set it for you.
+#
+# The whole-fleet recipes (clean, clean_rootfs, clean_kernel) read EMPTY as
+# "every device", pairing with `just all`. The single-device ones (mount_rootfs,
+# sync_vendor_firmware, build_kernel, ...) need it spelled out —
+# `just device=lynx sync_vendor_firmware` — and the Makefile errors if it is not.
 #
 # The Makefile is the single enforcement point — every recipe here passes
 # DEVICE={{ device }} through to make, which errors on an empty or unknown one.
 device := ""
 
-# Every device the tree knows about, derived from devices/*.mk so `all` and
-# `clean_all` pick up a new one automatically — adding a device stays "a new
+# Every device the tree knows about, derived from devices/*.mk so `all` and the
+# clean recipes pick up a new one automatically — adding a device stays "a new
 # fragment plus a one-line recipe".
 [private]
 _devices := trim(shell("ls devices/*.mk 2>/dev/null | sed 's|devices/||; s|\\.mk$||' | tr '\\n' ' '"))
@@ -342,8 +345,24 @@ pin_kernel_source:
         -o {{ justfile_directory() }}/kernel/kernel-manifest.{{ device }}.xml
     @echo "Wrote kernel/kernel-manifest.{{ device }}.xml — commit it to lock the kernel source."
 
+# Expunge the Bazel output and drop the kernel sentinels. Every device by
+# default, `device=<dev>` for one — same rule as `clean`.
+#
+# Not a dependency on clone_kernel_source any more: that resolves the tree path
+# at PARSE time from `device`, which is empty in the every-device case. Each
+# iteration re-enters just with the device set, so the path resolves per device.
 [group('kernel')]
-clean_kernel: clone_kernel_source
+[doc('Expunge the Bazel output (every device, or device=<dev>)')]
+clean_kernel:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for d in {{ if device == "" { _devices } else { device } }}; do
+        echo "═══ cleaning kernel: $d ═══"
+        just device="$d" _clean_kernel_one
+    done
+
+[private]
+_clean_kernel_one: clone_kernel_source
     cd {{ _kernel_source_dir }} && {{ _bazel }} clean --expunge
     rm -f {{ justfile_directory() }}/build/{{ device }}/.build_kernel \
           {{ justfile_directory() }}/build/{{ device }}/.apply_kernel_patches
@@ -418,29 +437,41 @@ trim_rootfs: mount_rootfs
     sudo fstrim -v {{ _sysroot_dir }}
     just device={{ device }} unmount_rootfs
 
-# Delete the rootfs image and associated sentinels.
+# Delete the rootfs image and its per-stage sentinels. Every device by default,
+# `device=<dev>` for one — same rule as `clean`.
 [group('rootfs')]
-clean_rootfs: unmount_rootfs
-    {{ _make }} -C {{ justfile_directory() }} clean_image DEVICE={{ device }}
-
-# Delete THIS device's rootfs image, boot images, super.img, kernel-staging
-# unpack dir and image-pipeline sentinels. Scoped to `device` (default felix) on
-# purpose: `just clean` should not silently destroy the other device's ~8 GiB of
-# build output. Use `just clean_all` for both.
-#
-# Preserves the cached kernel build (`just clean_kernel` for that) and the cached
-# OTA under build/<device>/vendor-firmware/, so the next build skips the ~1hr
-# kernel build and ~2GB OTA download.
-[doc("Delete one device's images + sentinels (device=felix by default)")]
-clean: unmount_rootfs
-    {{ _make }} -C {{ justfile_directory() }} clean DEVICE={{ device }}
-
-# Clean every device, mirroring `all`.
-clean_all:
+[doc('Delete rootfs images + stage sentinels (every device, or device=<dev>)')]
+clean_rootfs:
     #!/usr/bin/env bash
     set -euo pipefail
-    for d in {{ _devices }}; do
-        just device="$d" clean
+    for d in {{ if device == "" { _devices } else { device } }}; do
+        echo "═══ cleaning rootfs: $d ═══"
+        just device="$d" unmount_rootfs
+        {{ _make }} -C {{ justfile_directory() }} clean_image DEVICE="$d"
+    done
+
+# Delete rootfs image, boot images, super.img, the kernel-staging unpack dir and
+# the image-pipeline sentinels.
+#
+# A bare `just clean` cleans EVERY device, mirroring `just all` — the two are a
+# pair and it is confusing for one to mean "everything" and the other to demand a
+# device. `just device=lynx clean` narrows it to one.
+#
+# It was device-required at first, on the reasoning that clean should not
+# silently destroy the other device's ~8 GiB. That was paternalism, and
+# inconsistent: `all` spends an hour rebuilding both without being asked twice.
+#
+# Preserves the cached kernel build (`just clean_kernel` for that) and the cached
+# OTA under build/<device>/vendor-firmware/, so the next build still skips the
+# ~1hr kernel build and ~2GB download.
+[doc('Delete built images + sentinels (every device, or device=<dev> for one)')]
+clean:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    for d in {{ if device == "" { _devices } else { device } }}; do
+        echo "═══ cleaning $d ═══"
+        just device="$d" unmount_rootfs
+        {{ _make }} -C {{ justfile_directory() }} clean DEVICE="$d"
     done
 
 # ═══ ONE-TIME MIGRATION INTO THE PER-DEVICE LAYOUT ═══════════════════════════
