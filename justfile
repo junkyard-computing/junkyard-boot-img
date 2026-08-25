@@ -91,7 +91,7 @@ default:
 # KERNEL_VERSION written by .build_kernel. justfile exports are evaluated at
 # parse time, so on a fresh checkout KERNEL_VERSION would be empty without
 # this split.
-all size="8100M" debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000": clone_kernel_source
+all size="4000M" debootstrap_release="trixie" root_password="0000" hostname="fold" user_login="kalm" user_password="0000": clone_kernel_source
     {{ _make }} -C {{ justfile_directory() }} .build_kernel
     KVER=$(cat {{ justfile_directory() }}/kernel/kernel_version); \
     {{ _make }} -C {{ justfile_directory() }} .build_boot \
@@ -129,11 +129,11 @@ build_kernel: clone_kernel_source
 
 # Create the empty ext4 rootfs image.
 [group('rootfs')]
-create_rootfs_image size="8100M": unmount_rootfs
+create_rootfs_image size="4000M": unmount_rootfs
     {{ _make }} -C {{ justfile_directory() }} .create_image SIZE={{ size }}
 
 # Mount the ext4 rootfs image at rootfs/sysroot.
-mount_rootfs size="8100M": (create_rootfs_image size)
+mount_rootfs size="4000M": (create_rootfs_image size)
     @mkdir -p {{ _sysroot_dir }}
     @if ! mountpoint -q {{ _sysroot_dir }}; then \
       echo "Mounting rootfs image at {{ _sysroot_dir }}"; \
@@ -160,7 +160,7 @@ clean: unmount_rootfs
     {{ _make }} -C {{ justfile_directory() }} clean
 
 [group('rootfs')]
-build_rootfs debootstrap_release="trixie" root_password="0000" hostname="fold" size="8100M":
+build_rootfs debootstrap_release="trixie" root_password="0000" hostname="fold" size="4000M":
     {{ _make }} -C {{ justfile_directory() }} .debootstrap \
         RELEASE={{ debootstrap_release }} \
         ROOT_PW={{ root_password }} \
