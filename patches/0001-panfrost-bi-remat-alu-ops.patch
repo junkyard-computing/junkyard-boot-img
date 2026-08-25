@@ -1,0 +1,63 @@
+diff --git a/src/panfrost/compiler/bifrost/bi_spill_ssa.c b/src/panfrost/compiler/bifrost/bi_spill_ssa.c
+index eecca33..f8b2333 100644
+--- a/src/panfrost/compiler/bifrost/bi_spill_ssa.c
++++ b/src/panfrost/compiler/bifrost/bi_spill_ssa.c
+@@ -6,6 +6,7 @@
+  * SPDX-License-Identifier: MIT
+  */
+ 
++#include <string.h>
+ #include "util/bitset.h"
+ #include "util/hash_table.h"
+ #include "util/ralloc.h"
+@@ -443,10 +444,28 @@ insert_spill(bi_builder *b, struct spill_ctx *ctx, unsigned node)
+ static bool
+ can_remat_reg(bi_instr *I)
+ {
++   /* Rematerialize cheap, pure, single-32-bit-result integer ALU ops when their
++    * register sources are still live (reg_remat_available() checks that). These
++    * dominate register-heavy integer kernels: llama.cpp's Q4_K dequant is mostly
++    * shift/mask nibble extraction (LSHIFT_OR/AND, RSHIFT_OR) plus address/index
++    * arithmetic (IADD, IMUL, ISUB, MOV). Such shaders are load/store-bound, so
++    * recomputing a value is cheaper than a .tl spill fill — it moves work off
++    * the bottleneck LS unit onto the otherwise-idle ALU. The spilled memory copy
++    * still exists, so this only changes reload cost, never correctness. */
+    switch (I->op) {
++   case BI_OPCODE_MOV_I32:
+    case BI_OPCODE_IADD_IMM_I32:
+-      return I->nr_srcs == 1 && I->src[0].type == BI_INDEX_NORMAL &&
+-             !I->src[0].memory;
++   case BI_OPCODE_IADD_S32:
++   case BI_OPCODE_IADD_U32:
++   case BI_OPCODE_ISUB_S32:
++   case BI_OPCODE_ISUB_U32:
++   case BI_OPCODE_IMUL_I32:
++   case BI_OPCODE_LSHIFT_OR_I32:
++   case BI_OPCODE_LSHIFT_AND_I32:
++   case BI_OPCODE_LSHIFT_XOR_I32:
++   case BI_OPCODE_RSHIFT_OR_I32:
++   case BI_OPCODE_RSHIFT_AND_I32:
++      return I->nr_dests == 1;
+    default:
+       return false;
+    }
+@@ -486,7 +505,18 @@ insert_reload(struct spill_ctx *ctx, bi_block *block, bi_cursor cursor,
+        * firing; it only avoids a latency-exposed .tl load when the source is
+        * already in a register. */
+       bi_instr *def = ctx->ssa_defs[node];
+-      bi_iadd_imm_i32_to(&b, idx, def->src[0], def->index);
++      /* Clone the def with its single result retargeted to idx. A whole-struct
++       * copy carries every operand and modifier, so any can_remat_reg() op works
++       * with no per-opcode plumbing; reg_remat_available() guarantees the
++       * register sources are live at this point. */
++      size_t sz =
++         sizeof(bi_instr) + sizeof(bi_index) * (def->nr_dests + def->nr_srcs);
++      bi_instr *c = (bi_instr *)rzalloc_size(b.shader, sz);
++      memcpy(c, def, sz);
++      c->dest = (bi_index *)(&c[1]);
++      c->src = c->dest + c->nr_dests;
++      c->dest[0] = idx;
++      bi_builder_insert(&b.cursor, c);
+    } else {
+       bi_memmov_to(&b, idx, bi_index_as_mem(idx, ctx));
+       b.shader->fills++;

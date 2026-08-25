@@ -851,3 +851,55 @@ multi-week, both upstreamable, both needing an explicit decision (not loop itera
    shared-staging bottleneck. Backed by IDPADD/fp16-dot.
 Bandwidth parity (g3dl2) remains the extracted structural win; the compute residual is a documented,
 measurement-blocked known gap. Device at baseline; no driver changes iters 1-2 of the grind.
+
+---
+
+## 2026-07-31 — MLP / wait-batching scheduler lever: implemented, correct, PERF-NEUTRAL (last register-free lever closed)
+
+The one lever every prior entry flagged as "untested, est. modest": make more loads overlap at
+occupancy-1 to hide DRAM latency, without adding registers.
+
+**Root cause (found in the flow-insertion pass, not "partial batching"):**
+`src/panfrost/compiler/bifrost/valhall/va_insert_flow.c`, `bi_set_dependencies()` had a block commented
+*"For now, serialize all memory access"* that made **every** load wait on **every** prior in-flight
+memory op — including other loads. So load-after-load was fully serialized: in-flight loads capped at 1
+(MLP-1) at occupancy-1, and each load emitted a single-slot `wait0/1/2` on the previous one — exactly the
+disasm signature earlier analysis recorded.
+
+**Fix (register-free, semantically sound):** two plain loads never alias-conflict (read-after-read), so a
+load only needs to wait on prior *stores* (RAW), not on other loads.
+- Split a new `st->store` bitfield (slots holding an in-flight store/atomic) out of `st->memory`.
+- Load waits on `st->store` only; store/atomic still waits on all of `st->memory` (WAR + WAW).
+- Added an explicit **slot-reuse drain**: an async op reusing an occupied general slot drains it first
+  (the blanket serialization had been incidentally providing that safety, since `bi_pop_slot` clears the
+  whole slot; without it a later consumer of the new op would lose its dependency).
+- Env gate `PAN_NO_MLP_LOADS` for zero-rebuild A/B. (The gate is not in the shader-cache key, so A/B needs
+  `MESA_SHADER_CACHE_DISABLE=1` or distinct `MESA_SHADER_CACHE_DIR` per config.)
+
+**Correctness:** gentest greedy tokens **byte-identical** to baseline — independently proves loads truly
+need not serialize against each other.
+
+**Structural (BIFROST_MESA_DEBUG=shaders, cache-disabled):** serializing single-slot waits 3868→3512
+(−9%), 2-slot `wait01` 27→105. Real but small.
+
+**Throughput (pp512, pinned 848 MHz):** FLAT. Clean cool interleaved warm-cache A/B —
+MLP-on 43.49 t/s vs off 43.24 = **+0.6%** (a first, hotter run gave +1.4%); both inside the ±0.3 noise band.
+
+**Why flat (mechanism, evidenced):** `wait012` *batched* waits stayed flat (161→163) ⇒ the pressure
+scheduler (`bi_pressure_schedule`) almost never places three loads adjacently. At the 64-register tile it
+interleaves each load with its consumer to keep live ranges short, so there are almost no independent
+in-flight loads for the flow relaxation to parallelize. The binding constraint remains the per-consumer
+RAW wait on each load — unremovable (you must wait for a load before using its result) and unhideable at
+occupancy-1 (no second warp). Getting real MLP would require the *scheduler* to cluster loads ahead of
+their uses = +3 live load results = spill at 64 registers = the OCC2/pressure wall again. So the flow
+change alone cannot help, and the scheduler change that would help hits the same register wall.
+
+**Disposition:** the change is correct and a legitimate **upstream candidate** on its own merits (it
+removes genuinely-false load-after-load dependencies; the "For now" comment invites exactly this), but it
+does not close the llama gap. Reverted device + host to the known-good baseline driver (`.preMLP.bak`,
+md5-verified + token-checked). Patch preserved at `panthor-mesa-artifacts/mlp-loads-scoreboard.patch`.
+
+**This closes the last register-free lever.** Every avenue — instruction-count (GCM dedup, 16-bit narrow,
+fp fast-div), rematerialization, reload-coalescing, forced occupancy-2, and now MLP / wait-batching — is
+exhausted. The residual 2.19× is the llama tile size (out of scope) or matching libmali's RA/scheduler
+maturity (a multi-week backend project), not any single peephole or scoreboard change.
