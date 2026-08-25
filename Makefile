@@ -434,12 +434,24 @@ all:
 	# A stock-content dracut leaves only what's needed to pivot to the built-in
 	# UFS root, keeping the ramdisk small enough to load. Per-subsystem modules
 	# load normally from /lib/modules once the real rootfs is up.
+	# r8152 (the USB-Ethernet dongle driver) is built-in (CONFIG_USB_RTL8152=y),
+	# so it probes the instant the dongle enumerates on the initramfs's built-in
+	# xHCI host controller (~1.4s, before switch-root). Its errata-patch firmware
+	# (rtl_nic/rtl8153*.fw, from firmware-realtek) lives on the real rootfs, NOT in
+	# this initramfs, so that first probe fails `Direct firmware load ... error -2`
+	# and the chip binds PATCHLESS and never re-probes — which shows up as the
+	# dongle coming up but flaking / failing to hold a DHCP lease ("connected, no
+	# IP"). The AOSP track dodges this only because it builds r8152 as a module
+	# that loads after switch-root. We install the (tiny, ~1K each) rtl8153/8156
+	# USB-GbE patches into the initramfs so that first probe finds them and applies
+	# the patch — unlike the 21M aoc.bin, these do not meaningfully grow the ramdisk.
 	$(NSPAWN) -D $(SYSROOT_DIR) dracut \
 		--kver $(KERNEL_VERSION) \
 		--lz4 \
 		--show-modules \
 		--force \
 		--add "rescue bash rootfs-flash rootfs-slot" \
+		--install "/lib/firmware/rtl_nic/rtl8153a-2.fw /lib/firmware/rtl_nic/rtl8153a-3.fw /lib/firmware/rtl_nic/rtl8153a-4.fw /lib/firmware/rtl_nic/rtl8153b-2.fw /lib/firmware/rtl_nic/rtl8153c-1.fw /lib/firmware/rtl_nic/rtl8156a-2.fw /lib/firmware/rtl_nic/rtl8156b-2.fw" \
 		--kernel-cmdline "rd.shell=0 rd.emergency=reboot"
 	just unmount_rootfs
 	touch $@
