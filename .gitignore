@@ -201,3 +201,9 @@ kernel/source.aosp-backup/
 kernel/source/out/
 out/
 uart-logs/
+
+# Per-build kernel-module staging tarballs, and flash/work scratch dirs — all
+# local build artifacts, never committed.
+modules-*.tar.gz
+.flashtmp/
+.working-*/
