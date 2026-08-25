@@ -116,6 +116,11 @@ Same build outputs (`boot/boot.img`, `boot/vendor_boot.img`, `boot/rootfs.img`, 
 
 Note: **fastboot and UART share the one Type-C port** — never `reboot bootloader` mid-UART-session. Switch slots in-OS with `pixel-bootctl set-active-slot` (or `mark-unbootable` to roll back to AOSP) + reboot.
 
+**Device state: probe, never assume — this is a hard first-step rule, not advice.** felix has ONE Type-C port, so fastboot (USB) ⊥ UART ⊥ dongle ⊥ gadget are mutually exclusive; at most one is live at any instant. Before asserting which mode the device is in — or acting on that assumption — you MUST run an active probe *in the current turn*:
+- `fastboot devices` returning a serial ⇒ the port is USB/fastboot, and UART is therefore **not** flowing. `uartd status` reporting `connected=true` only means the host-side USB-serial *adapter* is plugged in; it says nothing about whether the phone is driving the line.
+- `uart peek`/`uart read` are **forensic history**, never live state — the daemon runs for days and its buffer can show a login prompt (or a service since removed) from a boot that happened long ago. To confirm the OS is actually up right now, use `uart run <cmd>` / `uart wait <regex>` (a fresh device-verified round-trip), not the buffer.
+- Rule of thumb: if you can't point at a probe command from *this* turn, you don't know the device's mode — so don't state it. This exact error (reading a stale UART buffer as if live, forgetting the one-port invariant) has been corrected repeatedly; it recurs whenever state is asserted from remembered/stale output instead of probed.
+
 ## The bring-up tooling ecosystem (sibling repos)
 
 This is the **mainline gs201 kernel track** (`main` is the separate android-GKI / Debian track). Bring-up runs as an unattended, UART-driven inner loop built from sibling repos under the `junkyard-computing` org, beside this one (`../<repo>`, not vendored). Their design specs live in [prompts/](prompts/). Cross-check these before reimplementing flashing, slot logic, register pokes, or a console transport — the split is deliberate.
