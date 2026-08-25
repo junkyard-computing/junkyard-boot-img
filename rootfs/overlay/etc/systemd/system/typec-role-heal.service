@@ -1,0 +1,8 @@
+[Unit]
+Description=Heal Type-C DRP race (force device role on PC attach so the USB gadget binds)
+After=sys-kernel-config.mount systemd-udevd.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/typec-role-heal
+[Install]
+WantedBy=multi-user.target

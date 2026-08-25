@@ -1,0 +1,3 @@
+# A Type-C partner attach can mis-resolve to host (DRP Try.SNK race). Kick the
+# heal so a PC attach reliably lands device-role and the USB gadget binds.
+SUBSYSTEM=="typec", ACTION=="add", KERNEL=="port0-partner", TAG+="systemd", ENV{SYSTEMD_WANTS}="typec-role-heal.service"

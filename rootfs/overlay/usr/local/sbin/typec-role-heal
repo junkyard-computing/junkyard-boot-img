@@ -1,0 +1,37 @@
+#!/bin/sh
+# Heal the gs201 Type-C DRP Try.SNK race: on a PC attach the port can mis-resolve
+# to host so the USB gadget can't come up. If we're STABLY host with a partner
+# but nothing enumerated on our roothub (a PC, not a dongle), force device.
+#
+# Safety for the dongle path: the dongle attach is slower (PD negotiation + data-
+# role swap + enum) and can bounce. So we wait generously, then RE-VERIFY we are
+# still host with the partner present AND nothing downstream, before forcing.
+# A dongle that has (or is about to) enumerate keeps us host; a bouncy/transient
+# connect aborts the heal instead of forcing device.
+exec 9>/run/typec-role-heal.lock
+flock -n 9 || exit 0
+R=/sys/class/usb_role/11210000.usb-role-switch/role
+P=/sys/class/typec/port0
+
+[ "$(cat "$R" 2>/dev/null)" = host ] || exit 0
+[ -d "$P-partner" ] || exit 0
+sleep 6                                   # cover dongle PD+DR-swap+enum (~2-4s) w/ margin
+
+# Re-verify AFTER settling: still host? still attached? (a churny/transient
+# connect will have moved on -> do not force anything.)
+[ "$(cat "$R" 2>/dev/null)" = host ] || exit 0
+[ -d "$P-partner" ] || exit 0
+for d in /sys/bus/usb/devices/*/; do
+    case "$(basename "$d")" in usb[0-9]*) continue ;; esac
+    [ -f "$d/idVendor" ] && exit 0        # a downstream device (dongle) -> keep host
+done
+
+# Stable host + partner + nothing downstream = a PC that lost the race. Force
+# device (verify+retry; the usb_role switch is async).
+i=0
+while [ "$i" -lt 5 ]; do
+    echo device > "$R" 2>/dev/null; sleep 1
+    [ "$(cat "$R" 2>/dev/null)" = device ] && { logger -t typec-role-heal "healed host->device after $((i+1)) try(s)"; exit 0; }
+    i=$((i+1))
+done
+logger -t typec-role-heal "FAILED to hold device role"; exit 1
