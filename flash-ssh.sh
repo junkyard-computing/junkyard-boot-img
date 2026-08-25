@@ -421,7 +421,15 @@ log "normalising AVB flags on the target slot (else it fails verification and ro
 # Sent as a quoted here-doc so the remote script needs no shell escaping.
 sshc 'sudo sh -s' <<'AVBFIX' || die "could not normalise the target slot's AVB flags"
 set -e
-act=$(grep -o 'slot_suffix = "[^"]*"' /proc/bootconfig | cut -d'"' -f2)
+# Active slot: AOSP exposes it in /proc/bootconfig; the mainline kernel has no
+# bootconfig (and no androidboot.slot_suffix on the cmdline either), so fall back
+# to pixel-bootctl, which reads the devinfo the bootloader actually keys on.
+act=$(grep -o 'slot_suffix = "[^"]*"' /proc/bootconfig 2>/dev/null | cut -d'"' -f2)
+if [ -z "$act" ]; then
+	s=$(/usr/local/bin/pixel-bootctl status 2>/dev/null | \
+		awk 'tolower($1)=="slot:"{sl=tolower($2)} $1=="active:"&&$2=="true"{print sl; exit}')
+	case "$s" in a) act=_a ;; b) act=_b ;; esac
+fi
 case "$act" in
 	_a) tgt=b ;;
 	_b) tgt=a ;;
