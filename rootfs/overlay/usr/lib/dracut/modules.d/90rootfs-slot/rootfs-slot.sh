@@ -34,8 +34,8 @@ MIN_HALF_SECTORS=1048576   # 512 MiB in 512-byte sectors
 # Not settled yet — say nothing and let the next iteration try again.
 [ -b "$SUPER" ] || return 0
 
-# Parse slot_suffix out of bootconfig ("androidboot.slot_suffix = "_a"") without
-# needing sed/grep in the initramfs.
+# AOSP: parse slot_suffix out of bootconfig ("androidboot.slot_suffix = "_a"")
+# without needing sed/grep in the initramfs.
 slot=
 while read -r key _eq val _rest; do
     if [ "$key" = "androidboot.slot_suffix" ]; then
@@ -45,6 +45,29 @@ while read -r key _eq val _rest; do
     fi
 done < /proc/bootconfig 2>/dev/null
 
+# Mainline: no bootconfig, and the cmdline carries no slot_suffix either. Ask
+# pixel-bootctl, which reads the boot_control state — the devinfo ACTIVE flag the
+# bootloader repairs to the slot it just booted (`current-slot`, the same
+# GetCurrentSlot primitive pixel-ota consumes). Without this the rootfs half can
+# never track the boot slot on mainline: it silently defaults to _a below, so a
+# unit booting slot B mounts slot A's half and rootfs A/B (and its rollback) does
+# not work. devinfo lives on a different UFS LUN than super, so give it a bounded
+# moment to enumerate; if it still cannot answer we fall through to the _a default
+# and never fail to map. The static pixel-bootctl binary is pulled into the
+# initramfs by module-setup.sh.
+PBCTL=/usr/local/bin/pixel-bootctl
+if [ -z "$slot" ] && [ -x "$PBCTL" ]; then
+    _n=0
+    while [ ! -b /dev/disk/by-partlabel/devinfo ] && [ "$_n" -lt 25 ]; do
+        sleep 0.2 2>/dev/null || sleep 1
+        _n=$((_n + 1))
+    done
+    case "$("$PBCTL" current-slot 2>/dev/null)" in
+        a) slot=_a ;;
+        b) slot=_b ;;
+    esac
+fi
+
 case "$slot" in
     _a) idx=0 ;;
     _b) idx=1 ;;
@@ -52,7 +75,7 @@ case "$slot" in
         # Default to A rather than failing: A is at offset 0, which is also where
         # a bare `fastboot flash super` lands, so it is the half most likely to
         # hold something bootable on a device in an odd state.
-        warn "rootfs-slot: no usable androidboot.slot_suffix (got '${slot:-<none>}'), assuming _a"
+        warn "rootfs-slot: no usable slot (bootconfig + pixel-bootctl), assuming _a"
         slot=_a
         idx=0 ;;
 esac
