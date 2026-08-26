@@ -3,6 +3,17 @@
 # to host so the USB gadget can't come up. If we're STABLY host with a partner
 # but nothing enumerated on our roothub (a PC, not a dongle), force device.
 #
+# ⚠ DETECTION READS THE TYPEC data_role, NEVER /sys/class/usb_role/.../role.
+# Reading the usb_role register does a raw readl that AXI-hangs and HARD-LOCKS
+# CPU0 when the U2 PHY clock is gated — which is EXACTLY the PC-attach case this
+# heal fires on: host role, nothing enumerated downstream, so the host controller
+# is idle and the clock gates. An earlier version of this script read that
+# register in its checks and crashed the phone the first time it was tested
+# against a real PC (2026-08-25). typec `data_role` is a tcpm sysfs read and is
+# safe on any clock state. The usb_role node is only ever WRITTEN here (forcing
+# device goes through the driver's role-set path, which enables the clock it
+# needs), never read.
+#
 # Safety for the dongle path: the dongle attach is slower (PD negotiation + data-
 # role swap + enum) and can bounce. So we wait generously, then RE-VERIFY we are
 # still host with the partner present AND nothing downstream, before forcing.
@@ -10,16 +21,21 @@
 # connect aborts the heal instead of forcing device.
 exec 9>/run/typec-role-heal.lock
 flock -n 9 || exit 0
-R=/sys/class/usb_role/11210000.usb-role-switch/role
+R=/sys/class/usb_role/11210000.usb-role-switch/role   # WRITE-ONLY (see header)
 P=/sys/class/typec/port0
+DR="$P/data_role"
 
-[ "$(cat "$R" 2>/dev/null)" = host ] || exit 0
+# The current data role is the bracketed token in e.g. "[host] device".
+cur_host()   { case "$(cat "$DR" 2>/dev/null)" in *'[host]'*)   return 0 ;; esac; return 1; }
+cur_device() { case "$(cat "$DR" 2>/dev/null)" in *'[device]'*) return 0 ;; esac; return 1; }
+
+cur_host || exit 0
 [ -d "$P-partner" ] || exit 0
 sleep 6                                   # cover dongle PD+DR-swap+enum (~2-4s) w/ margin
 
 # Re-verify AFTER settling: still host? still attached? (a churny/transient
 # connect will have moved on -> do not force anything.)
-[ "$(cat "$R" 2>/dev/null)" = host ] || exit 0
+cur_host || exit 0
 [ -d "$P-partner" ] || exit 0
 for d in /sys/bus/usb/devices/*/; do
     case "$(basename "$d")" in usb[0-9]*) continue ;; esac
@@ -27,11 +43,12 @@ for d in /sys/bus/usb/devices/*/; do
 done
 
 # Stable host + partner + nothing downstream = a PC that lost the race. Force
-# device (verify+retry; the usb_role switch is async).
+# device by WRITING the usb_role switch (never reading it); confirm via the safe
+# typec data_role. The switch is async, so verify + retry.
 i=0
 while [ "$i" -lt 5 ]; do
     echo device > "$R" 2>/dev/null; sleep 1
-    [ "$(cat "$R" 2>/dev/null)" = device ] && { logger -t typec-role-heal "healed host->device after $((i+1)) try(s)"; exit 0; }
+    cur_device && { logger -t typec-role-heal "healed host->device after $((i+1)) try(s)"; exit 0; }
     i=$((i+1))
 done
-logger -t typec-role-heal "FAILED to hold device role"; exit 1
+logger -t typec-role-heal "FAILED to confirm device role via data_role"; exit 1
