@@ -43,9 +43,40 @@ frozen inside the instruction with IRQs disabled → no NMI response → hard-lo
 defeat this by exposing the CMU_DISP gates + the QCH `CLOCK_REQ` (bit 1) as
 `CLK_IS_CRITICAL` with `auto_clock_gate=false`. **It reduces but does not eliminate** the
 stalls — the block still idle-gates intermittently (~1 in many boots, and every
-self-refresh cycle at runtime). The residual leak is not yet root-caused (candidates: a
-clock DECON touches that is not in the held set; or a HW Q-channel race the gate-hold
-can't fully win).
+self-refresh cycle at runtime).
+
+### Why d1ef1531 leaked — ROOT-CAUSED 2026-09-12
+
+Two facts in the generic samsung clk code, which together defeat it:
+
+1. **Global CMU auto mode overrides every per-register HWACG bit.** This is stated in
+   `drivers/clk/samsung/clk-exynos-arm64.c` at the `CMU_OPT_GLOBAL_EN_AUTO_GATING` write:
+   *"This overrides the individual HWACG bits in each of the individual gate, mux and qch
+   registers."* So holding `CLOCK_REQ` has **no effect** while global auto mode is armed.
+2. **`auto_clock_gate = false` does not disarm it — it only declines to arm it.** Nothing
+   ever *clears* `CONTROLLER_OPTION`, so CMU_DISP keeps whatever the **bootloader** left
+   there, and the bootloader leaves global auto mode **on**.
+
+There is a partial escape hatch: with `!init_auto`, `exynos_arm64_init_clocks()` sets
+`GATE_MANUAL` (bit 20) on each register in `clk_regs`, which the in-tree comment notes
+*does* override global auto mode. But it is guarded by `is_gate_reg()`, i.e.
+`GATE_OFF_START..GATE_OFF_END` = **0x2000–0x2fff** — and the gs201 CMU_DISP **QCH_CON
+registers live at 0x3008–0x3020**, outside that window. So:
+
+- the DECON **gate** bits (0x2010 `AD_APB_DECON_MAIN` PCLKM, 0x2014 `DPUB` ACLK_DECON) *were*
+  genuinely held — which is why `d1ef1531` could read back a live 399 MHz DECON clock;
+- the DECON **Q-channel** (0x300c `QCH_CON_DPUB_QCH`) was **never** taken out of auto mode,
+  so the hardware idle-gated DPUB anyway.
+
+That is the whole discrepancy between "the clock reads 399 MHz and the bits are held" and
+"a late modeset still AXI-hangs". **A register read-back proving a bit is set is not proof
+the hardware honours it** — an overriding mode elsewhere can make a held bit inert.
+
+**Fix:** new `samsung_cmu_info.force_manual_clock_gate` flag, set for CMU_DISP. It (a)
+*clears* `OPT_EN_AUTO_GATING` et al. in `CONTROLLER_OPTION` instead of merely not setting
+them, and (b) extends the `GATE_MANUAL` override to the QCH window (new `is_qch_reg()`,
+0x3000–0x3fff), gated on the flag so no other platform's QCH behaviour changes. It logs the
+pre-existing `CONTROLLER_OPTION` value, which confirms what the bootloader left.
 
 ## The two triggers
 
@@ -66,15 +97,46 @@ former hang window (validated to 300 s+). This is a **workaround** (it disables 
 power-saving feature); the durable fix is to actually drive the inner panel with a DRM
 client (fbdev), or to fully defeat the CMU_DISP idle-gate.
 
-### Boot (OPEN)
+### Boot (root-caused 2026-09-12; fix built, awaiting hardware validation)
 
 At boot, the bootloader hands DECON0 off running (`DECON_STATE_INIT`); the kernel stops it
 before re-enabling. `decon_enable` → (INIT branch) `_decon_stop_locked` → `decon_reg_stop`
 → `decon_reg_stop_perframe_dsi` issues a `readl` on DECON regs **under `spin_lock_irqsave`
 (IRQs off)**. Intermittently that `readl` hits the idle-gated block and hard-locks the CPU.
 Pinned with instrumentation to exactly between markers **`DECONDBG D2 stop_locked (INIT)`**
-and **`DECONDBG E pre _decon_enable_locked`** (i.e. inside `_decon_stop_locked` /
-`decon_reg_stop`). **Not yet fixed.**
+and **`DECONDBG E pre _decon_enable_locked`**; with finer markers, to the
+`decon_reg_set_win_enable` read-modify-write at the head of `_decon_reinit_locked`.
+
+**Timing threshold (the key evidence).** A modeset at **t15–25 s completes**; one at
+**t40–83 s stalls**. On UART there is no network, so kmscon waits on
+`NetworkManager-wait-online` and the modeset always lands t40+ — which is why *UART* boots
+hang near-deterministically while dongle boots are intermittent.
+
+**What makes t40 different from t20 — and it is not elapsed time.** At t≈20 s the panel
+handoff timer fires (`no modeset claimed the panel 20000ms after handoff; blanking it`) and
+asserts the panel **reset** gpio. The inner ana6707 is a **command-mode** panel, so DECON0's
+frame start is driven by the panel's **TE** signal. Killing the panel stops TE → DECON0
+stops issuing frames → DECON0's `QACTIVE` to CMU_DISP deasserts → the DISP clock idle-gates
+→ the next DECON SFR access bus-stalls. Before the blank, DECON0 is still streaming from
+the bootloader handoff, holds QACTIVE high, and the clock cannot gate. That predicts
+exactly the observed t15–25-OK / t40+-hang split.
+
+**Confirmed 2026-09-12:** pushing `EXYNOS_PANEL_HANDOFF_TIMEOUT_MS` 20000 → 120000 made a
+boot under the *exact* previously-hanging condition (USB, no network, modeset ~t40)
+**complete** — userspace reached, USB gadget enumerated at t≈43 s. One boot, so not yet a
+rate; but it is the first configuration that survived that condition at all.
+
+Note this is *not* merely deferring the hang: once any modeset claims the panel,
+`panel_state != PANEL_STATE_HANDOFF` and the blank never fires at all. It is still the
+wrong fix (it makes correctness depend on boot finishing within the timeout, and leaves the
+underlying clock bug live for every later modeset) — the real fix is the CMU_DISP
+`force_manual_clock_gate` change above. **Status: fix built, not yet validated on hardware.**
+
+### Ranking the two fixes
+
+The clock fix is the one to keep. The handoff-timeout bump is a stopgap worth remembering
+because it is a **one-line, zero-risk** way to get a bootable device while iterating on the
+clock path.
 
 ## Ruled out (do not re-chase)
 
@@ -90,6 +152,18 @@ and **`DECONDBG E pre _decon_enable_locked`** (i.e. inside `_decon_stop_locked` 
 - **TPU / pd_tpu genpd gating** — re-enabling `pd_tpu` (status=okay + edgetpu phandle)
   causes a *different* hard-lockup at the late_initcall reap; the DT deliberately keeps
   pd_tpu out of genpd. Unrelated to this bug.
+- **DECON's own internal auto-CG (gate #1)** — `decon_reg_set_clkgate_mode(id, 0)`
+  (`CLOCK_CON` AUTO_CG/QACTIVE). Called at `decon_probe`, at `decon_reg_stop`, and at the top
+  of `_decon_reinit_locked`; the hang persists at the *identical* spot every time. It cannot
+  work, and the reason is instructive: the `clkgate_mode` write is **posted**, so it returns
+  and its marker prints, while the very next *read*-modify-write (`decon_reg_set_win_enable`)
+  stalls. No DECON-side register write can fix a clock gated *externally* by CMU_DISP.
+  Distinguish carefully: **gate #1** = DECON's internal auto-CG (ruled out), **gate #2** =
+  the CMU_DISP block clock idle-gate (the actual cause).
+- **Making the modeset earlier via the kernel cmdline** —
+  `systemd.mask=NetworkManager-wait-online.service` appended to the boot cmdline. Tested
+  2026-09-12: still hung, same `RST_STAT 0x80`. Masking the wait does not move the modeset
+  early enough to beat the t20 panel blank.
 
 ## Diagnosis playbook (how this was found, how to reproduce)
 
@@ -115,15 +189,36 @@ and **`DECONDBG E pre _decon_enable_locked`** (i.e. inside `_decon_stop_locked` 
 
 ## Next steps
 
-1. **Fix the boot `decon_reg_stop` hang** — instrument `decon_reg_stop_perframe_dsi` to
-   pin the exact register, then either force+read-back the CMU_DISP clock immediately
-   before the access, or skip the per-frame stop in the INIT branch (bootloader frame
-   state is unknown anyway), or root-cause the d1ef1531 leak.
-2. **Durable runtime fix** — drive the inner panel with a DRM/fbdev client so it isn't
-   left unclaimed (branch `feature/mainline-fbcon-*`), which removes the self-refresh churn
-   without disabling the power-saving feature.
-3. Once both hold, re-run the multi-reboot soak to validate (the soak harness lives in the
-   session scratchpad: `rbsoak.sh`).
+1. **Validate `force_manual_clock_gate` on hardware.** Flash, boot on USB with no network
+   (the reliably-hanging condition), and check the console/`dmesg` for
+   `CONTROLLER_OPTION=0x…  -> forcing manual clock gating`. The logged value is itself the
+   proof of what the bootloader left armed: if `OPT_EN_AUTO_GATING` (bit 28) is **set** in
+   it, the leak explanation is confirmed outright.
+2. **Soak it.** One boot proves nothing here — this bug is a coin flip and two clean boots
+   have misled us before. Run ≥10 reboots.
+3. **Durable runtime fix** — drive the inner panel with a DRM/fbdev client so it isn't
+   left unclaimed, which removes the self-refresh churn *and* keeps DECON's QACTIVE
+   asserted, addressing both triggers at the source. No `feature/mainline-fbcon-*` branch
+   survives; rebuild per memory `project_fbcon_hangs_felix` (select `DRM_CLIENT_SELECTION`
+   + `DRM_TTM_HELPER`, GEM `->vmap`, `DRM_FBDEV_TTM_DRIVER_OPS`, **deferred**
+   `drm_client_setup()`, `cma=128M`, `.dirty = drm_atomic_helper_dirtyfb`).
+4. Consider reverting `0aa178ed` ("hold VSYS in BUCK … [UNVALIDATED]") — written under the
+   now-disproven power framing.
+
+### Host-rig notes worth keeping
+
+- **`lsusb` is not on this host's `$PATH`** (same class of trap as `strings` missing in the
+  nix shell — it silently broke a boot-detection harness into never reporting success).
+  Enumerate `/sys/bus/usb/devices/*/idVendor` instead.
+- **Boot success can be classified with no console at all**, which matters because UART and
+  USB are mutually exclusive and UART cannot charge: reboot from fastboot, then watch for
+  USB gadget `18d1:d001` in sysfs (⇒ userspace reached) versus the device reappearing in
+  fastboot (⇒ panic loop burned its A/B retries). This runs on USB, so the battery
+  **charges** throughout — prefer it over UART for rate-measurement soaks.
+- The gadget's host-side interface comes up but takes **no DHCP lease** (the phone's
+  `dnsmasq` isn't serving on the mainline image), so there is no SSH over the gadget; the
+  host side would need a static address. That is why a reboot soak still needs either a UART
+  shell or manual intervention.
 
 See also memory notes: `project_felix_uvlo_is_decon_hardlockup`,
 `project_felix_decon_enable_boot_loop`, `project_pkvm_cmu_unlock`.
