@@ -45,7 +45,29 @@ defeat this by exposing the CMU_DISP gates + the QCH `CLOCK_REQ` (bit 1) as
 stalls — the block still idle-gates intermittently (~1 in many boots, and every
 self-refresh cycle at runtime).
 
-### Why d1ef1531 leaked — ROOT-CAUSED 2026-09-12
+### ⚠ FIRST: d1ef1531 was INERT ON HARDWARE for two weeks (found 2026-09-12)
+
+Before believing anything about the clock fixes below, check that the **DTB on the device
+actually has the node**. It did not.
+
+`d1ef1531` added `cmu_disp: clock-controller@1c200000` to `gs201.dtsi`. The DTB rides
+**`vendor_boot.img`**, not `boot.img` — and `boot/vendor_boot.img` was dated **2026-08-26**,
+five days *before* that commit. Every debug cycle flashed only `boot.img`, so the kernel and
+the device tree drifted two weeks apart. Proof, three independent ways:
+
+- `grep -a -c gs201-cmu-disp` on the unpacked on-device `vendor_boot` dtb → **0** (new one → 1).
+- on the running device, `ls -d /proc/device-tree/clock-controller@*` → only `@10800000`,
+  `@10c00000`, `@11000000`, `@14400000`, `@1e080000`. No `@1c200000`.
+- instrumented `exynos_arm64_init_clocks()` printed **5** CMUs with the old DTB and **13**
+  with the new one.
+
+So the CMU_DISP driver never bound, `CLK_IS_CRITICAL` never held anything, and the only
+thing keeping the DISP clock alive was DECON actively streaming. **Lesson: a DT-dependent
+kernel fix is unverifiable until `vendor_boot` is reflashed; a kernel-only flash silently
+tests nothing.** After flashing the new `vendor_boot`, the CMU_DISP markers appeared
+immediately.
+
+### Why d1ef1531 leaked — ROOT-CAUSED 2026-09-12, then CONFIRMED ON HARDWARE
 
 Two facts in the generic samsung clk code, which together defeat it:
 
@@ -77,6 +99,41 @@ the hardware honours it** — an overriding mode elsewhere can make a held bit i
 them, and (b) extends the `GATE_MANUAL` override to the QCH window (new `is_qch_reg()`,
 0x3000–0x3fff), gated on the flag so no other platform's QCH behaviour changes. It logs the
 pre-existing `CONTROLLER_OPTION` value, which confirms what the bootloader left.
+
+**Measured on hardware once the DTB was fixed — the explanation is CONFIRMED:**
+
+```
+clock-controller@1c200000: CONTROLLER_OPTION 0xf1000000 -> 0x00000000
+                           (forcing manual clock gating; auto_gating bit28 was SET)
+clock-controller@1c200000: QCH +0x300c 0x003f0002 -> 0x003f0002
+```
+
+`0xf1000000` is exactly `CMU_OPT_GLOBAL_EN_AUTO_GATING` (bits 31/30/29/28/24) — the
+bootloader really does leave global auto mode armed, so it really was overriding the held
+bits. The QCH writes are correctly no-ops: `0x003f0002` already has `GATE_MANUAL` (bit 20)
+set and `GATE_ENABLE_HWACG` (bit 28) clear.
+
+**…and it is still NOT sufficient.** With CMU_DISP's auto mode provably cleared, a modeset at
+t31.7 still hard-locked at the same instruction. So clearing it was necessary-but-not-enough.
+
+### Next suspect: the same trap one level up, in CMU_TOP (UNTESTED)
+
+CMU_DISP is fed by CMU_TOP's `CLK_DOUT_CMU_DISP_BUS`, and `exynos_arm64_enable_bus_clk()`
+does `clk_prepare_enable()` on it — so the gate bit is held. But **CMU_TOP runs with
+`auto_clock_gate = true`** (deliberately, for the ~407 mW idle win), which means:
+
+- its global auto mode overrides its own per-gate HWACG bits, exactly as in CMU_DISP; and
+- the `GATE_MANUAL` escape hatch is skipped for *all* of CMU_TOP, because the generic loop is
+  guarded by `is_gate_reg(off) && !init_auto`.
+
+So the DISP distribution branch (`CLK_CON_GAT_GATE_CLKCMU_DISP_BUS`, **0x2070**, bit 21,
+flags 0) can be idle-gated by CMU_TOP no matter what CMU_DISP does. This also explains why
+the hang predates the new DTB: CMU_TOP's auto mode was already armed.
+
+Candidate fix, implemented but **not yet validated**: `samsung_cmu_info.manual_gate_regs[]`,
+a per-gate exemption list applied unconditionally (so it reaches a CMU that *is* in auto
+mode), set to `{ CLK_CON_GAT_GATE_CLKCMU_DISP_BUS }` for `top_cmu_info_gs201`. Surgical on
+purpose: CMU_TOP keeps HWACG on every other branch, so the idle-power win survives.
 
 ## The two triggers
 
@@ -121,22 +178,33 @@ stops issuing frames → DECON0's `QACTIVE` to CMU_DISP deasserts → the DISP c
 the bootloader handoff, holds QACTIVE high, and the clock cannot gate. That predicts
 exactly the observed t15–25-OK / t40+-hang split.
 
-**Confirmed 2026-09-12:** pushing `EXYNOS_PANEL_HANDOFF_TIMEOUT_MS` 20000 → 120000 made a
-boot under the *exact* previously-hanging condition (USB, no network, modeset ~t40)
-**complete** — userspace reached, USB gadget enumerated at t≈43 s. One boot, so not yet a
-rate; but it is the first configuration that survived that condition at all.
+**The TE/QACTIVE theory above is FALSIFIED — do not re-chase it.** Bumping
+`EXYNOS_PANEL_HANDOFF_TIMEOUT_MS` to 120000 did produce one clean boot under the
+previously-hanging condition, which looked like confirmation. It was the coin flip. Two
+follow-ups killed it:
 
-Note this is *not* merely deferring the hang: once any modeset claims the panel,
-`panel_state != PANEL_STATE_HANDOFF` and the blank never fires at all. It is still the
-wrong fix (it makes correctness depend on boot finishing within the timeout, and leaves the
-underlying clock bug live for every later modeset) — the real fix is the CMU_DISP
-`force_manual_clock_gate` change above. **Status: fix built, not yet validated on hardware.**
+- that same boot **hard-locked ~8 minutes later** when the blank finally fired, and
+- a build that **never arms the blank at all** (`if (false && …)`, no `blanking it` in the
+  log) still hard-locked at t41, at the identical instruction.
 
-### Ranking the two fixes
+So asserting the panel reset is not what gates the clock. If anything quiesces DECON it is
+more likely the panel/DSIM driver probe around t21 reconfiguring the link. **One clean boot
+is not evidence here** — this bug has now produced three false positives (pKVM, handoff-120s,
+and an un-drained UART buffer that replayed a previous boot's success as if it were current).
 
-The clock fix is the one to keep. The handoff-timeout bump is a stopgap worth remembering
-because it is a **one-line, zero-risk** way to get a bootable device while iterating on the
-clock path.
+### The timing threshold, measured
+
+| modeset at | outcome |
+|---|---|
+| t15.8 | completes (`DECONDBG E → 01…12 → F → decon_enable -`) |
+| t23.7 | completes |
+| t25.3 | completes |
+| t31.7 | **hard lockup** |
+| t41.1 / t41.5 / t102 | **hard lockup** |
+
+The boundary sits around **t25–31**, and it is the single best predictor of a hung boot. On
+UART there is no DHCP, so `NetworkManager-wait-online` pushes the modeset past it almost
+every time; with the dongle in, boots land in the safe window and succeed.
 
 ## Ruled out (do not re-chase)
 
@@ -215,10 +283,35 @@ clock path.
   USB gadget `18d1:d001` in sysfs (⇒ userspace reached) versus the device reappearing in
   fastboot (⇒ panic loop burned its A/B retries). This runs on USB, so the battery
   **charges** throughout — prefer it over UART for rate-measurement soaks.
-- The gadget's host-side interface comes up but takes **no DHCP lease** (the phone's
-  `dnsmasq` isn't serving on the mainline image), so there is no SSH over the gadget; the
-  host side would need a static address. That is why a reboot soak still needs either a UART
-  shell or manual intervention.
+- **SSH over the USB-Ethernet dongle is the best channel by far** — and the device is at
+  **192.168.1.139**, reachable with the **`~/.ssh/junkyard-fleet`** key (the default keys are
+  rejected). ⚠ `192.168.1.138` is **this build host's own wifi address** — an older note
+  claiming ".138 = mainline" is stale, and probing it yields a misleading "alive" + a
+  "Permission denied (publickey)" from the host itself. Always check
+  `ip -br addr | grep <ip>` before trusting a remembered address.
+- With that shell, partitions can be written **straight over the network**, which removes the
+  whole fastboot cable dance (UART ⊥ USB means each fastboot flash otherwise costs two cable
+  moves):
+  `cat boot.img | ssh … 'sudo dd of=/dev/disk/by-partlabel/boot_a bs=1M conv=fsync'`
+  then verify with a length-limited readback:
+  `sudo dd if=… bs=1M count=<bytes> iflag=count_bytes | sha256sum`.
+  `boot_a` = `/dev/sda10`, `vendor_boot_a` = `/dev/sda12`, both 64 MiB.
+- **The rootfs is 100 % full** (3.8 G, with `/usr` alone 3.2 G — 2.6 G of `/usr/lib` plus
+  `/opt/mesa-g710`). Not a runaway log: the image simply outgrew the partition. It means no
+  room to stage an image on `/`, and `journalctl --vacuum` frees nothing (journal is in
+  `/run`). Stream to the partition instead, and consider bumping `SIZE`.
+- Earlier claim that the phone's `dnsmasq` "isn't serving" on the gadget was **wrong** — the
+  mainline image does ship `usb_gadget` enabled with `--dhcp-range=10.42.0.10,10.42.0.100`.
+  The gadget link had no address because nothing on the *host* ran a DHCP client on it (the
+  interface never even appeared in `nmcli device`) and the phone only stayed up ~50 s.
+- ⚠ **Drain the uartd buffer before a reboot you intend to measure.** `uart read` returns
+  everything since the last read, so a capture started after issuing the reboot replays the
+  *previous* boot — which once made a stale success look like the new kernel's. Anchor on a
+  fresh `Booting Linux`, and confirm the `#<build>` in the live `Linux version` line.
+- `netcheck-recover` commits the slot on a good boot (`network proven — slot committed`),
+  which **disarms the retry-park** that is the only automatic route back to fastboot. For
+  experiments: `touch /etc/netcheck-recover.disable`, and re-arm with
+  `pixel-bootctl set-active-slot a` (marks active, NOT successful, retry 7).
 
 See also memory notes: `project_felix_uvlo_is_decon_hardlockup`,
 `project_felix_decon_enable_boot_loop`, `project_pkvm_cmu_unlock`.
