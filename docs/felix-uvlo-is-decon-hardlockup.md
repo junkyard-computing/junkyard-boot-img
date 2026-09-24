@@ -1,24 +1,61 @@
-# felix "0xcfcd UVLO" is a DECON/CMU_DISP hard-lockup, not a power event
+# felix "0xcfcd UVLO" is a DECON hard-lockup caused by a reaped SoC rail
 
-**Status (2026-09-11):** root cause understood; runtime lockup FIXED; boot lockup STILL OPEN.
-Track: mainline gs201/felix (this repo). Applies to the AOSP-GKI track only in that the
-same `0xcfcd` reboot-reason string appears there too — but this document is about mainline.
+**Status (2026-09-24): ROOT CAUSE FOUND AND FIXED.** Kernel commit **`c055c18c`**
+(`arm64: dts: gs201-felix: keep S1S_VDD_CAM (buck1s) always-on`), on
+`fix/gs201-bringup-power`. Validated 11/11 under a forced-late modeset that previously
+failed 6/6. Track: mainline gs201/felix.
 
-## TL;DR
+## TL;DR — read this first
 
-- The reboot reason **`0xcfcd - UVLO (IF-PMIC)`** that felix's bootloader prints is a
-  **mislabel**. On mainline it is almost always a **kernel hard-lockup**, not a PMIC
-  under-voltage. The bootloader prints "UVLO (IF-PMIC)" as its *default* reason whenever
-  the kernel dies without setting a clean reboot reason. **Do not trust the reboot-reason.**
-- The hard-lockup is a **CPU bus-stall on a DECON MMIO access whose CMU_DISP clock has
-  idle-gated (Q-channel)**. The stalled CPU is stuck mid-`readl` with IRQs off, so it
-  **does not answer the NMI** → the buddy watchdog panics ~10 s later.
-- Two distinct manifestations, same root:
-  1. **Runtime lockup** (~t130–210 s), triggered by the unclaimed inner panel's
-     **DRM self-refresh** cycling (`exynos_crtc_atomic_check: plane-less update is detected`).
-     **FIXED** by disabling self-refresh on the inner panel (kills the trigger).
-  2. **Boot lockup** in `decon_reg_stop` (the DECON per-frame-stop `readl`), intermittent
-     (~50% of boots). **STILL OPEN.** Not fixed by pKVM.
+- **The cause:** our DT let `regulator_init_complete()` reap the S2MPG13 **buck1s**
+  (`S1S_VDD_CAM`) rail **~30 s into boot**, to save ~62 mW. AOSP keeps that rail
+  `regulator-always-on` (`gs201-pmic.dtsi` BUCK1S, `subsys-name "Multimedia"`) — and the
+  display pipe depends on it despite the CAM name. After the reap, the first DECON SFR
+  access of any modeset **bus-stalls the CPU forever** → hard lockup → buddy-watchdog
+  panic → software reset → bootloader prints **`0xcfcd - UVLO (IF-PMIC)`**.
+- **The fix:** `regulator-always-on` on `buck1s` (`c055c18c`). Costs the ~62 mW the reap
+  used to save. Don't take it back without finding the rail's real display-side consumer.
+- **Why it hid for weeks:** the reboot reason says "UVLO", which sent effort after the
+  charger/OTG/battery; then the stall *looked* like a clock idle-gate, which sent two weeks
+  after CMU_DISP/CMU_TOP clock gating. It *is* a power problem — a SoC rail, not the cell,
+  which is why the battery never drooped.
+- **The one pattern that gave it away:** a modeset landing at **t15–25 always completed**,
+  one at **t31+ always hung**. The reap fires ~t30. On UART there's no DHCP, so
+  `NetworkManager-wait-online` pushes kmscon's modeset past the reap; with the dongle it
+  usually lands before — hence "UART boots hang, dongle boots mostly don't".
+- The runtime lockup (~t130–210, DRM self-refresh churn on the unclaimed inner panel) was
+  fixed separately and earlier by disabling self-refresh (see below). It is very likely the
+  same rail — every one of those commits came after the reap — but that fix predates this
+  one and was not re-tested with self-refresh restored.
+
+### Evidence
+
+Modeset forced late with a 35 s `ExecStartPre=/bin/sleep 35` drop-in on
+`kmsconvt@.service` (a **deterministic reproduction** — use this, not boot-luck):
+
+| DTB | clock changes | late modesets | result |
+|---|---|---|---|
+| buck1s reaped | on (`#66`) | t31.7, t41 ×3, t61, t102 | **0/6** — all hard LOCKUP |
+| buck1s always-on | on (`#66`) | t51.6, t60.9, t60.2, t122.8, t61.2, t121.8 | **6/6** |
+| buck1s always-on | **off** (`#67`) | t61.3, t60.8, t61.4, t59.9, t60.1 | **5/5** |
+
+The last row is the isolation: with `force_manual_clock_gate` and the CMU_TOP per-gate
+exemption both switched off (log shows `force_manual=0`, no `manual gate` line), the rail
+alone fixes it. Tell-tale log line when it's broken: `s2mpg13_buck1s_vdd_cam: disabling`
+at ~t31, then any later `decon_enable +` never reaches `DECONDBG F`.
+
+### What this means for the rest of this document
+
+Everything below is the investigation that got here. Its **clock theories are superseded**:
+the bootloader really does leave CMU_DISP global auto-gating armed (`CONTROLLER_OPTION
+0xf1000000`, bit 28 set) and CMU_TOP's DISP branch really is under auto mode, and both
+facts are real — but fixing them changed nothing, and fixing the rail alone fixes
+everything. The experimental clock-gating kernel changes are **not committed**; a backup of
+that WIP is at `kernel-wip-20260924.patch.bak`. The DTB/`vendor_boot` lesson, the
+diagnosis playbook, and the rig notes all still apply.
+
+Open question worth one experiment: `d1ef1531` (the CMU_DISP clock driver, committed) was
+present in all 11 passing runs. It has not been shown to be necessary *or* unnecessary.
 
 ## How to recognise it
 
@@ -304,6 +341,18 @@ every time; with the dongle in, boots land in the safe window and succeed.
   mainline image does ship `usb_gadget` enabled with `--dhcp-range=10.42.0.10,10.42.0.100`.
   The gadget link had no address because nothing on the *host* ran a DHCP client on it (the
   interface never even appeared in `nmcli device`) and the phone only stayed up ~50 s.
+- ⚠ **Reseating the UART adapter invalidates uartd's file descriptor.** The FT232R
+  re-enumerates (`/dev/ttyUSB0` gets a new mtime) and uartd keeps reporting
+  `connected=true` while reading nothing, forever. **Restart uartd after any replug.**
+  Launch it with `setsid nohup ./target/release/uartd --config run/uartd-felix.toml … &
+  disown` — a plain backgrounded launch from the tool shell gets killed with it (exit 144).
+- ⚠ **`buffer=0B` and a failed ping do not mean the device is dark.** An idle device at a
+  login prompt emits nothing. Probe positively (`uart run`, or bootloader output across a
+  reboot — that one is unconditional when the mux is armed).
+- **Reboot experiments with `sync; echo b > /proc/sysrq-trigger`**, not `systemctl
+  reboot`. With the rail bug present, the DRM teardown in a normal shutdown could hit the
+  same stall and wedge the device with no reset and no output (it did, twice); sysrq-b
+  skips teardown. Enable first with `echo 1 > /proc/sys/kernel/sysrq`.
 - ⚠ **Drain the uartd buffer before a reboot you intend to measure.** `uart read` returns
   everything since the last read, so a capture started after issuing the reboot replays the
   *previous* boot — which once made a stale success look like the new kernel's. Anchor on a
