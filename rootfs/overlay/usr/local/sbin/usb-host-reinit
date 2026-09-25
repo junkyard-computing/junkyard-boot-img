@@ -43,7 +43,10 @@ carrier() { for n in /sys/class/net/*; do case $(basename $n) in lo|usb0) ;; *) 
 } > "$LOG" 2>&1
 sync
 logger -t usb-host-reinit "$(tail -1 "$LOG") -> $LOG"
-if [ -z "$(carrier)" ] && [ $SAFETY = yes ]; then
+# Decide on what the wait loop MEASURED, not a fresh check: a link that
+# recovered and then dropped again seconds later (seen: deaths 15.6 s apart)
+# must not turn into a reboot -- usb-wedge-trace re-inits on the next death.
+if ! grep -q "^RESULT: RECOVERED" "$LOG" && [ $SAFETY = yes ]; then
   logger -t usb-host-reinit "no carrier after re-init; safety reboot"; sleep 2; sync
   echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger
 fi
