@@ -1,0 +1,109 @@
+diff --git a/drivers/usb/core/hub.c b/drivers/usb/core/hub.c
+index d92bf887739d..f12a655eced8 100644
+--- a/drivers/usb/core/hub.c
++++ b/drivers/usb/core/hub.c
+@@ -123,6 +123,21 @@ module_param(old_scheme_first, bool, S_IRUGO | S_IWUSR);
+ MODULE_PARM_DESC(old_scheme_first,
+ 		 "start with the old device initialization scheme");
+ 
++/*
++ * Recover an SS.Inactive link with a port-only warm reset BEFORE resetting the
++ * attached device. The full-device path quiesces the driver first, which
++ * cancels in-flight URBs, which makes the host controller issue Stop Endpoint
++ * commands against the dead link. Some xHCI implementations (seen on the gs201
++ * dwc3) never complete Stop Endpoint on an SS.Inactive port: the command times
++ * out after 5 s and the controller is declared dead, turning a recoverable link
++ * drop into a lost host controller. Retraining the link first means those
++ * commands run against a live link.
++ */
++static bool warm_reset_port_first;
++module_param(warm_reset_port_first, bool, S_IRUGO | S_IWUSR);
++MODULE_PARM_DESC(warm_reset_port_first,
++		 "Warm-reset an SS.Inactive port before resetting its attached device");
++
+ static bool use_both_schemes = true;
+ module_param(use_both_schemes, bool, S_IRUGO | S_IWUSR);
+ MODULE_PARM_DESC(use_both_schemes,
+@@ -5865,6 +5880,14 @@ static void port_event(struct usb_hub *hub, int port1)
+ 				hub_port_disable(hub, port1, 1);
+ 		} else {
+ 			dev_dbg(&port_dev->dev, "do warm reset, full device\n");
++			if (warm_reset_port_first) {
++				/* see warm_reset_port_first: retrain the link first */
++				err = hub_port_reset(hub, port1, NULL,
++						     HUB_BH_RESET_TIME, true);
++				dev_info(&port_dev->dev,
++					 "SS.Inactive: port-first warm reset %s (%d)\n",
++					 err ? "FAILED" : "ok", err);
++			}
+ 			usb_unlock_port(port_dev);
+ 			usb_lock_device(udev);
+ 			usb_reset_device(udev);
+diff --git a/drivers/usb/host/xhci-ring.c b/drivers/usb/host/xhci-ring.c
+index 4f98d8269625..0e9033cb421a 100644
+--- a/drivers/usb/host/xhci-ring.c
++++ b/drivers/usb/host/xhci-ring.c
+@@ -1714,6 +1714,28 @@ void xhci_cleanup_command_queue(struct xhci_hcd *xhci)
+ 		xhci_complete_del_and_free_cmd(cur_cmd, COMP_COMMAND_ABORTED, 0);
+ }
+ 
++/*
++ * On a Stop Endpoint command timeout, try to recover instead of declaring the
++ * host dead: abort the command ring (as every other command timeout already
++ * does) and, if that works, give the endpoint's URBs back so the caller's
++ * cancel returns and the device reset can proceed. If the abort itself fails,
++ * xhci_abort_cmd_ring() halts the host and declares it dead -- today's outcome.
++ *
++ * Seen on the gs201 dwc3 xHCI: after a SuperSpeed link drops to SS.Inactive,
++ * Stop Endpoint on that device never completes -- even once a warm reset has
++ * retrained the link to U0 -- and the unconditional hc_died below turns a
++ * recoverable link drop into a lost host controller.
++ *
++ * Caveat: the URBs are returned before the controller confirmed the endpoint
++ * stopped, so it could still DMA into their buffers. Acceptable for drivers
++ * that keep transfer buffers for the device's lifetime (r8152 does); the
++ * device is then reset, which disables and rebuilds its endpoint rings.
++ */
++static bool stop_ep_timeout_recover;
++module_param(stop_ep_timeout_recover, bool, 0644);
++MODULE_PARM_DESC(stop_ep_timeout_recover,
++		 "On Stop Endpoint timeout, abort the command ring and return the endpoint's URBs instead of declaring the host dead");
++
+ void xhci_handle_command_timeout(struct work_struct *work)
+ {
+ 	struct xhci_hcd	*xhci;
+@@ -1751,6 +1773,34 @@ void xhci_handle_command_timeout(struct work_struct *work)
+ 		if (ep)
+ 			ep->ep_state &= ~EP_STOP_CMD_PENDING;
+ 
++		if (stop_ep_timeout_recover) {
++			unsigned int slot = TRB_TO_SLOT_ID(cmd_field3);
++			unsigned int epi = TRB_TO_EP_INDEX(cmd_field3);
++
++			xhci_warn(xhci, "stop endpoint timeout (slot %u ep %u): aborting command ring instead of declaring host dead\n",
++				  slot, epi);
++			xhci->current_cmd->status = COMP_COMMAND_ABORTED;
++			hw_ring_state = xhci_read_64(xhci, &xhci->op_regs->cmd_ring);
++			if (hw_ring_state == ~(u64)0) {
++				xhci_hc_died(xhci);
++				goto time_out_completed;
++			}
++			if ((xhci->cmd_ring_state & CMD_RING_STATE_RUNNING) &&
++			    (hw_ring_state & CMD_RING_RUNNING)) {
++				xhci->cmd_ring_state = CMD_RING_STATE_ABORTED;
++				/* on failure this has already halted + hc_died */
++				if (xhci_abort_cmd_ring(xhci, flags) < 0)
++					goto time_out_completed;
++			} else {
++				xhci_handle_stopped_cmd_ring(xhci, xhci->current_cmd);
++			}
++			/* the stop never completed, so nothing gave these back */
++			xhci_kill_endpoint_urbs(xhci, slot, epi);
++			xhci_warn(xhci, "stop endpoint timeout recovered: ring aborted, slot %u ep %u URBs returned\n",
++				  slot, epi);
++			goto time_out_completed;
++		}
++
+ 		xhci_halt(xhci);
+ 		xhci_hc_died(xhci);
+ 		goto time_out_completed;
