@@ -86,3 +86,36 @@ This is the fleet safety net either way. It is not a root-cause fix: the link st
   how the kernel-panic above was found.
 - Soak driver: reboot via `sync; echo b > /proc/sysrq-trigger`, re-arm the A/B retry
   counter each cycle, and **stop and report** if the device does not come back.
+
+## 2026-09-25: the link drops are driven by the DONGLE UNIT (kernel ruled out)
+
+**Metric:** the USB3 root port's xHCI Link Error Count — `PORTLI` for port 2 at
+`0x11210438` (`PORTSC` + 8), low 16 bits. Read with `busybox devmem 0x11210438 32`.
+Every error forces a link recovery; the SS.Inactive drops are the recoveries that fail.
+A healthy link sits near zero, so a 60 s sample scores a link in a minute instead of
+waiting hours for a death.
+
+**Controlled experiment** — same phone (`34291FDHS000WV`), same cable/passthrough; kernel
+switched by A/B slot (slot B = the AOSP oracle's exact `boot`/`vendor_boot`/`dtbo`, copied
+byte-for-byte, with its module tree added to the same rootfs); dongle swapped for another
+unit of the same model (RTL8153A, `0bda:8153`):
+
+| | original dongle `a0:ce:c8:76:24:06` | replacement `80:69:1a:b3:91:2c` |
+|---|---|---|
+| mainline 7.2 | 3.0 errors/s | 0.04 errors/s |
+| AOSP 6.1 | 2.5 errors/s | 0.07 errors/s |
+
+The dongle unit accounts for a ~40–70× difference; the kernel for none. Mainline's
+SuperSpeed is as good as AOSP's. Earlier leads are superseded: "per-unit phone" (the
+"immune unit" rested on one n=1 run) and "PHY/PMA mis-programming" (July diff: identical to
+AOSP — and AOSP ships all 36 SS tune values as "default").
+
+**Practical consequences:** screen dongles with a 1-minute `PORTLI` sample; record the rate
+per boot for early warning; keep in-place recovery as the backstop. Open: can RX tuning
+(equalisation, squelch/LFPS thresholds — register map in AOSP
+`phy-exynos-usbdp-gen2-v4.c` `tune_each`) make the phone tolerate marginal dongles?
+Keep the original dongle as the reproducer.
+
+Side findings: `.139`'s rootfs was full because four stale 381 MB module trees had
+accumulated (the build untars over `/lib/modules` and never deletes); removing them took it
+from 100 % to 64 %. AOSP on this rootfs took ~7 min to boot vs 33 s for mainline.
