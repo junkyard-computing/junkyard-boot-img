@@ -1,0 +1,88 @@
+#!/bin/sh
+# usb-wedge-trace: capture the USB host path leading into a controller death,
+# then recover in place by re-initialising the host controller.
+#
+# Follows the kernel log; on the first sign of trouble (Tx timeout / controller
+# not responding / HC died) waits ~3 s to catch the collapse, then persists
+# dmesg + Type-C/USB/NIC/power state to userdata (the rootfs is full).
+#
+# Link-state evidence comes from xHCI/hub dynamic debug enabled on the cmdline
+# (dyndbg="func handle_port_status +p; file xhci-hub.c +p; file hub.c +p"):
+# port-change events log the raw PORTSC, which carries the port link state.
+# If the kernel also has event tracing, an xhci-hcd+dwc3 instance is dumped too
+# -- but do NOT enable tracing by config change on felix: it alters struct
+# module, every prebuilt module (dm_mod included) then fails to load, and the
+# initramfs cannot assemble root.
+#
+# Recovery (/etc/usb-host-reinit.enable): after a confirmed "HC died", run
+# usb-host-reinit. Only after HC died, when xhci_hc_died() has returned every
+# URB -- re-initialising while a Stop Endpoint is still pending could hit the
+# same hang. --safety makes it warm-reboot if the NIC does not come back; that
+# reboot is capped at MAXLOOP consecutive dying boots (tcpm-landing-guard resets
+# the count on a healthy boot).
+MAXCAP=40; MAXLOOP=3; MAXREINIT=20   # triggers per boot; dying boots in a row; re-inits per boot
+# deaths already in the log count as handled: 0 at boot, and a restart must not
+# re-act on a death from before it (dmesg -w replays the whole buffer)
+reinits=0; deaths_handled=$(dmesg 2>/dev/null | grep -c "HC died")
+START=$(cut -d. -f1 /proc/uptime)
+TR=/sys/kernel/tracing; I=$TR/instances/usbwedge; TRACE=0
+. /usr/local/lib/usb-evidence.sh
+D=$(ud_dir usb-wedge)
+
+mountpoint -q $TR || mount -t tracefs nodev $TR 2>/dev/null
+if [ -d $TR/events/xhci-hcd ]; then
+  mkdir -p $I; echo 0 > $I/tracing_on; echo ${USBWEDGE_BUF_KB:-8192} > $I/buffer_size_kb; : > $I/trace
+  echo 1 > $I/events/xhci-hcd/enable; [ -d $I/events/dwc3 ] && echo 1 > $I/events/dwc3/enable
+  echo 1 > $I/tracing_on; TRACE=1
+fi
+dd=$(grep -c 'handle_port_status\|xhci-hub.c\|core/hub.c' /proc/dynamic_debug/control 2>/dev/null)
+on=$(grep 'handle_port_status\|xhci-hub.c\|core/hub.c' /proc/dynamic_debug/control 2>/dev/null | grep -c '=p')
+logger -t usb-wedge-trace "armed: trace=$TRACE usb_dyndbg_sites=$dd enabled=$on dir=$D"
+
+n=0
+dmesg -w 2>/dev/null | while IFS= read -r line; do
+  case "$line" in
+    *'[PSTORE]'*|*'[BEACON]'*|*'[PREV-BOOT]'*|*usb-host-reinit*|*usb-wedge-trace*) continue;;
+    *'Tx timeout'*|*'not responding'*|*'HC died'*|*'assume dead'*|*'port-first warm reset'*) ;;
+    *) continue;;
+  esac
+  # dmesg -w replays the whole buffer: skip anything from before we started
+  ts=$(echo "$line" | sed -n "s/^\[ *\([0-9]*\)\..*/\1/p"); [ -n "$ts" ] && [ "$ts" -lt "$START" ] && continue
+  [ $n -ge $MAXCAP ] && continue
+  n=$((n+1))
+  logger -t usb-wedge-trace "trigger #$n: $line"
+  sleep 3
+  [ $TRACE = 1 ] && echo 0 > $I/tracing_on
+  BID=$(cat /proc/sys/kernel/random/boot_id)
+  F="$D/wedge-$(date +%Y%m%d-%H%M%S)-${BID%%-*}-$n"; mkdir -p "$F"
+  echo "$line" > "$F/trigger.txt"
+  dmesg > "$F/dmesg.txt" 2>&1
+  snapshot_state > "$F/state.txt" 2>&1
+  grep 'handle_port_status\|xhci-hub.c\|core/hub.c' /proc/dynamic_debug/control > "$F/dyndbg.txt" 2>/dev/null
+  [ $TRACE = 1 ] && cat $I/trace > "$F/trace.txt" 2>&1
+  sync
+  # one controller death logs 3 matching lines; act once per NEW "HC died"
+  deaths=$(grep -c "HC died" "$F/dmesg.txt")
+  died=no; [ "$deaths" -gt "$deaths_handled" ] && died=yes
+  loops=$(cat "$D/consecutive_deaths" 2>/dev/null || echo 0)
+  if [ "$died" = yes ] && [ ! -e "$D/.counted-${BID%%-*}" ]; then
+    loops=$((loops+1)); echo $loops > "$D/consecutive_deaths"; : > "$D/.counted-${BID%%-*}"
+  fi
+  echo "$(date -Is) boot=${BID%%-*} trigger#$n died=$died consecutive=$loops uptime=$(cut -d' ' -f1 /proc/uptime) $(basename "$F")" >> "$D/summary.log"
+  sync
+  logger -t usb-wedge-trace "saved $F (hc_died=$died consecutive=$loops)"
+  if [ "$died" = yes ] && [ -e /etc/usb-host-reinit.enable ]; then
+    deaths_handled=$deaths
+    reinits=$((reinits+1))
+    if [ $reinits -gt $MAXREINIT ]; then
+      logger -t usb-wedge-trace "controller death #$deaths but $MAXREINIT re-inits already this boot; leaving it for inspection"
+    elif [ "$loops" -lt "$MAXLOOP" ]; then
+      logger -t usb-wedge-trace "controller death #$deaths; re-init $reinits/$MAXREINIT"
+      /usr/local/sbin/usb-host-reinit --safety
+    else
+      logger -t usb-wedge-trace "controller death #$deaths ($loops dying boots running); re-init without safety reboot"
+      /usr/local/sbin/usb-host-reinit
+    fi
+  fi
+  [ $TRACE = 1 ] && { : > $I/trace; echo 1 > $I/tracing_on; }
+done

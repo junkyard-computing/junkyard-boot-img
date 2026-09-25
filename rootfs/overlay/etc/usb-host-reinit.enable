@@ -1,0 +1,2 @@
+# Presence enables in-place USB host-controller recovery: after the xHCI dies,
+# usb-wedge-trace runs usb-host-reinit (rebind xhci-hcd). Remove to only record.

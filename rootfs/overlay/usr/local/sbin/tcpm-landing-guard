@@ -1,0 +1,38 @@
+#!/bin/sh
+# tcpm-landing-guard: at SETTLE s of uptime, record how this boot's USB-C port
+# and host path came up, to userdata (survives power loss; the rootfs is full).
+# Classifies TWO things separately, because they fail separately:
+#   role: the TCPM landing (sink+host is what we want)
+#   host: whether the dongle is actually alive on the host controller
+# The controller-death capture itself is usb-wedge-trace's job; this is the
+# per-boot census so rates can be counted.
+SETTLE=${TCPM_GUARD_SETTLE:-90}
+while :; do up=$(cut -d. -f1 /proc/uptime); [ "$up" -ge "$SETTLE" ] && break; sleep 5; done
+. /usr/local/lib/usb-evidence.sh
+
+D=$(ud_dir tcpm-guard)
+BID=$(cat /proc/sys/kernel/random/boot_id)
+P=/sys/class/typec/port0
+dr=$(cat $P/data_role 2>/dev/null)
+case "$dr" in *'[host]'*) role=host;; *'[device]'*) role=device;; *) role=unknown;; esac
+nic=""; for n in /sys/class/net/*; do b=$(basename $n); case $b in lo|usb0|dummy*) ;; *) nic="$b=$(cat $n/carrier 2>/dev/null)";; esac; done
+kdm=$(dmesg | grep -avE '\[(PSTORE|BEACON|PRE|PREV-BOOT)\]')
+if echo "$kdm" | grep -qE 'HC died|assume dead'; then host=HC_DIED
+elif echo "$nic" | grep -q '=1'; then host=OK
+elif [ -n "$nic" ]; then host=NIC_NO_CARRIER
+else host=NO_NIC; fi
+ssi=$(echo "$kdm" | grep -c "portsc: 0x4012c1\|Wait for inactive link"); pfr=$(echo "$kdm" | grep -o "port-first warm reset [A-Za-z]*" | sort | uniq -c | tr "\n" " ")
+rec=$(echo "$kdm" | grep -c "stop endpoint timeout recovered")
+verdict="role=$role host=$host ss_inactive_lines=$ssi port_first=[$pfr] stopep_recovered=$rec"
+# a healthy boot ends any run of dying boots (see usb-wedge-trace MAXLOOP)
+[ "$host" = OK ] && echo 0 > "$(ud_dir usb-wedge)/consecutive_deaths"
+
+F="$D/boot-$(date +%Y%m%d-%H%M%S)-${BID%%-*}.log"
+{ echo "verdict: $verdict"; snapshot_state
+  echo; echo "=== dmesg (this boot only): tcpm/typec/usb host path"
+  echo "$kdm" | grep -aiE 'tcpm|typec|tcpci|max77759|dwc3|xhci|usb [0-9]|r8152|Tx timeout|HC died|role|portsc|Port change'
+} > "$F" 2>&1
+echo "$(date -Is) boot=${BID%%-*} $verdict nic=[$nic] $(basename "$F")" >> "$D/summary.log"
+sync
+logger -t tcpm-landing-guard "$verdict -> $F"
+exit 0

@@ -32,6 +32,16 @@ MODULE_ORDER_PATH ?= rootfs/module_order.txt
 ROOTFS_IMG ?= boot/rootfs.img
 MKBOOTIMG ?= tools/mkbootimg/mkbootimg.py
 OVERLAY_DIR ?= rootfs/overlay
+# Overlay files that have been deleted from rootfs/overlay/ but must also be
+# removed from the sysroot. The overlay rsync is deliberately not --delete (the
+# overlay is a sparse graft onto a full Debian install), and the sysroot is not
+# wiped between builds, so a git-rm'd overlay file otherwise keeps shipping -- a
+# retired unit stays ENABLED while the build reports success. Paths are
+# sysroot-relative; entries can be dropped once the sysroot has been rebuilt.
+RETIRED_OVERLAY_PATHS ?= \
+	usr/local/sbin/usb-host-recover \
+	etc/systemd/system/usb-host-recover.service \
+	etc/systemd/system/multi-user.target.wants/usb-host-recover.service
 VENDOR_FIRMWARE_STAGE ?= rootfs/vendor-firmware/extracted
 
 # Standard out-of-tree kbuild invocation. O=out keeps build artifacts under
@@ -351,6 +361,8 @@ all:
 	$(NSPAWN) -D $(SYSROOT_DIR) rm -f /etc/NetworkManager/system-connections/usb0-gadget.nmconnection
 	# Apply tracked overlay (usb_gadget, blacklist.conf, custom service, ...).
 	sudo rsync -a $(OVERLAY_DIR)/ $(SYSROOT_DIR)/
+	# ...and remove the ones retired from it (see RETIRED_OVERLAY_PATHS).
+	sudo rm -f $(addprefix $(SYSROOT_DIR)/,$(RETIRED_OVERLAY_PATHS))
 	# usb-gadget: the overlay has shipped the script + unit for a while, but
 	# nothing ever enabled the unit, so the gadget was dead code in every
 	# image. Enable it. This is safe for the dongle path and does NOT pin the

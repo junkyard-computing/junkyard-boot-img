@@ -1,0 +1,13 @@
+[Unit]
+Description=Trace the USB host path and persist it when the controller dies
+DefaultDependencies=no
+After=local-fs.target systemd-journald.service
+Before=NetworkManager.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/sbin/usb-wedge-trace
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target

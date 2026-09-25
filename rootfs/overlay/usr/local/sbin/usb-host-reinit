@@ -1,0 +1,49 @@
+#!/bin/sh
+# usb-host-reinit: recover a wedged/dead xHCI by re-initialising the host
+# controller, without a reboot. Mainline replacement for AOSP's otg_id bounce
+# (that sysfs node does not exist on mainline).
+#
+# Why: after a SuperSpeed link drops to SS.Inactive, the gs201 dwc3 xHCI's
+# command engine wedges -- Stop Endpoint never completes and a command-ring
+# abort is not honoured either (-110) -- so no command-level recovery exists.
+# A controller reset is the only way back.
+#
+#   level xhci (default): unbind/bind the xhci platform device. Re-probing
+#                         resets the controller (HCRST) and recreates both root
+#                         hubs, leaving dwc3 and the TCPM's role switch alone.
+#   level dwc3:           unbind/bind the dwc3 core (heavier; may disturb the
+#                         role-switch link -- fallback only).
+#
+# Logs to userdata. With --safety, warm-reboots if no NIC has carrier within
+# WAIT s, so a failed re-init cannot strand a headless unit.
+LEVEL=xhci; SAFETY=no; WAIT=30
+for a in "$@"; do case "$a" in --dwc3) LEVEL=dwc3;; --safety) SAFETY=yes;; esac; done
+. /usr/local/lib/usb-evidence.sh
+D=$(ud_dir usb-reinit); LOG="$D/reinit-$(date +%Y%m%d-%H%M%S).log"
+now() { cut -d' ' -f1 /proc/uptime; }
+carrier() { for n in /sys/class/net/*; do case $(basename $n) in lo|usb0) ;; *) [ "$(cat $n/carrier 2>/dev/null)" = 1 ] && { basename $n; return 0; };; esac; done; return 1; }
+{
+  echo "start $(date -Is) uptime=$(now) level=$LEVEL boot=$(cut -c1-8 /proc/sys/kernel/random/boot_id)"
+  echo "before: nic=$(carrier || echo none) usb=[$(ls /sys/bus/usb/devices | tr '\n' ' ')]"
+  if [ $LEVEL = xhci ]; then DRV=/sys/bus/platform/drivers/xhci-hcd; DEV=$(ls $DRV | grep -m1 'xhci-hcd\.')
+  else DRV=/sys/bus/platform/drivers/dwc3; DEV=$(ls $DRV | grep -m1 '\.usb$'); fi
+  echo "device=$DEV driver=$DRV"
+  t0=$(now)
+  echo "$DEV" > $DRV/unbind; echo "unbind rc=$? t=$(now)"
+  sleep 2
+  echo "$DEV" > $DRV/bind;   echo "bind rc=$? t=$(now)"
+  i=0; nic=""
+  while [ $i -lt $WAIT ]; do nic=$(carrier) && break; sleep 1; i=$((i+1)); done
+  t1=$(now)
+  echo "after: nic=${nic:-none} carrier_after=$(echo "$t1 - $t0" | awk '{printf "%.1f", $1-$3}')s usb=[$(ls /sys/bus/usb/devices | tr '\n' ' ')]"
+  for d in /sys/bus/usb/devices/[0-9]*-*; do [ -f $d/speed ] && echo "  $(basename $d) $(cat $d/idVendor):$(cat $d/idProduct) speed=$(cat $d/speed)"; done
+  echo "typec: power=$(cat /sys/class/typec/port0/power_role 2>/dev/null) data=$(cat /sys/class/typec/port0/data_role 2>/dev/null)"
+  echo "=== dmesg since unbind"; dmesg | awk -v t=$t0 '{s=$0; sub(/^\[ */,"",s); sub(/\].*/,"",s); if (s+0 >= t-0.5) print}' | tail -60
+  [ -n "$nic" ] && echo "RESULT: RECOVERED" || echo "RESULT: NO_CARRIER"
+} > "$LOG" 2>&1
+sync
+logger -t usb-host-reinit "$(tail -1 "$LOG") -> $LOG"
+if [ -z "$(carrier)" ] && [ $SAFETY = yes ]; then
+  logger -t usb-host-reinit "no carrier after re-init; safety reboot"; sleep 2; sync
+  echo 1 > /proc/sys/kernel/sysrq; echo b > /proc/sysrq-trigger
+fi

@@ -1,0 +1,12 @@
+[Unit]
+Description=Record how the Type-C port landed this boot (to userdata)
+After=typec-host-fix.service systemd-udevd.service
+DefaultDependencies=yes
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/tcpm-landing-guard
+TimeoutStartSec=300
+
+[Install]
+WantedBy=multi-user.target

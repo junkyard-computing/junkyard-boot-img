@@ -356,7 +356,7 @@ done
 # Bounded and non-destructive: one attempt per invocation (the timer retries in 5
 # minutes), and a failed write just falls through to the existing escalation. A
 # reboot is still the answer if this does not help — it is now the second answer.
-OTG_ID=${OTG_ID:-/sys/devices/platform/11210000.usb/dwc3_exynos_otg_id}
+# (OTG_ID, the old AOSP bounce target, no longer used on mainline)
 BOUNCE_SETTLE=${BOUNCE_SETTLE:-15}
 
 # ★★ NEVER BOUNCE THE PORT WHILE A HOST IS ATTACHED TO THE GADGET.
@@ -382,24 +382,30 @@ BOUNCE_SETTLE=${BOUNCE_SETTLE:-15}
 # port to hunt for a dongle while the gadget is carrying the only way in.
 if [ "$(cat "/sys/class/net/$GADGET_IF/carrier" 2>/dev/null)" = 1 ]; then
     log "USB gadget has a host attached — not bouncing the port role"
-elif [ -w "$OTG_ID" ]; then
-    log "no network after ${DEADLINE}s — bouncing the USB host role before escalating"
-    if printf 1 > "$OTG_ID" 2>/dev/null && sleep 1 && printf 0 > "$OTG_ID" 2>/dev/null; then
-        j=0
-        while [ "$j" -lt "$BOUNCE_SETTLE" ]; do
-            if healthy; then
-                log "recovered by USB host bounce after ${j}s — no reboot needed"
-                mark_running_successful
-                : > "$HADIP" 2>/dev/null
-                rm -f "$COUNTER"
-                exit 0
-            fi
-            j=$((j + 1)); sleep 1
-        done
-        log "USB host bounce did not restore reachability within ${BOUNCE_SETTLE}s"
-    else
-        log "USB host bounce failed to write $OTG_ID"
-    fi
+elif [ -x /usr/local/sbin/usb-host-reinit ]; then
+    # Mainline has no dwc3_exynos_otg_id: that bounce was an AOSP-only sysfs
+    # node, and here the old `[ -w "$OTG_ID" ]` test was simply false, so this
+    # step silently never ran and every "no network" went straight to a reboot.
+    # usb-host-reinit re-initialises the host controller instead (rebinds the
+    # xHCI platform device: HCRST + fresh root hubs, dwc3 and the TCPM role
+    # switch untouched) -- measured recovering a dead controller with the dongle
+    # back at SuperSpeed in ~6 s. No --safety: escalation stays ours below.
+    log "no network after ${DEADLINE}s — re-initialising the USB host controller before escalating"
+    /usr/local/sbin/usb-host-reinit
+    j=0
+    while [ "$j" -lt "$BOUNCE_SETTLE" ]; do
+        if healthy; then
+            log "recovered by USB host re-init after ${j}s — no reboot needed"
+            mark_running_successful
+            : > "$HADIP" 2>/dev/null
+            rm -f "$COUNTER"
+            exit 0
+        fi
+        j=$((j + 1)); sleep 1
+    done
+    log "USB host re-init did not restore reachability within ${BOUNCE_SETTLE}s"
+else
+    log "no usb-host-reinit available — cannot recover the USB host in place"
 fi
 
 proven=$(slot_field successful)
