@@ -557,9 +557,17 @@ all:
 	#                                          Cost on a healthy link: ~300 lines per boot, all at
 	#                                          KERN_DEBUG (below loglevel=4, never on the console);
 	#                                          8M is <0.1% of RAM and keeps early boot from rotating out.
+	# watchdog.stop_on_reboot=0: softdog calls watchdog_stop_on_reboot(), so it disarmed itself
+	#                                          the moment reboot() began and systemd's RebootWatchdogSec never
+	#                                          covered device_shutdown(); the s3c2410 HW watchdog is disabled by
+	#                                          its own .shutdown too. A hang there was permanent (7 h on
+	#                                          2026-09-26; reproduced with a blocking .shutdown test module).
+	# oops=panic: reboot on any oops rather than run on with a damaged kernel -- an oops taints
+	#                                          TAINT_DIE, which also disables the hung-task panic. The main
+	#                                          track already sets CONFIG_PANIC_ON_OOPS=y. The oops lands in pstore.
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/mapper/rootfs rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm udev.event_timeout=20 log_buf_len=8M dyndbg=\"func handle_port_status +p; file xhci-hub.c +p; file hub.c +p\"" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/mapper/rootfs rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm udev.event_timeout=20 log_buf_len=8M watchdog.stop_on_reboot=0 oops=panic dyndbg=\"func handle_port_status +p; file xhci-hub.c +p; file hub.c +p\"" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
