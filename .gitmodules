@@ -4,7 +4,7 @@
 [submodule "kernel/source"]
 	path = kernel/source
 	url = https://github.com/junkyard-computing/linux.git
-	branch = felix
+	branch = rebase/v7.3-rc4
 [submodule "tools/pixel-bootctl"]
 	path = tools/pixel-bootctl
 	url = https://github.com/junkyard-computing/pixel-bootctl.git
