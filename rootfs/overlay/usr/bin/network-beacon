@@ -43,7 +43,11 @@ echo "[BEACON] network-beacon: collecting current state" > /dev/kmsg
     nmcli general status 2>&1
     echo
     echo "--- dmesg | grep -iE usb|eth|r8152|ax8817|cdc|usbnet|dwc3|xhci|networkmanager ---"
-    dmesg 2>/dev/null | grep -iE 'usb|eth|r8152|ax8817|cdc|usbnet|dwc3|xhci|networkmanager' | tail -120
+    # Drop the beacons' own replay lines: [PREV-BOOT] is the previous snapshot echoed into kmsg at
+    # the top of this script, and it matches the grep, so without this every snapshot embedded the
+    # previous one and the log grew by a generation each boot.
+    dmesg 2>/dev/null | grep -vE '\[(PREV-BOOT|BEACON|PSTORE)\]' \
+        | grep -iE 'usb|eth|r8152|ax8817|cdc|usbnet|dwc3|xhci|networkmanager' | tail -120
     echo
     echo "=== end snapshot ==="
 } > "$PREV" 2>&1
