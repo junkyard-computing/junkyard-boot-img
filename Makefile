@@ -409,7 +409,16 @@ all:
 	sudo rm -rf rootfs/unpack/modules_install
 	sudo mkdir -p rootfs/unpack/modules_install
 	sudo chown $$(id -u):$$(id -g) rootfs/unpack/modules_install
-	$(KMAKE) INSTALL_MOD_PATH=$(CURDIR)/rootfs/unpack/modules_install modules_install
+	# Stripped: 95 MB per tree instead of 381 MB (the debug info is never used on-device).
+	$(KMAKE) INSTALL_MOD_PATH=$(CURDIR)/rootfs/unpack/modules_install INSTALL_MOD_STRIP=1 modules_install
+	# The sysroot is never wiped between builds and untarring/rsyncing never deletes, so every
+	# previous kernel's tree stayed in the image: four 381 MB trees filled a device rootfs to 100 %
+	# (which silently stopped the persistent journal). A rootfs half only ever boots with its own
+	# slot's kernel, so keep exactly the tree being installed and replace it wholesale.
+	for d in $(SYSROOT_DIR)/lib/modules/*/; do \
+		[ -d "$$d" ] || continue; \
+		echo "Removing kernel module tree $$d"; sudo rm -rf "$$d"; \
+	done
 	sudo rsync -a rootfs/unpack/modules_install/lib/modules/ $(SYSROOT_DIR)/lib/modules/
 	sudo cp $(KERNEL_BUILD_DIR)/System.map $(SYSROOT_DIR)/boot/System.map-$(KERNEL_VERSION)
 	@echo "Updating module dependencies"
@@ -542,9 +551,15 @@ all:
 	#                                          (0x3a00) with -EINVAL. Verified on
 	#                                          .138: warm reset → "[PXL] fastboot
 	#                                          enter reason: reboot bootloader".
+	# log_buf_len=8M + the USB dyndbg are the controller-death evidence (docs/felix-usb-host-controller-death.md):
+	#                                          PORTSC per port-change event and the hub's recovery
+	#                                          decisions, so a fielded unit records how its link died.
+	#                                          Cost on a healthy link: ~300 lines per boot, all at
+	#                                          KERN_DEBUG (below loglevel=4, never on the console);
+	#                                          8M is <0.1% of RAM and keeps early boot from rotating out.
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/mapper/rootfs rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm udev.event_timeout=20" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/mapper/rootfs rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm udev.event_timeout=20 log_buf_len=8M dyndbg=\"func handle_port_status +p; file xhci-hub.c +p; file hub.c +p\"" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
