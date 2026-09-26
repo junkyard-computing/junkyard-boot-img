@@ -27,13 +27,13 @@ rec=$(echo "$kdm" | grep -c "stop endpoint timeout recovered")
 # it kills a controller (good ≈ 0.04/s, bad ≈ 3/s). Adds a 60 s sample to the census.
 lq="link_errors_per_s=- verdict=unknown"
 [ "$host" = OK ] && lq=$(/usr/local/sbin/usb-link-quality 60 2>/dev/null)
-linkq=$(echo "$lq" | sed -n 's/.*link_errors_per_s=\([^ ]*\).*verdict=\([^ ]*\).*/\1/\2/p')
+linkq=$(echo "$lq" | sed -n 's|.*link_errors_per_s=\([^ ]*\).*verdict=\([^ ]*\).*|\1/\2|p')
 verdict="role=$role host=$host link_err_rate=${linkq:-unknown} ss_inactive_lines=$ssi port_first=[$pfr] stopep_recovered=$rec"
 # a healthy boot ends any run of dying boots (see usb-wedge-trace MAXLOOP)
 [ "$host" = OK ] && echo 0 > "$(ud_dir usb-wedge)/consecutive_deaths"
 
 F="$D/boot-$(date +%Y%m%d-%H%M%S)-${BID%%-*}.log"
-{ echo "verdict: $verdict"; snapshot_state
+{ echo "verdict: $verdict"; echo "link quality: $lq"; snapshot_state
   echo; echo "=== dmesg (this boot only): tcpm/typec/usb host path"
   echo "$kdm" | grep -aiE 'tcpm|typec|tcpci|max77759|dwc3|xhci|usb [0-9]|r8152|Tx timeout|HC died|role|portsc|Port change'
 } > "$F" 2>&1
