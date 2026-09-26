@@ -4,9 +4,11 @@ After=typec-host-fix.service systemd-udevd.service
 DefaultDependencies=yes
 
 [Service]
-Type=oneshot
+# exec, not oneshot: it sleeps until uptime 90 s and then samples the link for 60 s, and a oneshot
+# would hold multi-user.target (and `systemctl is-system-running`) at "starting" all that time.
+# Nothing waits on the census.
+Type=exec
 ExecStart=/usr/local/sbin/tcpm-landing-guard
-TimeoutStartSec=300
 
 [Install]
 WantedBy=multi-user.target

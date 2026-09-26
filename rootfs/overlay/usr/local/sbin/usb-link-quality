@@ -1,0 +1,41 @@
+#!/bin/sh
+# usb-link-quality [SECONDS]: score the SuperSpeed link to the dongle.
+#
+# Samples the xHCI Link Error Count of the USB3 root port -- PORTLI for port 2,
+# low 16 bits, at 0x11210438 (PORTSC + 8) -- twice, SECONDS apart (default 60),
+# and prints errors per second. Every error forces a link recovery; the
+# SS.Inactive drops that kill the controller are the recoveries that fail. A
+# healthy link sits near zero: measured on the same phone, a good dongle scored
+# 0.04/s and a bad one 3.0/s (the dongle unit, not the kernel, sets the rate).
+# Screening threshold: > 0.5/s is a bad dongle.
+#
+# Guarded: /dev/mem reads of a clock-gated USB block can hard-lock a CPU on
+# gs201, so it reads only while the host controller is up with a SuperSpeed
+# device enumerated, and refuses otherwise. Output is one line:
+#   link_errors_per_s=R errors=N seconds=S verdict=good|bad|unknown [reason=...]
+REG=0x11210438
+SECS=${1:-60}
+
+ss_up() {
+  # the controller is live iff a SuperSpeed device hangs off its USB3 root hub
+  for d in /sys/bus/usb/devices/[0-9]-[0-9]*; do
+    [ -f "$d/speed" ] || continue
+    case "$(cat "$d/speed" 2>/dev/null)" in 5000|10000|20000) return 0;; esac
+  done
+  return 1
+}
+deaths() { dmesg 2>/dev/null | grep -avE '\[(PSTORE|BEACON|PREV-BOOT)\]' | grep -c 'HC died'; }
+read_le() { v=$(busybox devmem $REG 32 2>/dev/null) || return 1; echo $(( v & 0xffff )); }
+out() { echo "link_errors_per_s=$1 errors=$2 seconds=$3 verdict=$4${5:+ reason=$5}"; }
+
+command -v busybox >/dev/null || { out - - 0 unknown no-busybox; exit 2; }
+ss_up || { out - - 0 unknown no-superspeed-device; exit 2; }
+d0=$(deaths); a=$(read_le) || { out - - 0 unknown devmem-failed; exit 2; }
+sleep "$SECS"
+ss_up || { out - - "$SECS" unknown device-gone-during-sample; exit 2; }
+[ "$(deaths)" = "$d0" ] || { out - - "$SECS" unknown controller-died-during-sample; exit 2; }
+b=$(read_le) || { out - - "$SECS" unknown devmem-failed; exit 2; }
+n=$(( (b - a) & 0xffff ))
+r=$(awk -v n=$n -v s=$SECS 'BEGIN{printf "%.3f", n/s}')
+v=$(awk -v r=$r 'BEGIN{print (r > 0.5) ? "bad" : "good"}')
+out "$r" "$n" "$SECS" "$v"

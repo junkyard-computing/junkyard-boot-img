@@ -23,7 +23,12 @@ elif [ -n "$nic" ]; then host=NIC_NO_CARRIER
 else host=NO_NIC; fi
 ssi=$(echo "$kdm" | grep -c "portsc: 0x4012c1\|Wait for inactive link"); pfr=$(echo "$kdm" | grep -o "port-first warm reset [A-Za-z]*" | sort | uniq -c | tr "\n" " ")
 rec=$(echo "$kdm" | grep -c "stop endpoint timeout recovered")
-verdict="role=$role host=$host ss_inactive_lines=$ssi port_first=[$pfr] stopep_recovered=$rec"
+# The dongle's link quality, recorded every boot so a marginal unit shows up as a rate long before
+# it kills a controller (good ≈ 0.04/s, bad ≈ 3/s). Adds a 60 s sample to the census.
+lq="link_errors_per_s=- verdict=unknown"
+[ "$host" = OK ] && lq=$(/usr/local/sbin/usb-link-quality 60 2>/dev/null)
+linkq=$(echo "$lq" | sed -n 's/.*link_errors_per_s=\([^ ]*\).*verdict=\([^ ]*\).*/\1/\2/p')
+verdict="role=$role host=$host link_err_rate=${linkq:-unknown} ss_inactive_lines=$ssi port_first=[$pfr] stopep_recovered=$rec"
 # a healthy boot ends any run of dying boots (see usb-wedge-trace MAXLOOP)
 [ "$host" = OK ] && echo 0 > "$(ud_dir usb-wedge)/consecutive_deaths"
 
