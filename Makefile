@@ -565,9 +565,19 @@ all:
 	# oops=panic: reboot on any oops rather than run on with a damaged kernel -- an oops taints
 	#                                          TAINT_DIE, which also disables the hung-task panic. The main
 	#                                          track already sets CONFIG_PANIC_ON_OOPS=y. The oops lands in pstore.
+	# cma=128M: the display has no IOMMU, so each scanout buffer is physically contiguous CMA.
+	#                                          The inner panel alone needs 16 MB per buffer (1840x2208x4);
+	#                                          the default 32 MB left kmscon unable to allocate it
+	#                                          ("Failed to create dumb of 16252928 bytes") and the inner
+	#                                          display stayed blank.
+	# video=DSI-1:d: fleet units light only the OUTER panel. DSI-1 is the inner ana6707: forced off,
+	#                                          kmscon never drives it and the panel driver blanks it as
+	#                                          unclaimed (the low-power, ~7C-cooler state). Drop this on a
+	#                                          bench unit to get the login console on the inner display too
+	#                                          (verified working with cma=128M).
 	$(MKBOOTIMG) \
 		--kernel $(KERNEL_BUILD_DIR)/arch/arm64/boot/Image.lz4 \
-		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/mapper/rootfs rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm udev.event_timeout=20 log_buf_len=8M watchdog.stop_on_reboot=0 oops=panic dyndbg=\"func handle_port_status +p; file xhci-hub.c +p; file hub.c +p\"" \
+		--cmdline "earlycon=exynos4210,mmio32,0x10A00000 root=/dev/mapper/rootfs rw firmware_class.path=/vendor/firmware kvm-arm.mode=nvhe loglevel=4 clk_ignore_unused reboot=warm udev.event_timeout=20 log_buf_len=8M cma=128M video=DSI-1:d watchdog.stop_on_reboot=0 oops=panic dyndbg=\"func handle_port_status +p; file xhci-hub.c +p; file hub.c +p\"" \
 		--header_version 4 \
 		-o boot/boot.img \
 		--pagesize 2048 \
