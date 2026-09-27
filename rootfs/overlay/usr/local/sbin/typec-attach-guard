@@ -1,0 +1,44 @@
+#!/bin/sh
+# typec-attach-guard: recover a USB-C port that never attached.
+#
+# On 1 of 109 felix boots the TCPM sat in SRC_ATTACH_WAIT for 8 h with the
+# dongle's Rd present, waiting for a vSafe0V alert that never came: no
+# partner, no host role, no NIC, no network. netcheck-recover deliberately
+# does not reboot a proven slot that never had an address ("nothing is
+# plugged in"), so the unit stayed stranded.
+#
+# Rebinding the TCPC driver re-runs TCPM's init, which re-reads the VBUS and
+# vSafe0V state and starts toggling afresh; on the bench the dongle was back
+# with carrier ~7 s later. With nothing plugged in the port is unattached
+# anyway, so the rebind is harmless. A host on the gadget port is a partner,
+# so this never touches gadget mode.
+#
+# Runs from a timer. Rebinds after two consecutive checks with no partner,
+# at most once per HOLDOFF seconds. Disable with /etc/typec-attach-guard.disable.
+HOLDOFF=${TYPEC_GUARD_HOLDOFF:-600}
+P=${TYPEC_GUARD_PORT:-/sys/class/typec/port0}
+ST=${TYPEC_GUARD_STATE:-/run/typec-attach-guard}
+[ -e /etc/typec-attach-guard.disable ] && exit 0
+[ -d "$P" ] || exit 0
+mkdir -p "$ST"
+if [ -e "$P/port0-partner" ]; then
+  rm -f "$ST/misses"
+  exit 0
+fi
+m=$(( $(cat "$ST/misses" 2>/dev/null || echo 0) + 1 )); echo $m > "$ST/misses"
+[ $m -ge 2 ] || exit 0
+now=$(cut -d. -f1 /proc/uptime); last=$(cat "$ST/last" 2>/dev/null || echo -$HOLDOFF)
+[ $(( now - last )) -ge $HOLDOFF ] || exit 0
+dev=$(readlink -f "$P/device"); drv=$(readlink -f "$dev/driver")
+[ -n "$dev" ] && [ -d "$drv" ] || { logger -t typec-attach-guard "no TCPC driver for $P"; exit 0; }
+id=$(basename "$dev")
+echo $now > "$ST/last"; rm -f "$ST/misses"
+msg="port0 has had no partner for $m checks (uptime ${now}s); rebinding TCPC $id ($(basename "$drv"))"
+logger -t typec-attach-guard "$msg"; echo "typec-attach-guard: $msg" 2>/dev/null >/dev/kmsg
+echo "$id" > "$drv/unbind"; sleep 2; echo "$id" > "$drv/bind"
+# evidence on userdata, if the helpers are present
+if [ -r /usr/local/lib/usb-evidence.sh ]; then
+  . /usr/local/lib/usb-evidence.sh
+  echo "$(date -Is) boot=$(cut -c1-8 /proc/sys/kernel/random/boot_id) $msg" >> "$(ud_dir typec-attach-guard)/summary.log"
+  sync
+fi

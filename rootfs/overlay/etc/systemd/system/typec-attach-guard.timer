@@ -1,0 +1,10 @@
+[Unit]
+Description=Check once a minute that the USB-C port has a partner
+
+[Timer]
+OnBootSec=90s
+OnUnitActiveSec=60s
+AccuracySec=5s
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,6 @@
+[Unit]
+Description=Recover a USB-C port that never attached (rebind the TCPC)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/typec-attach-guard
