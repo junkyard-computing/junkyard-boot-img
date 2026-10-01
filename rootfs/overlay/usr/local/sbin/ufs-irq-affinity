@@ -1,0 +1,13 @@
+#!/bin/sh
+# Move the UFS host interrupt off CPU0 (to the mid cluster, CPUs 4-5).
+#
+# Every device interrupt lands on CPU0 by default, and at ~2 GB/s of UFS reads
+# the UFS interrupt plus its block-completion softirq keep CPU0 so busy that the
+# I2C controllers sharing it (fuel gauges, PMIC) miss their 100 ms transfer
+# timeout: 108 "exynos5-hsi2c ... tx timeout" in 60 s of 3 MB O_DIRECT reads at
+# QD4, i.e. failed battery/temperature reads exactly while a thermal guard needs
+# them. With UFS on CPU4 the same load logged none, and read throughput rose
+# ~5% (1754 -> 1837 MiB/s). Measured on felix, 7.3-rc4, 2026-09-30.
+for irq in $(awk -F: '/ufshcd/ {gsub(/ /, "", $1); print $1}' /proc/interrupts); do
+  echo 4-5 > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null
+done

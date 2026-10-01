@@ -1,0 +1,9 @@
+[Unit]
+Description=Move the UFS host interrupt off CPU0 (keeps I2C fuel-gauge/PMIC reads from timing out under heavy I/O)
+After=sysinit.target
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ufs-irq-affinity
+RemainAfterExit=yes
+[Install]
+WantedBy=multi-user.target
