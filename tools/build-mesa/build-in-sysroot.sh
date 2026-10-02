@@ -1,6 +1,6 @@
 #!/bin/bash
 # Runs INSIDE the mounted felix rootfs via systemd-nspawn (see the Makefile
-# `.build_mesa` stage). Builds the junkyard-computing/mesa `felix-g710` fork
+# `.build_mesa` stage). Builds the junkyard-computing/mesa fork at the pinned rev
 # (Panfrost gallium + rusticl OpenCL + PanVK Vulkan, with the Mali-G710 model
 # entry) against the rootfs's own trixie glibc / LLVM-19 / libclc-19.
 #
@@ -11,7 +11,7 @@
 # the shipped image only carries the runtime libraries (see packages.txt).
 #
 # Inputs (bind-mounted by the Makefile at /mesa):
-#   /mesa/src   — the mesa fork checkout (felix-g710), cloned host-side
+#   /mesa/src   — the mesa fork checkout (MESA_FORK_REV), cloned host-side
 #   /mesa/build — persisted build tree (ninja resumes across runs)
 #   /mesa/out   — output dir; built .so's + ICD manifests are collected here
 set -euo pipefail

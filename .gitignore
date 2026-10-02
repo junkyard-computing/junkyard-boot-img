@@ -175,6 +175,8 @@ boot/vendor_boot.img
 .install_kernel
 .install_initramfs
 .build_mesa
+.kernel-rev
+.mesa-rev
 .install_mesa
 .build_boot
 

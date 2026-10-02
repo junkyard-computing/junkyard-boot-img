@@ -74,12 +74,17 @@ PIXEL_OTA_SOURCES := $(wildcard $(PIXEL_OTA_DIR)/Cargo.toml $(PIXEL_OTA_DIR)/Car
 # The build is expensive (~1hr first time under qemu) but the cache dir and its
 # sentinel are PRESERVED across `clean_rootfs` (ninja resumes), like the kernel.
 MESA_FORK_URL ?= https://github.com/junkyard-computing/mesa.git
-MESA_FORK_BRANCH ?= felix-g710
+MESA_FORK_BRANCH ?= exp/wls-offsets
 # Pinned exact revision on $(MESA_FORK_BRANCH) for reproducible builds. Bump this
 # deliberately when advancing the fork; without it the build tracks the branch
-# tip and a silent upstream commit changes what ships. 3ca7ae7 = branch tip w/
-# panfrost/bi spiller-rematerialize. Override on the CLI to build a different rev.
-MESA_FORK_REV ?= 3ca7ae7723543eed57eb41ea9ea284aad3065b76
+# tip and a silent upstream commit changes what ships. Changing it re-runs
+# .build_mesa (via the .mesa-rev stamp).
+# bd0debe9 = exp/wls-offsets: the PanVK build validated on the mainline rig
+# 2026-10-01 (llama.cpp prefill/decode, FA suite, Qwen3-30B decode). It replaces
+# felix-g710 3ca7ae7 (July), whose PanVK miscompiles llama.cpp's integer-dot
+# matmuls into an INSTR_BARRIER_FAULT device loss. Its LOCAL DEBUG commits are
+# env-gated and inert by default. Override on the CLI to build a different rev.
+MESA_FORK_REV ?= bd0debe9d548a1fd0dc5107b7b5d8f4792a190e4
 MESA_DIR ?= build/mesa
 MESA_SRC ?= $(MESA_DIR)/src
 MESA_OUT ?= $(MESA_DIR)/out
@@ -128,7 +133,19 @@ all:
 	just unmount_rootfs
 	touch $@
 
-.build_kernel: kernel/custom_defconfig_mod/felix.config
+# Revision stamps. A gitlink bump of kernel/source or a new MESA_FORK_REV changes
+# no file the build stages otherwise depend on, so the sentinels stayed satisfied
+# and the OLD kernel / Mesa shipped. Each stamp is rewritten only when its
+# revision actually changes, so an unchanged tree stays a no-op.
+KERNEL_REV := $(shell git -C $(KERNEL_SOURCE_DIR) rev-parse HEAD 2>/dev/null)
+.kernel-rev: FORCE
+	@echo '$(KERNEL_REV)' | cmp -s - $@ || echo '$(KERNEL_REV)' > $@
+.mesa-rev: FORCE
+	@echo '$(MESA_FORK_REV)' | cmp -s - $@ || echo '$(MESA_FORK_REV)' > $@
+.PHONY: FORCE
+FORCE:
+
+.build_kernel: kernel/custom_defconfig_mod/felix.config .kernel-rev
 	$(KMAKE) $(KERNEL_DEFCONFIG)
 	# Merge the felix fragment on top of the mainline defconfig: forces
 	# VA_BITS=48 / no-LPA2 and turns off ARMv8.5+ extensions the GS201 cores
@@ -241,7 +258,7 @@ all:
 # qemu); ninja resumes from the persisted $(MESA_DIR)/build tree on reruns, so
 # even after a `clean_rootfs` (which preserves this sentinel) the re-run only
 # reinstalls build deps + relinks, not a full rebuild.
-.build_mesa: .install_packages $(MESA_BUILD_SCRIPT)
+.build_mesa: .install_packages $(MESA_BUILD_SCRIPT) .mesa-rev
 	mkdir -p $(MESA_SRC) $(MESA_DIR)/build $(MESA_OUT)
 	# Clone or update the fork host-side (native git, not under qemu). Fetch the
 	# PINNED rev (MESA_FORK_REV), not the branch tip, for reproducibility.
@@ -254,6 +271,13 @@ all:
 		git -C $(MESA_SRC) fetch --depth 1 origin $(MESA_FORK_REV) && \
 		git -C $(MESA_SRC) checkout -B $(MESA_FORK_BRANCH) FETCH_HEAD; \
 	fi
+	# build-mesa.sh resumes ninja whenever build.ninja exists. That is right for a
+	# rerun of the same rev, but a different source tree must start clean rather
+	# than reconfigure on top of the old one's objects. (The tree is written as
+	# root inside nspawn, hence sudo.)
+	if [ "$$(cat $(MESA_DIR)/build/.src-rev 2>/dev/null)" != "$(MESA_FORK_REV)" ]; then \
+		sudo find $(MESA_DIR)/build -mindepth 1 -delete; \
+	fi
 	just mount_rootfs
 	# Bind the host mesa work dir into the sysroot at /mesa and run the build.
 	$(NSPAWN) --bind="$(CURDIR)/$(MESA_DIR):/mesa" \
@@ -262,6 +286,7 @@ all:
 	just unmount_rootfs
 	test -f $(MESA_OUT)/libRusticlOpenCL.so.1 || \
 		{ echo "ERROR: mesa build produced no libRusticlOpenCL.so.1"; exit 1; }
+	echo '$(MESA_FORK_REV)' | sudo tee $(MESA_DIR)/build/.src-rev >/dev/null
 	touch $@
 
 # Bake the cached Mesa libs into the image at $(MESA_PREFIX), register the
@@ -277,12 +302,13 @@ all:
 	sudo cp $(MESA_OUT)/panvk-g710.json $(SYSROOT_DIR)/usr/share/vulkan/icd.d/panvk-g710.json
 	# Loader path + rusticl driver selection, system-wide.
 	echo "$(MESA_PREFIX)/lib" | sudo tee $(SYSROOT_DIR)/etc/ld.so.conf.d/mesa-g710.conf >/dev/null
-	echo "RUSTICL_ENABLE=panfrost" | sudo tee -a $(SYSROOT_DIR)/etc/environment >/dev/null
-	# Register-pressure-aware loop unrolling (mesa fork felix-g710 c00a209f): stops
-	# PanVK from blindly obeying SPIR-V [[unroll]] hints that spill-storm on Valhall's
-	# 64-reg file (llama.cpp mul_mm 1252->0 spills, ~2x prefill, kills the wide-batch
-	# job-timeout hang). Drop this line once the pass is made unconditional upstream.
-	echo "PAN_PRESSURE_UNROLL=1" | sudo tee -a $(SYSROOT_DIR)/etc/environment >/dev/null
+	# Idempotent: this stage re-runs on every Mesa bump, and a plain `tee -a`
+	# piled up one copy of each line per run.
+	sudo grep -qx "RUSTICL_ENABLE=panfrost" $(SYSROOT_DIR)/etc/environment 2>/dev/null || \
+		echo "RUSTICL_ENABLE=panfrost" | sudo tee -a $(SYSROOT_DIR)/etc/environment >/dev/null
+	# PAN_PRESSURE_UNROLL (felix-g710's opt-in loop-unroll pass) no longer exists
+	# at the pinned rev; drop copies an older install left behind.
+	sudo sed -i "/^PAN_PRESSURE_UNROLL=/d" $(SYSROOT_DIR)/etc/environment
 	$(NSPAWN) -D $(SYSROOT_DIR) ldconfig
 	just unmount_rootfs
 	touch $@
