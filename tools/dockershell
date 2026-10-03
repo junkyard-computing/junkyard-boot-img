@@ -90,11 +90,22 @@ tty_args=(-i)
 # with. Docker containers don't run dbus by default, so start one inside
 # /run/dbus before exec'ing the user's command. Idempotent — a no-op once
 # the socket already exists.
+#
+# On a NixOS host the aarch64 binfmt interpreter is a /nix/store wrapper that
+# execs the real qemu (also under /nix/store). The foreign-arch debootstrap
+# second-stage + every in-sysroot nspawn run arm64 binaries through it, so the
+# store must be visible inside the container (read-only) or those arm64 execs
+# exit 255 with no message (tools/nspawn-wrap.sh assumes this mount). No-op on
+# non-Nix hosts. Same fix as the main track's dockershell.
+nix_args=()
+[ -d /nix/store ] && nix_args+=(-v /nix/store:/nix/store:ro)
+
 exec docker run --rm \
   "${tty_args[@]}" \
   --privileged \
   --cgroupns=host \
   "${mount_args[@]}" \
+  ${nix_args[@]+"${nix_args[@]}"} \
   -w "$REPO_ROOT" \
   ${device_args[@]+"${device_args[@]}"} \
   --entrypoint /usr/bin/env \

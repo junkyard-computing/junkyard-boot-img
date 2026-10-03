@@ -262,6 +262,15 @@ FORCE:
 	mkdir -p $(MESA_SRC) $(MESA_DIR)/build $(MESA_OUT)
 	# Clone or update the fork host-side (native git, not under qemu). Fetch the
 	# PINNED rev (MESA_FORK_REV), not the branch tip, for reproducibility.
+	# The image must ship exactly MESA_FORK_REV. Local edits in this tree used to
+	# either block the checkout or, when they did not collide, ride silently into
+	# the image (a July debug hack printing "PAN2T" on every shader compile
+	# shipped that way). Stash them, named, so nothing is lost and the build is
+	# clean.
+	if [ -d $(MESA_SRC)/.git ] && [ -n "$$(git -C $(MESA_SRC) status --porcelain --untracked-files=no)" ]; then \
+		echo "WARNING: $(MESA_SRC) has local changes; stashing them before checking out $(MESA_FORK_REV)"; \
+		git -C $(MESA_SRC) stash push -m "auto-stash by .build_mesa $$(date -Is) before $(MESA_FORK_REV)"; \
+	fi
 	if [ -d $(MESA_SRC)/.git ]; then \
 		git -C $(MESA_SRC) fetch --depth 1 origin $(MESA_FORK_REV) && \
 		git -C $(MESA_SRC) checkout -B $(MESA_FORK_BRANCH) FETCH_HEAD; \
@@ -295,20 +304,23 @@ FORCE:
 .install_mesa: .build_mesa .install_packages
 	just mount_rootfs
 	sudo mkdir -p $(SYSROOT_DIR)$(MESA_PREFIX)/lib
-	sudo rsync -a $(MESA_OUT)/ $(SYSROOT_DIR)$(MESA_PREFIX)/lib/
+	# --delete: $(MESA_PREFIX)/lib is ours alone, and without it a Mesa bump left
+	# the previous build's versioned files behind (26.2's libgallium kept riding
+	# along next to 26.3's, since the sysroot is never wiped).
+	sudo rsync -a --delete $(MESA_OUT)/ $(SYSROOT_DIR)$(MESA_PREFIX)/lib/
 	# ICD manifests in the standard search dirs so clinfo/vulkaninfo find them.
 	sudo mkdir -p $(SYSROOT_DIR)/etc/OpenCL/vendors $(SYSROOT_DIR)/usr/share/vulkan/icd.d
 	sudo cp $(MESA_OUT)/rusticl-g710.icd $(SYSROOT_DIR)/etc/OpenCL/vendors/rusticl-g710.icd
 	sudo cp $(MESA_OUT)/panvk-g710.json $(SYSROOT_DIR)/usr/share/vulkan/icd.d/panvk-g710.json
 	# Loader path + rusticl driver selection, system-wide.
 	echo "$(MESA_PREFIX)/lib" | sudo tee $(SYSROOT_DIR)/etc/ld.so.conf.d/mesa-g710.conf >/dev/null
-	# Idempotent: this stage re-runs on every Mesa bump, and a plain `tee -a`
-	# piled up one copy of each line per run.
-	sudo grep -qx "RUSTICL_ENABLE=panfrost" $(SYSROOT_DIR)/etc/environment 2>/dev/null || \
-		echo "RUSTICL_ENABLE=panfrost" | sudo tee -a $(SYSROOT_DIR)/etc/environment >/dev/null
-	# PAN_PRESSURE_UNROLL (felix-g710's opt-in loop-unroll pass) no longer exists
-	# at the pinned rev; drop copies an older install left behind.
-	sudo sed -i "/^PAN_PRESSURE_UNROLL=/d" $(SYSROOT_DIR)/etc/environment
+	# Rewrite rather than append: this stage re-runs on every Mesa bump, and a
+	# plain `tee -a` piled up one copy of each line per run. Also drops
+	# PAN_PRESSURE_UNROLL (felix-g710's opt-in loop-unroll pass), which no longer
+	# exists at the pinned rev.
+	sudo touch $(SYSROOT_DIR)/etc/environment
+	sudo sed -i -e "/^RUSTICL_ENABLE=/d" -e "/^PAN_PRESSURE_UNROLL=/d" $(SYSROOT_DIR)/etc/environment
+	echo "RUSTICL_ENABLE=panfrost" | sudo tee -a $(SYSROOT_DIR)/etc/environment >/dev/null
 	$(NSPAWN) -D $(SYSROOT_DIR) ldconfig
 	just unmount_rootfs
 	touch $@
