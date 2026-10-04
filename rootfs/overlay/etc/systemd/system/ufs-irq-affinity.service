@@ -3,7 +3,10 @@ Description=Move the UFS host interrupt off CPU0 (keeps I2C fuel-gauge/PMIC read
 After=sysinit.target
 [Service]
 Type=oneshot
+# The script retries for up to 30 s until the IRQ's effective affinity reads back on CPUs 4-5, and
+# exits non-zero (a failed unit, not a silent success) if it never does.
 ExecStart=/usr/local/sbin/ufs-irq-affinity
+TimeoutStartSec=60
 RemainAfterExit=yes
 [Install]
 WantedBy=multi-user.target

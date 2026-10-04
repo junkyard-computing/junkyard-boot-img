@@ -8,6 +8,46 @@
 # QD4, i.e. failed battery/temperature reads exactly while a thermal guard needs
 # them. With UFS on CPU4 the same load logged none, and read throughput rose
 # ~5% (1754 -> 1837 MiB/s). Measured on felix, 7.3-rc4, 2026-09-30.
-for irq in $(awk -F: '/ufshcd/ {gsub(/ /, "", $1); print $1}' /proc/interrupts); do
-  echo 4-5 > "/proc/irq/$irq/smp_affinity_list" 2>/dev/null
+#
+# Success means the IRQ's EFFECTIVE affinity reads back on 4-5, not that a write
+# was attempted. The first version sent write errors to /dev/null and exited 0
+# even when it found no ufshcd IRQ at all, so on 2026-10-03 a boot left the IRQ
+# on CPU0 (smp_affinity 0-7) under a unit reporting status=0/SUCCESS. Retry
+# until it sticks, log every failed attempt with its reason, and exit non-zero
+# (a failed unit) if it never does.
+WANT=4-5
+TRIES=30	# one per second
+
+say() { echo "ufs-irq-affinity: $*"; }
+kmsg() { echo "ufs-irq-affinity: $*" > /dev/kmsg 2>/dev/null; }
+
+i=1
+while :; do
+	irqs=$(awk -F: '/ufshcd/ {gsub(/ /, "", $1); print $1}' /proc/interrupts)
+	bad=
+	[ -n "$irqs" ] || bad=" no ufshcd IRQ in /proc/interrupts yet"
+	for irq in $irqs; do
+		err=$( { echo "$WANT" > "/proc/irq/$irq/smp_affinity_list"; } 2>&1 )
+		eff=$(cat "/proc/irq/$irq/effective_affinity_list" 2>/dev/null)
+		case "$eff" in
+		4|5) ;;
+		*) bad="$bad irq $irq: write ${err:-ok}, smp_affinity $(cat "/proc/irq/$irq/smp_affinity_list" 2>/dev/null), effective ${eff:-?};" ;;
+		esac
+	done
+	if [ -z "$bad" ]; then
+		for irq in $irqs; do
+			msg="irq $irq on CPU $(cat "/proc/irq/$irq/effective_affinity_list") (smp_affinity $(cat "/proc/irq/$irq/smp_affinity_list"))"
+			[ "$i" -gt 1 ] && msg="$msg after $i attempts"
+			say "$msg"
+			kmsg "$msg"
+		done
+		exit 0
+	fi
+	say "attempt $i/$TRIES:$bad"
+	if [ "$i" -ge "$TRIES" ]; then
+		kmsg "FAILED to move the UFS IRQ off CPU0 after $TRIES attempts:$bad"
+		exit 1
+	fi
+	i=$((i + 1))
+	sleep 1
 done
