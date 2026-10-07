@@ -1,5 +1,5 @@
 [Unit]
-Description=Select power_allocator (IPA) thermal governor for CPU zones
+Description=CPU thermal policy: IPA governor on CPU zones, X1 frequency cap
 After=sysinit.target
 [Service]
 Type=oneshot

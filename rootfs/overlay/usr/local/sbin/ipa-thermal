@@ -9,3 +9,24 @@ for z in /sys/class/thermal/thermal_zone*; do
     echo power_allocator > "$z/policy" 2>/dev/null ;;
   esac
 done
+
+# Cap the X1 cluster (CPUs 6-7). Under sustained all-core load at 2.85 GHz the
+# big-thermal sensor spikes ~20 C between 250 ms readings (92 -> 110 -> 115 C in
+# half a second), faster than the 1 s / 250 ms thermal polling can throttle, so
+# a spike trips the 115 C critical point (clean poweroff) and, we believe, can
+# beat the kernel to the chip's own thermal trip (silent reset, no log). At
+# 2.348 GHz the same load ran 5 min with peaks of 97 C. Sustained throughput
+# is no worse: lower X1 clocks measured faster on long CPU runs.
+# Override with /etc/x1-max-khz: a kHz value, or "off" for no cap.
+cap=2348000
+[ -r /etc/x1-max-khz ] && cap=$(tr -d ' \n' < /etc/x1-max-khz)
+[ "$cap" = off ] && exit 0
+for p in /sys/devices/system/cpu/cpufreq/policy*; do
+  case " $(cat "$p/related_cpus" 2>/dev/null) " in *" 6 "*) ;; *) continue ;; esac
+  best=
+  for f in $(cat "$p/scaling_available_frequencies" 2>/dev/null); do
+    [ "$f" -le "$cap" ] && { [ -z "$best" ] || [ "$f" -gt "$best" ]; } && best=$f
+  done
+  [ -n "$best" ] && echo "$best" > "$p/scaling_max_freq"
+  logger -t ipa-thermal "X1 policy $(basename "$p") capped at ${best:-unchanged} kHz (cap $cap)"
+done
