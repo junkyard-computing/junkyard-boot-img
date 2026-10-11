@@ -79,12 +79,16 @@ MESA_FORK_BRANCH ?= exp/wls-offsets
 # deliberately when advancing the fork; without it the build tracks the branch
 # tip and a silent upstream commit changes what ships. Changing it re-runs
 # .build_mesa (via the .mesa-rev stamp).
-# bd0debe9 = exp/wls-offsets: the PanVK build validated on the mainline rig
-# 2026-10-01 (llama.cpp prefill/decode, FA suite, Qwen3-30B decode). It replaces
-# felix-g710 3ca7ae7 (July), whose PanVK miscompiles llama.cpp's integer-dot
-# matmuls into an INSTR_BARRIER_FAULT device loss. Its LOCAL DEBUG commits are
-# env-gated and inert by default. Override on the CLI to build a different rev.
-MESA_FORK_REV ?= bd0debe9d548a1fd0dc5107b7b5d8f4792a190e4
+# 6f95d7de = exp/wls-offsets: bd0debe9 (the PanVK build validated on the
+# mainline rig 2026-10-01: llama.cpp prefill/decode, FA suite, Qwen3-30B decode)
+# plus ALU rematerialization on by default when register demand is far over
+# budget (ggml q2_K MUL_MAT_ID 2.8 -> 8.7 GFLOPS on G710, other types within
+# noise, same correctness) and an off-by-default PAN_REMAT_XBLOCK knob.
+# bd0debe9 replaced felix-g710 3ca7ae7 (July), whose PanVK miscompiles
+# llama.cpp's integer-dot matmuls into an INSTR_BARRIER_FAULT device loss. LOCAL
+# DEBUG commits are env-gated and inert by default. Override on the CLI to build
+# a different rev.
+MESA_FORK_REV ?= 6f95d7de6f703600eb6b7a2e4898e068e4247df2
 MESA_DIR ?= build/mesa
 MESA_SRC ?= $(MESA_DIR)/src
 MESA_OUT ?= $(MESA_DIR)/out
