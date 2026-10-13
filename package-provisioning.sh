@@ -75,8 +75,11 @@ fi
 say "factory image OK"
 
 # ------------------------------------------------------------------ images ---
+# Mainline ships NO dtbo: its dtb is self-contained, and flash-fastboot.sh leaves
+# dtbo_<slot> ERASED when images/dtbo.img is absent. So it is optional here, and
+# bundled only if a build produced one.
 DTBO="kernel/source/out/felix/dist/dtbo.img"
-for f in boot/boot.img boot/vendor_boot.img boot/super.img "$DTBO"; do
+for f in boot/boot.img boot/vendor_boot.img boot/super.img; do
 	[ -f "$f" ] || die "missing $f — build it first (see CLAUDE.md; super.img needs 'just build_super_image')"
 done
 
@@ -170,7 +173,11 @@ say "staging images"
 ln -s "$here/boot/boot.img"         "$KIT/images/boot.img"
 ln -s "$here/boot/vendor_boot.img"  "$KIT/images/vendor_boot.img"
 ln -s "$here/boot/super.img"        "$KIT/images/super.img"
-ln -s "$here/$DTBO"                 "$KIT/images/dtbo.img"
+if [ -f "$DTBO" ]; then
+	ln -s "$here/$DTBO"             "$KIT/images/dtbo.img"
+else
+	say "no $DTBO — kit ships without dtbo.img (flashing erases dtbo_a/dtbo_b)"
+fi
 printf '%s\n' "$VERSION" > "$KIT/images/VERSION"
 
 # EXTRACT the factory image rather than shipping the zip.
@@ -242,4 +249,4 @@ say "done: $OUT_ABS  ($(du -h "$OUT_ABS" | cut -f1))"
 echo
 echo "  image version : $VERSION"
 echo "  felix build   : $BUILD_ID"
-echo "  contents      : README.md, 6 scripts, 4 images, factory image, SHA256SUMS"
+echo "  contents      : README.md, 6 scripts, boot images, factory image, SHA256SUMS"
